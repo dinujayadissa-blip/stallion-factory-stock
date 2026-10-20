@@ -208,11 +208,41 @@ test('the name on every change is the login\'s name — a "by" sent from the pag
   assert.equal(db.prepare(`SELECT worker FROM reminders WHERE text = 'Check the A-frame'`).get().worker, 'Lee Leading');
 });
 
-test('a worker can undo only their own take', async () => {
+test('a worker can undo only their own take — by login, not by name (issue #2)', async () => {
+  // the take carries the login's id
+  assert.equal(db.prepare('SELECT user_id FROM movements WHERE id = ?').get(id.take).user_id, id.sam);
   let r = await call('POST', '/api/floor/undo', { as: S.pat, body: { movement_id: id.take, line_id: id.sparkLine, van_id: id.van } });
   assert.equal(r.status, 403);
   assert.match(r.json.error, /Only the person who did it/);
+  // same name on the movement but another login's id: still not theirs
+  db.prepare('UPDATE movements SET worker = ? WHERE id = ?').run('Pat Plumber', id.take);
+  r = await call('POST', '/api/floor/undo', { as: S.pat, body: { movement_id: id.take, line_id: id.sparkLine, van_id: id.van } });
+  assert.equal(r.status, 403);
+  db.prepare('UPDATE movements SET worker = ? WHERE id = ?').run('Sam Sparks', id.take);
   r = await call('POST', '/api/floor/undo', { as: S.sam, body: { movement_id: id.take, line_id: id.sparkLine, van_id: id.van } });
+  assert.equal(r.status, 200, r.text);
+  // a take saved before logins (no login id) still goes by the name
+  r = await call('POST', '/api/floor/take', { as: S.sam, body: { line_id: id.sparkLine, qty: 1, seen_issued: 0 } });
+  assert.equal(r.status, 200, r.text);
+  const mv = r.json.movement_id;
+  db.prepare('UPDATE movements SET user_id = NULL WHERE id = ?').run(mv);
+  assert.equal((await call('POST', '/api/floor/undo', { as: S.pat, body: { movement_id: mv, line_id: id.sparkLine, van_id: id.van } })).status, 403);
+  assert.equal((await call('POST', '/api/floor/undo', { as: S.sam, body: { movement_id: mv, line_id: id.sparkLine, van_id: id.van } })).status, 200);
+  // deliveries booked on the phone carry the login's id too
+  r = await call('POST', '/api/floor/receive', { as: S.sam, body: { item_id: id.plumbItem, qty: 1 } });
+  assert.equal(r.status, 200, r.text);
+  assert.equal(db.prepare('SELECT user_id FROM movements WHERE id = ?').get(r.json.movement_id).user_id, id.sam);
+  assert.equal((await call('POST', '/api/floor/receive/undo', { as: S.pat, body: { movement_id: r.json.movement_id, item_id: id.plumbItem } })).status, 403);
+  assert.equal((await call('POST', '/api/floor/receive/undo', { as: S.sam, body: { movement_id: r.json.movement_id, item_id: id.plumbItem } })).status, 200);
+});
+
+test('two logins can never have the same name (issue #2)', async () => {
+  let r = await call('POST', '/api/users', { as: S.owner, body: { username: 'sam2', name: 'sam  SPARKS', role: 'worker', trade: 'plumber', password: 'sam2-pass-1' } });
+  assert.equal(r.status, 409);
+  assert.match(r.json.error, /already has the name/);
+  r = await call('PUT', `/api/users/${id.pat}`, { as: S.owner, body: { name: 'Sam Sparks' } });
+  assert.equal(r.status, 409);
+  r = await call('PUT', `/api/users/${id.pat}`, { as: S.owner, body: { name: 'Pat Plumber' } }); // own name again is fine
   assert.equal(r.status, 200, r.text);
 });
 

@@ -311,6 +311,12 @@ function checkRoleTrade(role, trade) {
 export const publicUser = u => (u ? { id: u.id, username: u.username, name: u.name, role: u.role, trade: u.trade || '' } : null);
 const USER_COLS = 'id, username, name, role, trade, active, must_change, created_at, created_by, last_login';
 
+// Two logins never share a display name (capitals and spaces ignored): it is the name on everything they do.
+function checkNameFree(name, exceptId = null) {
+  if (get('SELECT 1 FROM users WHERE lower(name) = lower(?) AND id <> ?', name, exceptId ?? -1)) {
+    throw httpError(409, `Someone already has the name "${name}" — add a surname or an initial so the two can be told apart`);
+  }
+}
 export const userCount = () => get('SELECT COUNT(*) AS n FROM users').n;
 export const listUsers = () => all(`SELECT ${USER_COLS} FROM users ORDER BY active DESC, CASE role WHEN 'owner' THEN 1 WHEN 'office' THEN 2
   WHEN 'stores' THEN 3 WHEN 'leadhand' THEN 4 ELSE 5 END, name COLLATE NOCASE`);
@@ -325,9 +331,11 @@ export async function createUser({ username, name, role, trade = '', password, m
   const bad = passwordProblem(password, u);
   if (bad) throw httpError(400, bad);
   if (findUser(u)) throw httpError(409, `The username "${u}" is already taken`);
+  checkNameFree(n);
   const hash = await hashPassword(password);
   // First-time setup: checked again right before saving (two browsers at once can't both make an owner).
   if (firstLogin && userCount() > 0) throw httpError(409, 'The first login was already made — log in instead');
+  checkNameFree(n); // again: another login may have been added while the password was hashed
   try {
     const r = run(`INSERT INTO users(username, name, role, trade, pass_hash, active, must_change, created_at, created_by)
                    VALUES(?, ?, ?, ?, ?, 1, ?, ?, ?)`, u, n, role, t, hash, mustChange ? 1 : 0, nowText(), String(createdBy || '').slice(0, 40));
@@ -349,6 +357,7 @@ export function updateUser(id, { name, role, trade } = {}, actor = null) {
     const newRole = role === undefined ? u.role : role;
     const newTrade = checkRoleTrade(newRole, trade === undefined ? u.trade : trade);
     const newName = name === undefined ? u.name : cleanName(name);
+    if (newName.toLowerCase() !== u.name.toLowerCase()) checkNameFree(newName, u.id);
     if (newRole !== u.role) {
       if (actor && actor.id === u.id) throw httpError(400, "You can't change your own job role — ask another owner");
       if (u.role === 'owner' && u.active && !activeOwners(u.id)) throw httpError(400, 'This is the only owner login — make someone else an owner first');

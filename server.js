@@ -133,9 +133,19 @@ app.use('/photos', (req, res, next) => (req.user ? next() : res.status(401).send
     setHeaders: r => r.setHeader('Cache-Control', 'private, max-age=31536000, immutable') }));
 
 // Wrap handlers so thrown errors become JSON responses.
+// Every stock movement a change makes is stamped with the login's id (issue #2: "undo only your own", floor stats).
+// A handler that doesn't wait runs to the end before any other request, so the movements numbered above the
+// highest one before it are exactly its own. (Handlers that wait — PDFs, logins — make no movements.)
+function stampMovements(req, run0) {
+  if (!req.user || req.method === 'GET' || req.method === 'HEAD') return run0();
+  const hi = get('SELECT COALESCE(MAX(id), 0) AS n FROM movements').n;
+  const out = run0();
+  if (!(out && typeof out.then === 'function')) run('UPDATE movements SET user_id = ? WHERE id > ? AND user_id IS NULL', req.user.id, hi);
+  return out;
+}
 const h = fn => async (req, res) => {
   try {
-    const out = await fn(req, res);
+    const out = await stampMovements(req, () => fn(req, res));
     if (!res.headersSent) res.json(out ?? { ok: true });
   } catch (e) {
     // Our own messages (with a status) are written for staff; anything else is an internal error.
@@ -348,20 +358,23 @@ const worker = req => req.user?.name || '';
 // A worker only ever sees their own trade; everyone else picks a trade view on /floor ('all' = every trade).
 const floorTrade = (req, asked) => (req.user?.role === 'worker' ? req.user.trade : asked);
 // A worker may only undo their own take / delivery booking (the name saved on it = their login's name).
+// It goes by the login's id saved on the movement; only movements from before logins (no id) go by the name.
 function ownMovementOnly(req, type) {
   if (req.user?.role !== 'worker') return;
-  const m = get('SELECT worker FROM movements WHERE id = ? AND type = ?', Number(req.body.movement_id), type);
-  if (m && String(m.worker || '').trim().toLowerCase() !== String(req.user.name).trim().toLowerCase()) {
-    throw inv.httpError(403, 'Only the person who did it can undo it — ask the office');
-  }
+  const m = get('SELECT worker, user_id FROM movements WHERE id = ? AND type = ?', Number(req.body.movement_id), type);
+  if (!m) return; // "Nothing to undo" from the undo itself
+  const own = m.user_id != null ? Number(m.user_id) === Number(req.user.id)
+    : String(m.worker || '').trim().toLowerCase() === String(req.user.name).trim().toLowerCase();
+  if (!own) throw inv.httpError(403, 'Only the person who did it can undo it — ask the office');
 }
+
 app.get('/api/floor/vans', h(() => inv.floorVans()));
 app.get('/api/trades', h(() => TRADES));
 // The worker home screen: the floor map with badges for one trade.
 // `trade` in the answer: the trade really shown (a worker's own, whatever was asked).
 app.get('/api/floor/map', h(req => { const t = floorTrade(req, String(req.query.trade || 'all')); return { ...layout.floorMap(t), trade: isTrade(t) ? t : 'all' }; }));
 app.get('/api/floor/vans/:id', h(req => inv.floorVan(id(req))));
-app.get('/api/floor/stats', h(req => inv.floorStats(worker(req))));
+app.get('/api/floor/stats', h(req => inv.floorStats({ userId: req.user.id, name: worker(req) })));
 // accept_borrow: true = the worker agreed to take another van's part, false = it's a new delivery.
 const acceptBorrow = v => (v === true || v === 'true' ? true : v === false || v === 'false' ? false : undefined);
 app.post('/api/floor/take', h(req => inv.takeForVan(Number(req.body.line_id), num(req.body.qty), worker(req),

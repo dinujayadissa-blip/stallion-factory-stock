@@ -2555,15 +2555,19 @@ export function floorVan(vanId) {
   return { van, lines, reminders };
 }
 
+// `by`: a name, or { userId, name } — the login (logins and job roles): its own movements by user id, and only
+// movements saved before logins (no user id) by name, so two people with the same name are never mixed up.
 export function floorStats(by = '') {
+  const { userId = null, name = '' } = typeof by === 'object' && by ? by : { name: by };
   const today = `date(at) = date('now','localtime')`;
+  const mine = '(user_id = ? OR (user_id IS NULL AND worker = ?))';
   const row = get(`SELECT
-      COUNT(*) FILTER (WHERE worker = ?) AS mine,
+      COUNT(*) FILTER (WHERE ${mine}) AS mine,
       COUNT(*) AS team,
-      COUNT(*) FILTER (WHERE worker = ? AND type = 'issue') AS mine_took,
+      COUNT(*) FILTER (WHERE ${mine} AND type = 'issue') AS mine_took,
       COUNT(*) FILTER (WHERE type = 'issue') AS team_took,
-      COUNT(DISTINCT worker) AS people
-    FROM movements WHERE ${today} AND type IN ('issue','receive') AND worker <> ''`, by, by);
+      COUNT(DISTINCT COALESCE(CAST(user_id AS TEXT), worker)) AS people
+    FROM movements WHERE ${today} AND type IN ('issue','receive') AND worker <> ''`, userId ?? -1, name, userId ?? -1, name);
   return row;
 }
 

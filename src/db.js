@@ -360,6 +360,9 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 CREATE INDEX IF NOT EXISTS ix_sessions_user ON sessions(user_id);
 `);
+// Which login made a stock movement (issue #2): "undo only your own" and the floor stats go by this id, not by
+// the name (two people can have similar names). Empty on movements from before logins.
+addColumn('movements', 'user_id', 'INTEGER');
 
 // One line in the allocation log. `before`/`after` are stored as text (numbers or short labels).
 // `change` / `firm_change`: how much `reserved` / `reserved_firm` moved (worked out from before/after

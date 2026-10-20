@@ -2569,3 +2569,17 @@ app open go to the log in page; each worker logs in once (30 days, renewed by us
 - Now, of the lines that match, the one with the fewest `:x` parts wins (a named path always beats `:id`), and the
   three lines sit next to `/api/items`. A new test checks that **every** line of the table can be reached (it fails
   on any line swallowed by another), and the HTTP test checks a worker gets 403 on the three lists.
+
+**#2 — "undo only your own" and the floor stats went by the display name** (`src/db.js`, `server.js`,
+`src/inventory.js` floorStats, `src/auth.js`, tests)
+- Why: two logins called "Sam Smith" / "sam smith" could undo each other's takes and deliveries, and the phone's
+  "You took N today" counted both.
+- New column `movements.user_id` (start-up `addColumn`, empty on old rows). Every stock movement a change request
+  makes is stamped with the login's id (in the `h()` wrapper: the movements numbered above the highest one before a
+  handler that doesn't wait are that request's own) — takes, extra parts, phone and office deliveries, counts,
+  adjustments, PO receipts, issue / return, already fitted.
+- A worker's Undo / Put back / delivery Undo compares the login id; only movements from before logins (no id) still
+  go by the name. The floor stats count own movements by id (old ones by name).
+- Two logins can't have the same display name (capitals and spaces ignored), when adding or renaming: "Someone
+  already has the name "Sam Smith" — add a surname or an initial so the two can be told apart".
+- No data change; old movements keep no id.

@@ -303,3 +303,13 @@ test('issue #1: every line of the table can be reached — a ":id" line never sw
   }
   assert.equal(auth.allowed('GET', '/api/items/12', 'worker'), true);
 });
+
+test('issue #2: floor stats count by login id; only old movements (no id) by name', async () => {
+  const inv = await import('../src/inventory.js');
+  const item = Number(run(`INSERT INTO items(sku, name) VALUES('ST-1', 'Stats part')`).lastInsertRowid);
+  const mv = (worker, userId) => run(`INSERT INTO movements(item_id, qty, type, worker, user_id) VALUES(?, -1, 'issue', ?, ?)`, item, worker, userId);
+  mv('Sam Smith', 101); mv('Sam Smith', 102); mv('Sam Smith', 102); mv('Sam Smith', null);
+  assert.equal(inv.floorStats({ userId: 101, name: 'Sam Smith' }).mine_took, 2); // own (1) + the old one by name (1)
+  assert.equal(inv.floorStats({ userId: 102, name: 'Sam Smith' }).mine_took, 3);
+  assert.equal(inv.floorStats('Sam Smith').mine_took, 1); // a plain name: only rows without a login id
+});
