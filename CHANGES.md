@@ -2583,3 +2583,16 @@ app open go to the log in page; each worker logs in once (30 days, renewed by us
 - Two logins can't have the same display name (capitals and spaces ignored), when adding or renaming: "Someone
   already has the name "Sam Smith" — add a surname or an initial so the two can be told apart".
 - No data change; old movements keep no id.
+
+**#3 — small fixes** (`server.js`, `src/auth.js`, `public/floor.js`, `views/`, tests)
+- A wrong "current password" on Change password now counts like a wrong log in (same lockout, username + address):
+  5 wrong → "Too many tries — wait 15 minutes", and log in for that username is locked too.
+- `/photos` also needs the new password chosen first (a login that must change it gets 401, like everything else).
+- Log out on the worker app also forgets what the phone remembered for that person: today's takes, the last take,
+  the last delivery booking and the last van (`floor.takes`, `floor.lastTake`, `floor.lastBooking`, `floor.lastVan`).
+- `index.html` and `floor.html` moved from `public/` to **`views/`**: odd addresses (`/%69ndex.html`, `//index.html`,
+  `/index.html::$DATA`) went through the static files and served the page shell without the login check. Only the
+  `/` and `/floor` routes send them now. (`app-preview.html` stays public: no data in it.)
+- `PUT /api/vans/<gone>`, `DELETE /api/vans/<gone>` and `POST /api/vans/<gone>/rebuild` answered 500 "Something went
+  wrong"; now 404 "That van no longer exists — refresh".
+- Carrying over: move `public/index.html` and `public/floor.html` to `views/` (delete them from `public/`).

@@ -104,6 +104,8 @@ app.use('/api', (req, res, next) => {
 });
 
 // ── Pages: the office app and the worker app need a login; the login page doesn't ──
+// index.html and floor.html live in views/ (not public/), so no odd address (/%69ndex.html, //index.html…) can
+// reach them through the static files without these checks.
 const nextTo = req => `/login?next=${encodeURIComponent(req.originalUrl)}`;
 const noStore = res => res.setHeader('Cache-Control', 'no-store');
 app.get(['/', '/index.html'], (req, res) => {
@@ -112,13 +114,13 @@ app.get(['/', '/index.html'], (req, res) => {
   if (req.user.mustChange) return res.redirect(302, nextTo(req));
   if (!auth.capabilities(req.user.role).officeApp) return res.redirect(302, '/floor'); // workers: the worker app only
   if (req.path !== '/') return res.redirect(302, '/');
-  res.sendFile(path.join(dir, 'public', 'index.html'));
+  res.sendFile(path.join(dir, 'views', 'index.html'));
 });
 app.get(['/floor', '/floor.html'], (req, res) => {
   noStore(res);
   if (!req.user || req.user.mustChange) return res.redirect(302, '/login?next=%2Ffloor');
   if (req.path !== '/floor') return res.redirect(302, '/floor');
-  res.sendFile(path.join(dir, 'public', 'floor.html'));
+  res.sendFile(path.join(dir, 'views', 'floor.html'));
 });
 app.get(['/login', '/login.html'], (req, res) => { noStore(res); res.sendFile(path.join(dir, 'public', 'login.html')); });
 // Styles, scripts, fonts, logos, the app icon / manifest / service worker: no login needed (no data in them).
@@ -128,7 +130,7 @@ app.use('/vendor/three/build', express.static(path.join(dir, 'node_modules', 'th
 app.use('/vendor/three/addons', express.static(path.join(dir, 'node_modules', 'three', 'examples', 'jsm'), { maxAge: '7d', index: false }));
 // Item photos: any login (the browser sends the cookie with each picture). File names change on every
 // upload, so they can be kept for a long time — but only in that browser ("private").
-app.use('/photos', (req, res, next) => (req.user ? next() : res.status(401).send('Please log in')),
+app.use('/photos', (req, res, next) => (req.user && !req.user.mustChange ? next() : res.status(401).send('Please log in')),
   express.static(PHOTO_DIR, { maxAge: '365d', immutable: true, index: false,
     setHeaders: r => r.setHeader('Cache-Control', 'private, max-age=31536000, immutable') }));
 
@@ -176,7 +178,12 @@ app.post('/api/logout', h((req, res) => {
 }));
 app.get('/api/me', h(req => meOut(req.user)));
 app.post('/api/me/password', h(async req => {
-  await auth.changeOwnPassword(req.user.id, String(req.body.current ?? ''), String(req.body.password ?? ''), req.sessionHash);
+  // Wrong "current password" counts like a wrong log in (same lockout), so a phone left logged in can't be used to
+  // guess the password.
+  const ip = clientIp(req);
+  if (throttle.locked(ip, req.user.username)) throw inv.httpError(429, auth.LOCKED);
+  try { await auth.changeOwnPassword(req.user.id, String(req.body.current ?? ''), String(req.body.password ?? ''), req.sessionHash); }
+  catch (e) { if (e.wrongCurrent) throttle.fail(ip, req.user.username); throw e; }
   return meOut({ ...req.user, mustChange: false });
 }));
 // First login (the owner): only while there are none, and only on this PC itself.
@@ -241,9 +248,12 @@ app.post('/api/vans', h(req => {
   return { id: vanId, drawingReminders: layout.drawingReminders(vanId), customerReminders: layout.customerReminders(vanId, req.body.customer_fields) };
 }));
 app.get('/api/vans/:id', h(req => inv.getVan(id(req))));
-app.put('/api/vans/:id', h(req => inv.updateVan(id(req), req.body)));
-app.delete('/api/vans/:id', h(req => inv.deleteVan(id(req))));
+// A van that was deleted meanwhile: a plain 404, not "Something went wrong".
+const vanThere = req => { if (!get('SELECT 1 FROM vans WHERE id = ?', id(req))) throw inv.httpError(404, 'That van no longer exists — refresh'); };
+app.put('/api/vans/:id', h(req => { vanThere(req); return inv.updateVan(id(req), req.body); }));
+app.delete('/api/vans/:id', h(req => { vanThere(req); return inv.deleteVan(id(req)); }));
 app.post('/api/vans/:id/rebuild', h(req => {
+  vanThere(req);
   if (!tx(() => inv.applyRules(id(req)))) {
     throw inv.httpError(400, 'This van came from the production plan, so its parts list is the plan — edit it on the van or plan page');
   }

@@ -402,7 +402,7 @@ export async function resetPassword(id, password, { mustChange = true } = {}) {
 export async function changeOwnPassword(userId, current, next, keepTokenHash = null) {
   const row = get('SELECT * FROM users WHERE id = ?', userId);
   if (!row || !row.active) throw httpError(401, 'Please log in');
-  if (!(await verifyPassword(current, row.pass_hash))) throw httpError(400, 'Your current password is not right');
+  if (!(await verifyPassword(current, row.pass_hash))) throw httpError(400, 'Your current password is not right', { wrongCurrent: true });
   const bad = passwordProblem(next, row.username);
   if (bad) throw httpError(400, bad);
   if (await verifyPassword(next, row.pass_hash)) throw httpError(400, 'Choose a different password from the one you have now');

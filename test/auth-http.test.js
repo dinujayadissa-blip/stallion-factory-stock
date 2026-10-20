@@ -85,6 +85,11 @@ test('not logged in: the API says "Please log in", the pages go to /login, style
     assert.equal((await call('GET', p)).status, 200, p);
   }
   assert.equal((await call('GET', '/photos/1-1.jpg')).status, 401);
+  // issue #3: the app pages can't be reached through the static files by an odd address
+  for (const p of ['/%69ndex.html', '//index.html', '/index.html::$DATA', '/%66loor.html', '//floor.html', '/floor.html', '/views/index.html']) {
+    const r = await call('GET', p);
+    assert.ok(r.status !== 200 || !/id="app"|id="screen"/.test(r.text), `${p} gave the page (${r.status})`);
+  }
 });
 
 test('first login: refused from another PC and through a proxy; made on this PC; only once', async () => {
@@ -154,6 +159,7 @@ test('a temporary password: nothing works until a new one is chosen', async () =
   assert.equal(x.status, 403);
   assert.equal(x.json.mustChange, true);
   assert.equal((await call('GET', '/floor', { as: c })).status, 302);
+  assert.equal((await call('GET', '/photos/1-1.jpg', { as: c })).status, 401); // issue #3: not even photos
   assert.equal((await call('POST', '/api/me/password', { as: c, body: { current: 'newbie-pass-1', password: 'short' } })).status, 400);
   x = await call('POST', '/api/me/password', { as: c, body: { current: 'newbie-pass-1', password: 'my-own-pass-9' } });
   assert.equal(x.status, 200, x.text);
@@ -272,6 +278,29 @@ test('leading hand: moves vans and runs the floor — not the parts rules or the
   assert.equal((await call('POST', '/api/layout/areas', { as: S.lee, body: { kind: 'bay', x: 1, y: 1, w: 9, h: 3 } })).status, 403);
   assert.equal((await call('POST', `/api/items/${id.plumbItem}/receive`, { as: S.lee, body: { qty: 1 } })).status, 403);
   assert.equal((await call('GET', '/api/plan', { as: S.lee })).status, 200);
+});
+
+test('a van deleted meanwhile: a plain 404 (issue #3)', async () => {
+  for (const [m, p, body] of [['PUT', '/api/vans/999999', { eta: '2027-01-01' }], ['PUT', '/api/vans/999999', { status: 'completed' }],
+    ['POST', '/api/vans/999999/rebuild', {}], ['DELETE', '/api/vans/999999', undefined]]) {
+    const r = await call(m, p, { as: S.olive, body });
+    assert.equal(r.status, 404, `${m} ${p}: ${r.text}`);
+    assert.equal(r.json.error, 'That van no longer exists — refresh');
+  }
+});
+
+test('wrong "current password" counts like a wrong log in (issue #3)', async () => {
+  const r0 = await call('POST', '/api/users', { as: S.owner, body: { username: 'tess', name: 'Tess Test', role: 'worker', trade: 'finisher', password: 'tess-pass-1', must_change: false } });
+  assert.equal(r0.status, 200, r0.text);
+  const c = await login('tess', 'tess-pass-1');
+  for (let i = 0; i < 5; i++) {
+    const r = await call('POST', '/api/me/password', { as: c, body: { current: `guess-${i}-x`, password: 'new-pass-123' } });
+    assert.equal(r.status, 400);
+  }
+  let r = await call('POST', '/api/me/password', { as: c, body: { current: 'tess-pass-1', password: 'new-pass-123' } });
+  assert.equal(r.status, 429);
+  r = await call('POST', '/api/login', { body: { username: 'tess', password: 'tess-pass-1' } });
+  assert.equal(r.status, 429);
 });
 
 test('office: everything in the office app', async () => {

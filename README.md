@@ -350,6 +350,7 @@ server.js            web server + API
 src/auth.js          logins, passwords, sessions and the job-role table (who may do what)
 scripts/users.js     logins from the command line (npm run users)
 public/login.*       the log in page
+views/               the office app and worker app pages (index.html, floor.html) — only served after a login check
 src/parseOrder.js    reads the dealer PDF
 src/rules.js         order options → parts list
 src/inventory.js     stock, allocation, purchasing

@@ -270,6 +270,9 @@ function passwordSheet() {
 // cleared, so the next person sees nothing of the last one.
 async function logout() {
   try { await fetch('/api/logout', { method: 'POST' }); } catch { /* logged out here anyway */ }
+  // What this phone remembered for the person (their takes / bookings to undo, the last van) goes too, so the
+  // next person on a shared phone doesn't see it.
+  for (const k of ['takes', 'lastTake', 'lastBooking', 'lastVan']) { try { localStorage.removeItem(`floor.${k}`); } catch { /* private mode */ } }
   try { if (window.caches) for (const k of await caches.keys()) await caches.delete(k); } catch { /* none */ }
   location.replace('/login?out=1');
 }
