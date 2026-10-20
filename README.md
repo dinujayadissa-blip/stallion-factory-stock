@@ -78,7 +78,7 @@ npm run users -- disable <username>            npm run users -- enable <username
 ```
 
 The password is typed at the prompt (shown as `*`), never on the command line. Five wrong passwords for a username
-lock it for 15 minutes on that device ("Too many tries — wait 15 minutes"); restarting the app clears the locks.
+lock it for 15 minutes on that device (the log in page warns at 2 tries left and says when it can be tried again); the owner sees "Locked until …" on **Logins** and can **Unlock** it (Reset password unlocks too); restarting the app clears the locks. After Add login / Reset password the username and temporary password are shown once, with Copy and Print.
 
 **Later, for remote access** (Tailscale / Cloudflare Tunnel): set `ALLOWED_HOSTS` to the name used from outside
 (e.g. `ALLOWED_HOSTS=factory.example.com`) — changes are only accepted on this PC's own names and addresses — and,

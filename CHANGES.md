@@ -2596,3 +2596,47 @@ app open go to the log in page; each worker logs in once (30 days, renewed by us
 - `PUT /api/vans/<gone>`, `DELETE /api/vans/<gone>` and `POST /api/vans/<gone>/rebuild` answered 500 "Something went
   wrong"; now 404 "That van no longer exists — refresh".
 - Carrying over: move `public/index.html` and `public/floor.html` to `views/` (delete them from `public/`).
+
+**#13 — user test: handing over logins, locks, "you've been logged out", role dashboards** (`server.js`,
+`src/auth.js`, `public/app.js`, `public/login.js`, `public/login.css`, `public/floor.js`, `public/purchasing.js`,
+`public/styles.css`, tests)
+- **Hand-over box:** after *Add login* and *Reset password* a window shows where to open the app, the username and
+  the temporary password in large letters, with **Copy** and **Print** (a one-page slip). On the office PC itself
+  (localhost) the address is the PC's network address from Settings. It is shown once; the app never shows a
+  password again.
+- **Locks:** the Logins page shows "Locked until 3:45 pm (wrong passwords)" for a username locked from any device,
+  with an **Unlock** button (owner; `POST /api/users/:id/unlock`). *Reset password* lifts the lock too.
+  (`npm run users -- reset` runs in another program and can't lift it — Unlock, or wait 15 minutes.)
+- **Log in page:** after a wrong password it warns "Wrong username or password — 2 tries left, then a 15-minute
+  wait" (and "1 try left"); when locked: "Too many tries — wait 15 minutes. You can try again at 3:45 pm." The
+  server's error text is unchanged ("Wrong username or password" for every case); it now also sends `left` and,
+  when locked, `until`. The same applies on "Choose a new password".
+- **Session ended:** when the browser still has a session that has ended (turned off, new job role, password reset,
+  logged out on another device, 30 days unused), the server says so (`ended: true` on the 401, `&ended=1` on the
+  page redirect) and clears the old cookie; the log in page says "You've been logged out — your login may have been
+  changed or turned off. Ask the owner if you can't log in." Someone who was never logged in doesn't see it.
+- **Dashboard for stores and leading hands:** no Office to-do or Go-live checklist (pages they can't open). Stores
+  see "Stores to-do": overdue deliveries, purchase orders to receive, stock checks, parts not counted yet; leading
+  hands see "Floor to-do": vans late, reminders overdue / due today / open. Order now and Overdue deliveries panels
+  only for logins that can open Purchasing; Waiting on a decision only for the office. Owner / office unchanged.
+- **Stores can set where a part is kept** in the office app: item window → **Place** (rack + shelf / bin), the two
+  fields the server already let stores change.
+- Own row on Logins: the job-role box is greyed out with "You can't change your own job role — another owner can."
+- Hints that pointed at buttons a role can't see are hidden or reworded (production plan "Click a cell to mark it
+  ordered…" → "Click a cell to see it"; van "Check by hand" text about + Add part / Parts rules; van details note
+  about Completed; Purchasing "tick them and make the PO").
+- Item history said the van twice for floor takes ("issue · ST0386 · ST0386"): the reference is left out when it
+  is the van.
+- A leading hand logging in goes back to the app they used last on that device (office app or worker app;
+  remembered per login). Workers always go to the worker app, everyone else to the office app as before.
+- The session cookie's name carries the port (`fs_session_3000`): a second copy of the app on the same PC (e.g. a
+  test copy on another port) no longer logs the real one out. Everyone logs in once more after this update.
+
+**Tested (after #1–#13):** `npm test` **52 pass** (new: every table line reachable; workers refused the three item
+lists; movements carry the login id, undo by id with the name only for old rows; no two logins with the same name;
+floor stats by id; odd page addresses; photos / password-change lockout; 404 for a van that is gone; tries left /
+lock end / Unlock / reset lifts the lock; session-ended answer and cookie cleared; per-port cookie). Clicked through
+on the test copy (port 3710): log in page warnings and lock time (390 px); Logins page lock + Unlock, Reset password
+→ hand-over box (network address, Copy), own role greyed; a session removed on the server → "You've been logged
+out…"; stores dashboard and item Place; leading hand dashboard, first log in → worker app, then office app
+remembered; worker-app Log out clears the remembered takes / bookings / van.

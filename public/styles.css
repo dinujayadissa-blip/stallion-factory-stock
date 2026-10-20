@@ -1051,3 +1051,8 @@ td.lg-acts { white-space: nowrap; text-align: right; }
   td.lg-acts { grid-column: 1 / -1; white-space: normal; text-align: left; display: flex !important; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
   td.lg-acts .btn { min-height: 44px; }
 }
+/* Logins: the username + temporary password to hand over (issue #13) */
+.handover .ho-row { display: flex; gap: 12px; align-items: baseline; padding: 8px 0; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+.handover .ho-l { width: 150px; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .06em; font-family: var(--font-mono); }
+.handover .ho-big { font-size: 20px; font-weight: 600; color: var(--espresso); user-select: all; }
+.handover .hint { margin-top: 10px; }

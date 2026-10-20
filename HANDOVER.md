@@ -92,7 +92,9 @@ the office PC and open the app folder can do this — so keep the office PC itse
 - Logins and sessions are in `factory.db` (tables `users`, `sessions`), so backups include them; passwords are only
   stored as scrypt hashes, sessions only as sha256 of the cookie's token.
 - Five wrong passwords for a username lock it for 15 minutes on that device; 30 wrong tries from one device in 15
-  minutes lock that device for 15 minutes. Restarting the app clears the locks.
+  minutes lock that device for 15 minutes. Restarting the app clears the locks. The owner can Unlock a username on **Logins**.
+- The session cookie is named after the port (`fs_session_3000`), so a test copy on another port on the same PC
+  never logs the live app out.
 - Changes (`POST/PUT/DELETE /api/…`, incl. log in) are only accepted when the browser used one of this PC's own
   names / addresses (localhost, the LAN / Tailscale addresses, the PC name, `<PC name>.local`) or a name in the env
   `ALLOWED_HOSTS`. If staff reach the PC by another name (e.g. a router DNS name), add it there; the log says

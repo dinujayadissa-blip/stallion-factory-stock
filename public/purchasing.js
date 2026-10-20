@@ -384,7 +384,7 @@ function renderOrderTab(root, { sh, checks }, show) {
       : `${real.length} line(s)`;
     return `<details class="pur-sec" data-grp="${g}" ${open ? 'open' : ''}><summary><span class="sec-title">${title}</span>
       <span class="muted small">${count}${chk ? ` · + ${chk} part${chk === 1 ? '' : 's'} the plan says ${chk === 1 ? 'was' : 'were'} ordered (${chkNums(list)} order number${chkNums(list) === 1 ? '' : 's'}) – check, not counted` : ''}${g === 'soon' ? ` · next ${win} weeks` : ''}</span><span class="small muted sec-help">${help}</span></summary>
-      ${blocks.length ? `<div class="sec-tools small"><span class="muted">${blocks.length} supplier${blocks.length === 1 ? '' : 's'} — ${touchScreen ? 'tap' : 'click'} one to see its lines${phone ? ', tick them and make the PO' : ''}.</span>
+      ${blocks.length ? `<div class="sec-tools small"><span class="muted">${blocks.length} supplier${blocks.length === 1 ? '' : 's'} — ${touchScreen ? 'tap' : 'click'} one to see its lines${phone && can('office') ? ', tick them and make the PO' : ''}.</span>
           <button class="btn small link" data-openall="${g}">Open all</button><button class="btn small link" data-closeall="${g}">Close all</button></div>
         ${blocks.map(([s, ls]) => supBlock(g, s, ls)).join('')}` : list.length ? '' : '<div class="empty" style="padding:14px">Nothing here.</div>'}
       ${onlyChkHtml}</details>`;

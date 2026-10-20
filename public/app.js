@@ -35,15 +35,16 @@ const planOrderedTag = text => { const d = planOrderedDate(text);
 var ME = null;
 const can = k => !!ME?.can?.[k];
 // Not logged in (any more): to the log in page, and back to this same place afterwards.
-function toLogin() {
+// `ended`: the session ended on the office PC (turned off, new role, password reset…) — the log in page says so.
+function toLogin(ended = false) {
   if (toLogin.going) return;
   toLogin.going = true;
-  location.href = `/login?next=${encodeURIComponent(location.pathname + location.search + location.hash)}`;
+  location.href = `/login?next=${encodeURIComponent(location.pathname + location.search + location.hash)}${ended ? '&ended=1' : ''}`;
 }
 // A refused request: not logged in → the log in page. (A login that may not do it gets the server's plain
 // "Your login can't do that — ask the owner", shown like any other message.)
 function authCheck(res, data) {
-  if (res.status === 401 || (res.status === 403 && data?.mustChange)) { toLogin(); throw new Error('Please log in'); }
+  if (res.status === 401 || (res.status === 403 && data?.mustChange)) { toLogin(!!data?.ended); throw new Error('Please log in'); }
 }
 
 async function api(method, url, body) {
@@ -509,7 +510,7 @@ async function renderHome() {
         ? `<div class="tt-sub">+ ${nDateChk} date${nDateChk === 1 ? '' : 's'} to check</div>` : ''}</a>
       <a class="tile tt ${nDue2 ? 'warn' : ''}" href="#/vans" data-focus="due2"><div class="n">${nDue2}</div><div class="l">due in 2 weeks</div></a>
       <a class="tile tt ${c.vansShort ? 'warn' : ''}" href="#/vans" data-focus="waiting"><div class="n">${c.vansShort}</div><div class="l">waiting on parts</div></a>
-      <a class="tile tt ${s.overdue.length ? 'bad' : ''}" href="#/purchasing/po" data-scroll="overdue-box"><div class="n">${s.overdue.length}</div><div class="l">deliveries overdue</div></a>
+      <a class="tile tt ${s.overdue.length ? 'bad' : ''}" href="#/purchasing/po" data-scroll="overdue-box" data-need="stock"><div class="n">${s.overdue.length}</div><div class="l">deliveries overdue</div></a>
     </div></div>`;
   // Small fixes & phone round 3 (owner-r2-2): on a phone the lists below the vans fold to one line each with
   // their count ("Reminders 23 · 5 overdue"), opened with a tap (and kept open for this visit). The PC shows
@@ -528,8 +529,8 @@ async function renderHome() {
       <a class="btn" href="/api/export/plan.xlsx" data-need="export">Export production plan (Excel)</a></div></div>
     <div class="dash">
     ${todayTiles}
-    <div class="dash-action">${needsActionHtml(s, { late: nLate })}</div>
-    <div class="dash-golive">${goLiveHtml(s.golive)}</div>
+    <div class="dash-action">${can('office') ? needsActionHtml(s, { late: nLate }) : roleTodoHtml(s, { late: nLate, rems, remLate })}</div>
+    <div class="dash-golive">${can('office') ? goLiveHtml(s.golive) : ''}</div>
     <div class="grid2 dash-grid">
       <div class="panel flush dash-vans"><h2>Vans by delivery date</h2>
         <div class="table-wrap"><table class="cards-sm" id="dash-vans"><thead><tr><th>Chassis</th><th>Model</th><th>Due</th><th>Status</th><th style="width:30%">Parts</th></tr></thead><tbody>
@@ -566,7 +567,7 @@ async function renderHome() {
               ? ` <a href="#/vans/${w.van_id}" class="nowrap more-link">+ ${w.parts.length - 8} more</a>` : ''}</div></td></tr>`; }).join('')
             : '<tr><td class="empty">No van due soon is waiting on parts.</td></tr>'}
           </tbody></table></div>` })}
-        ${panel({ k: 'order', cls: 'dash-order', head: 'Order now', title: 'Order now', count: `${s.action.orderNow} part${s.action.orderNow === 1 ? '' : 's'}`,
+        ${!can('stock') ? '' : panel({ k: 'order', cls: 'dash-order', head: 'Order now', title: 'Order now', count: `${s.action.orderNow} part${s.action.orderNow === 1 ? '' : 's'}`,
           body: `<div class="table-wrap"><table><thead><tr><th>Part</th><th>For</th><th>Needed by</th><th class="num">Order</th></tr></thead><tbody>
           ${s.toOrder.length ? s.toOrder.map(r => `<tr><td>${esc(r.name)}${r.po_spec ? `<div class="small">${esc(r.po_spec)}</div>` : ''}<div class="small muted">${esc(r.supplier || 'no supplier')}</div></td>
             <td class="nowrap">${r.topup ? '<span class="small muted">shelf</span>' : `${r.build_pos ? `<span class="chip bo" title="Place in the build order">#${r.build_pos}</span> ` : ''}<a href="#/vans/${r.van_id}">${esc(r.chassis)}</a>`}${r.urgent ? ' <span class="chip urgent">borrowed</span>' : ''}</td>
@@ -576,10 +577,10 @@ async function renderHome() {
           </tbody></table></div>
           <div style="padding:10px 16px"><a href="#/purchasing">Go to purchasing →</a>${c.itemsToOrder > 0 ? ` <span class="small muted">(order now: ${esc(c.orderNowText)}${c.comingUp ? ` · ${c.comingUp} part(s) coming up` : ''})</span>` : ''}</div>
         ` })}
-        ${s.overdue.length ? panel({ k: 'overdue', cls: 'dash-overdue', head: `Overdue deliveries (${s.overdue.length})`, title: 'Overdue deliveries', count: `<span class="overdue">${s.overdue.length}</span>`,
+        ${s.overdue.length && can('stock') ? panel({ k: 'overdue', cls: 'dash-overdue', head: `Overdue deliveries (${s.overdue.length})`, title: 'Overdue deliveries', count: `<span class="overdue">${s.overdue.length}</span>`,
           body: `${overduePanelHtml(s.overdue.slice(0, 10))}
           ${s.overdue.length > 10 ? `<div class="small muted" style="padding:6px 16px">+ ${s.overdue.length - 10} more on the Purchasing page</div>` : ''}` }) : ''}
-        ${s.decisions.length ? panel({ k: 'dec', cls: 'dash-dec', id: 'decisions-panel', head: `Waiting on a decision (${s.decisions.length})`, title: 'Waiting on a decision', count: s.decisions.length,
+        ${s.decisions.length && can('office') ? panel({ k: 'dec', cls: 'dash-dec', id: 'decisions-panel', head: `Waiting on a decision (${s.decisions.length})`, title: 'Waiting on a decision', count: s.decisions.length,
           body: `
           <p class="muted small" style="padding:0 16px;margin-top:-6px">Customer supplies / to be decided — reminders, not stock or orders.</p>${decisionsPanelHtml(s.decisions)}` }) : ''}
         ${panel({ k: 'recent', cls: 'dash-recent', head: 'Recent stock movements', title: 'Recent stock movements', count: s.recent.length ? `last ${s.recent.length}` : 'none',
@@ -657,6 +658,30 @@ function needsActionHtml(s, { late = 0 } = {}) {
           <span class="an">${n}</span><span><strong>${esc(label)}</strong> <span class="small muted">${esc(help)}</span></span></a>`).join('')}</div></div>
     </div>
     <div class="small muted" style="margin-top:8px">${s.counts.planned} vans planned · ${s.counts.inProduction} in production · ${s.counts.vansShort} of ${s.counts.vansNear} van(s) due soon waiting on parts · ${s.counts.openPOs} open purchase orders</div></div>`;
+}
+
+// Stores and leading hands (logins and job roles, issue #13): no office to-do or go-live checklist (they can't open
+// those pages) — only what their job role can act on.
+//   stores:       overdue deliveries, purchase orders to receive, stock checks, racks not counted yet
+//   leading hand: vans late, reminders overdue / due today, reminders open
+function roleTodoHtml(s, { late = 0, rems = [], remLate = 0 } = {}) {
+  const today = localToday();
+  const remToday = rems.filter(r => r.due === today).length;
+  const notCounted = (s.golive?.steps || []).find(x => x.key === 'e')?.places?.reduce((n, p) => n + (p.left || 0), 0) || 0;
+  const rows = can('stock') ? [
+    [s.overdue.length, 'Overdue deliveries', 'PO line(s) that should have arrived — chase or book them in', '#/purchasing/po', 'overdue-box'],
+    [s.counts.openPOs || 0, 'Purchase orders to receive', 'open POs — Receive… when a delivery comes', '#/purchasing/po', ''],
+    [s.counts.stockChecks || 0, 'Stock checks', 'floor corrections, borrowings and count differences to look at', '#/checks', ''],
+    [notCounted, 'Parts not counted yet', 'shelf parts on racks that were never counted — Count a rack', '#/stock', ''],
+  ] : [
+    [late, 'Vans late', 'in production past their due date', '#/vans', ''],
+    [remLate, 'Reminders overdue', 'reminders past their date', '#/', 'rem-panel'],
+    [remToday, 'Reminders due today', '', '#/', 'rem-panel'],
+    [rems.length, 'Reminders open', 'on the Factory floor van panels too', '#/factory', ''],
+  ];
+  const head = can('stock') ? 'Stores to-do' : 'Floor to-do';
+  return `<div class="panel action-panel"><div class="todo-h">${head}</div><div class="action-list">${rows.map(([n, label, help, href, scroll]) =>
+    `<a class="action-row ${n ? '' : 'zero'}" href="${href}" ${scroll ? `data-scroll="${scroll}"` : ''}><span class="an">${n}</span><span><strong>${esc(label)}</strong> <span class="small muted">${esc(help)}</span></span></a>`).join('')}</div></div>`;
 }
 
 function goLiveHtml(g) {
@@ -1018,8 +1043,8 @@ async function renderPlan() {
         <input type="search" id="pv" placeholder="Find van…" style="width:180px" value="${esc(opts.v || '')}">
         <input type="search" id="pc" placeholder="Show columns matching… (e.g. battery, solar)" style="width:300px" value="${esc(opts.c || '')}">
         <label class="row"><input type="checkbox" id="pa" ${opts.all ? 'checked' : ''}> Include finished vans</label>
-        <span class="grow"></span><span class="muted small mouse-only">Click a cell to mark it ordered, received or fitted</span>
-        <span class="muted small touch-only">${byVan ? 'Tap a van to see its parts by state (counted as on the van page)' : 'Tap a cell to see it — nothing changes until you tap a button there twice'}</span>
+        <span class="grow"></span><span class="muted small mouse-only">${can('office') ? 'Click a cell to mark it ordered, received or fitted' : 'Click a cell to see it'}</span>
+        <span class="muted small touch-only">${byVan ? 'Tap a van to see its parts by state (counted as on the van page)' : (can('office') ? 'Tap a cell to see it — nothing changes until you tap a button there twice' : 'Tap a cell to see it')}</span>
       </div>
       ${byVan ? '<div class="pv-list" id="pvlist"></div>' : `<div class="plan-wrap"><table class="plan" id="plan">
         <thead><tr><th class="stick c1"><span class="no-phone">Chassis</span><span class="ph-only">Van</span></th><th class="stick c2">Van</th><th class="stick c3">Due</th>
@@ -1341,7 +1366,7 @@ async function renderVan(vanId) {
         </tbody></table></div></div>`,
     review: () => `
       <div class="panel">
-        <p class="muted" style="margin-top:0">Options on the dealer order that no parts rule covers — usually custom requests. Add parts for them with <strong>+ Add part</strong>, or teach the system with a new rule on the <a href="#/rules">Parts rules</a> page so it's automatic next time.</p>
+        <p class="muted" style="margin-top:0">Options on the dealer order that no parts rule covers — usually custom requests.<span data-need="office"> Add parts for them with <strong>+ Add part</strong>, or teach the system with a new rule on the <a href="#/rules">Parts rules</a> page so it's automatic next time.</span></p>
         ${d.review.length ? d.review.map(r => `<div class="review-item"><div class="grow"><div class="lbl">${esc(r.label)}</div><div>${esc(r.value)}</div></div>
           <button class="btn small no-print" data-need="office" data-addfor="${esc(r.label + ': ' + r.value)}">+ Add part</button></div>`).join('') : '<div class="muted">Nothing to check.</div>'}
         <div class="row" style="margin-top:14px">
@@ -1365,7 +1390,7 @@ async function renderVan(vanId) {
         <label class="field" style="grid-column:1/-1">Notes<textarea name="notes" rows="3">${esc(v.notes)}</textarea></label>
       </form>
       <div class="row" style="margin-top:12px" data-need="office"><button class="btn primary" id="vsave">Save details</button>
-      <span class="hint">Completed: parts still set aside for this van are counted as used. Use Return for anything that came back to the shelf. Cancelled: they go back to the other vans.</span></div></div>`,
+      <span class="hint" data-need="office">Completed: parts still set aside for this van are counted as used. Use Return for anything that came back to the shelf. Cancelled: they go back to the other vans.</span></div></div>`,
   };
 
   // The status filter, kept while switching tabs; on a phone the list opens on the parts still missing (C5).
@@ -1706,11 +1731,32 @@ async function receiveDialog(i) {
   });
 }
 
+// Where a part is kept: rack + shelf / bin (issue #13 — stores can set it here; the server lets stores change only
+// these two fields of a part). Shown on the worker app's Find a part, with the rack on the map.
+async function placeDialog(i) {
+  const lay = await api('GET', '/api/layout');
+  const racks = lay.areas.filter(a => a.kind === 'storage').sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+  const m = modal(`Where is ${i.name} kept?`, `<form id="plf" class="form-grid">
+      <label class="field">Rack<select name="area_id"><option value="">— not on a rack —</option>${racks.map(a =>
+        `<option value="${a.id}" ${a.id === i.area_id ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select></label>
+      <label class="field">Shelf / bin<input type="text" name="location" maxlength="60" value="${esc(i.location || '')}" placeholder="e.g. Shelf 3"></label></form>
+    <div class="hint" style="margin-top:8px">Workers see it on Find a part, with the rack on the map.</div>`,
+  { footer: '<button class="btn" data-close>Cancel</button><button class="btn primary" id="plf-save">Save place</button>' });
+  $('[data-close]', m.el).onclick = m.close;
+  $('#plf-save', m.el).onclick = e => {
+    const f = formData($('#plf', m.el));
+    return busy(e.currentTarget, async () => {
+      await act(() => api('PUT', `/api/items/${i.id}`, { area_id: f.area_id ? Number(f.area_id) : null, location: String(f.location || '').trim().slice(0, 60) }), 'Place saved');
+      itemsCache = null; m.close(); itemDialog(i.id);
+    });
+  };
+}
+
 async function itemDialog(itemId) {
   const d = await api('GET', `/api/items/${itemId}`);
   const i = d.item;
   // Receive / Count / Edit: inside the window on a PC; in the bottom bar on a phone, always in reach (C8).
-  const itemActs = '<button class="btn" data-need="stock" data-ia="recv">Receive</button><button class="btn" data-need="stock" data-ia="count">Count / adjust</button><button class="btn" data-need="office" data-ia="edit">Edit item</button>';
+  const itemActs = '<button class="btn" data-need="stock" data-ia="recv">Receive</button><button class="btn" data-need="stock" data-ia="count">Count / adjust</button><button class="btn" data-need="stock" data-ia="place">Place</button><button class="btn" data-need="office" data-ia="edit">Edit item</button>';
   const m = modal(i.name, `
     <div class="item-head">
       <div class="photo-box">${i.photo
@@ -1753,7 +1799,7 @@ async function itemDialog(itemId) {
         <h3 style="margin-top:16px">Rules that add it</h3>${d.rules.length ? d.rules.map(r => `<div class="small"><strong>${esc(r.name)}</strong> <span class="mono faint">${esc(r.conditions.replace(/\n/g, ' · '))}</span> × ${esc(r.qty)}</div>`).join('') : '<div class="muted small">None — only added by hand.</div>'}
       </div>
       <div><h3>History</h3>${d.movements.length ? `<table><tbody>${d.movements.map(mv => `<tr><td class="small muted nowrap">${esc(mv.at.slice(0, 16))}</td>
-        <td class="small">${esc(mv.type)}${mv.chassis ? ` · ${esc(mv.chassis)}` : ''}${mv.ref ? ` · ${esc(mv.ref)}` : ''}${mv.worker ? ` · by ${esc(mv.worker)}` : ''}${mv.note ? `<div class="faint">${esc(mv.note)}</div>` : ''}</td>
+        <td class="small">${esc(mv.type)}${mv.chassis ? ` · ${esc(mv.chassis)}` : ''}${mv.ref && mv.ref !== mv.chassis ? ` · ${esc(mv.ref)}` : ''}${mv.worker ? ` · by ${esc(mv.worker)}` : ''}${mv.note ? `<div class="faint">${esc(mv.note)}</div>` : ''}</td>
         <td class="num" style="color:${mv.qty < 0 ? 'var(--bad)' : 'var(--ok)'}">${mv.qty > 0 ? '+' : ''}${q(mv.qty)}</td></tr>`).join('')}</tbody></table>` : '<div class="muted small">No movements yet.</div>'}
       </div></div>
     <details style="margin-top:14px" ${d.history.length && d.history.length <= 8 ? 'open' : ''}><summary><h3 style="display:inline">Set-aside history</h3>
@@ -1825,6 +1871,7 @@ async function itemDialog(itemId) {
   if (orph) orph.onclick = () => { m.close(); sessionStorage.setItem('stockTab', 'pervan'); if (location.hash === '#/stock') reload(); };
   const onAct = (k, fn) => $$(`[data-ia="${k}"]`, m.el).forEach(b => { b.onclick = fn; });
   onAct('recv', () => { m.close(); receiveDialog(i); });
+  onAct('place', () => { m.close(); placeDialog(i); });
   onAct('edit', async () => { m.close(); editItemDialog(i, [...new Set((await items()).map(x => x.category))].sort()); });
   onAct('count', () => {
     m.close();
@@ -2187,8 +2234,9 @@ async function renderLogins() {
         <td data-label="Job role">${esc(roleName(u.role))}</td>
         <td data-label="Trade">${u.trade ? esc(tradeName(u.trade)) : '<span class="faint">—</span>'}</td>
         <td data-label="Last log in" class="small">${u.last_login ? esc(fmtDateTime(u.last_login)) : '<span class="faint">never</span>'}${u.must_change ? '<div class="warn-text">must choose a new password</div>' : ''}</td>
-        <td data-label="Login">${u.active ? '<span class="chip ready">On</span>' : '<span class="chip cancelled">Turned off</span>'}</td>
-        <td class="lg-acts"><button class="btn small" data-uedit>Edit</button> <button class="btn small" data-upw>Reset password</button>
+        <td data-label="Login">${u.active ? '<span class="chip ready">On</span>' : '<span class="chip cancelled">Turned off</span>'}${u.locked_until
+          ? `<div class="warn-text">Locked until ${esc(clockText(u.locked_until))} (wrong passwords)</div>` : ''}</td>
+        <td class="lg-acts">${u.locked_until ? '<button class="btn small primary" data-uunlock>Unlock</button> ' : ''}<button class="btn small" data-uedit>Edit</button> <button class="btn small" data-upw>Reset password</button>
           ${u.id === ME.user.id ? '' : `<button class="btn small ${u.active ? 'danger' : ''}" data-uact>${u.active ? 'Turn off' : 'Turn on'}</button>`}</td></tr>`).join('')}
     </tbody></table></div></div>
     <div class="panel small muted">Forgotten owner password? On the office PC itself: <span class="mono">npm run users -- reset &lt;username&gt;</span> (README → Logins and roles).</div>`;
@@ -2197,6 +2245,11 @@ async function renderLogins() {
   $$('#logins-t tr[data-uid]').forEach(tr => {
     $('[data-uedit]', tr).onclick = () => loginDialog(d, user(tr));
     $('[data-upw]', tr).onclick = () => resetPasswordDialog(user(tr));
+    const ul = $('[data-uunlock]', tr);
+    if (ul) ul.onclick = e => busy(e.currentTarget, async () => {
+      await act(() => api('POST', `/api/users/${user(tr).id}/unlock`), `${user(tr).name} can log in again`);
+      reload();
+    });
     const a = $('[data-uact]', tr);
     if (a) a.onclick = e => {
       const u = user(tr);
@@ -2215,7 +2268,8 @@ function loginDialog(d, u = null) {
       <label class="field">Name (shown in the app)<input type="text" name="name" maxlength="40" value="${esc(u?.name || '')}" placeholder="e.g. Sam Smith"></label>
       ${isNew ? '<label class="field">Username (to log in)<input type="text" name="username" maxlength="32" autocapitalize="none" spellcheck="false" placeholder="e.g. sam"></label>'
         : `<label class="field">Username<input type="text" value="${esc(u.username)}" disabled></label>`}
-      <label class="field">Job role<select name="role">${Object.entries(d.roles).map(([k, r]) => `<option value="${k}" ${(u?.role || 'worker') === k ? 'selected' : ''}>${esc(r.label)}</option>`).join('')}</select></label>
+      <label class="field">Job role<select name="role" ${u && u.id === ME.user.id ? 'disabled' : ''}>${Object.entries(d.roles).map(([k, r]) => `<option value="${k}" ${(u?.role || 'worker') === k ? 'selected' : ''}>${esc(r.label)}</option>`).join('')}</select>
+        ${u && u.id === ME.user.id ? '<span class="hint">You can\'t change your own job role — another owner can.</span>' : ''}</label>
       <label class="field" id="lf-trade">Trade<select name="trade"><option value="">— pick the trade —</option>${Object.entries(d.trades).map(([k, t]) =>
         `<option value="${k}" ${u?.trade === k ? 'selected' : ''}>${esc(`${t.icon} ${t.label}`)}</option>`).join('')}</select></label>
       <div class="hint" style="grid-column:1/-1" id="lf-help"></div>
@@ -2233,20 +2287,70 @@ function loginDialog(d, u = null) {
   sync();
   $('#lf-save', m.el).onclick = e => {
     const f = formData($('#lf', m.el));
+    if (!f.role) f.role = role.value; // own login: the job role box is greyed out (a form doesn't send it)
     if (!f.name?.trim()) return toast("Type the person's name", true);
     if (f.role === 'worker' && !f.trade) return toast("Pick the worker's trade", true);
     if (isNew && !f.username?.trim()) return toast('Type a username', true);
     if (!isNew && u.role !== f.role && !confirm(`Change ${u.name} to ${d.roles[f.role]?.label}? They are logged out and log in again with the new job role.`)) return;
     return busy(e.currentTarget, async () => {
       if (isNew) {
-        await act(() => api('POST', '/api/users', { name: f.name, username: f.username.trim(), role: f.role, trade: f.trade, password: f.password,
-          must_change: $('[name=must_change]', m.el).checked }), `Login added for ${f.name.trim()}`);
+        const must = $('[name=must_change]', m.el).checked;
+        const nu = await act(() => api('POST', '/api/users', { name: f.name, username: f.username.trim(), role: f.role, trade: f.trade, password: f.password,
+          must_change: must }), `Login added for ${f.name.trim()}`);
+        m.close();
+        handOverDialog(nu, f.password, must, d);
+        return reload();
       } else {
         await act(() => api('PUT', `/api/users/${u.id}`, { name: f.name, role: f.role, trade: f.role === 'worker' ? f.trade : '' }), 'Saved');
       }
       m.close();
       reload();
     });
+  };
+}
+
+// "3:45 pm" from a time in ms (this computer's clock).
+const clockText = ms => { const d = new Date(ms); const h = d.getHours(); return `${h % 12 || 12}:${String(d.getMinutes()).padStart(2, '0')} ${h < 12 ? 'am' : 'pm'}`; };
+
+// After Add login / Reset password: the username and temporary password to hand over — Copy, or Print a slip.
+// (Shown once here; the app never shows a password again.)
+async function handOverDialog(u, password, mustChange, d = null) {
+  // The address to give them: on the office PC itself (localhost) the network address from Settings instead.
+  let base = `${location.protocol}//${location.host}`;
+  if (['localhost', '127.0.0.1', '[::1]'].includes(location.hostname) && can('settings')) {
+    try { const lan = (await api('GET', '/api/settings')).floorUrls?.[0]; if (lan) base = lan.replace(/\/floor$/, ''); } catch { /* keep this address */ }
+  }
+  const where = `${base}${u.role === 'worker' || u.role === 'leadhand' ? '/floor' : '/'}`;
+  const role = d?.roles?.[u.role]?.label || ME?.roles?.[u.role] || u.role;
+  const lines = ['Stallion Caravans – Factory Stock', `Name: ${u.name}`, `Open: ${where}`, `Username: ${u.username}`, `Temporary password: ${password}`,
+    ...(mustChange ? ['You choose your own password the first time you log in.'] : [])];
+  const m = modal(`Login for ${u.name}`, `<div class="handover">
+      <div class="ho-row"><span class="ho-l">Open</span><span class="mono">${esc(where)}</span></div>
+      <div class="ho-row"><span class="ho-l">Username</span><span class="mono ho-big">${esc(u.username)}</span></div>
+      <div class="ho-row"><span class="ho-l">Temporary password</span><span class="mono ho-big">${esc(password)}</span></div>
+      <div class="hint">${esc(role)}. ${mustChange ? 'They choose their own password the first time they log in.' : 'They keep this password until they change it.'}
+        Give it to them in person — it isn't shown again.</div></div>`,
+  { footer: '<button class="btn" id="ho-print">Print</button><button class="btn" id="ho-copy">Copy</button><button class="btn primary" data-close>Done</button>' });
+  $('[data-close]', m.el).onclick = m.close;
+  $('#ho-copy', m.el).onclick = async () => {
+    const text = lines.join('\n');
+    // navigator.clipboard needs https / localhost; on the office network the older way is used.
+    try { await navigator.clipboard.writeText(text); toast('Copied'); return; } catch { /* fall back */ }
+    const ta = document.createElement('textarea');
+    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.append(ta); ta.select();
+    let ok = false;
+    try { ok = document.execCommand('copy'); } catch { ok = false; }
+    ta.remove();
+    toast(ok ? 'Copied' : 'Could not copy — write it down', !ok);
+  };
+  $('#ho-print', m.el).onclick = () => {
+    const w = window.open('', '_blank', 'width=480,height=600');
+    if (!w) return toast('Allow pop-ups to print the slip', true);
+    w.document.write(`<!doctype html><meta charset="utf-8"><title>Login for ${esc(u.name)}</title>
+      <body style="font:16px/1.6 Inter,Arial,sans-serif;padding:24px"><h2 style="margin:0 0 12px">${esc(lines[0])}</h2>
+      <p>${lines.slice(1).map(l => esc(l)).join('<br>')}</p></body>`);
+    w.document.close(); w.focus(); w.print();
   };
 }
 
@@ -2261,8 +2365,10 @@ function resetPasswordDialog(u) {
     const pw = $('[name=password]', m.el).value;
     if (pw.length < 8) return toast('Use at least 8 characters for the password', true);
     return busy(e.currentTarget, async () => {
-      await act(() => api('POST', `/api/users/${u.id}/password`, { password: pw, must_change: $('[name=must_change]', m.el).checked }), `${u.name}'s password is reset`);
+      const must = $('[name=must_change]', m.el).checked;
+      const nu = await act(() => api('POST', `/api/users/${u.id}/password`, { password: pw, must_change: must }), `${u.name}'s password is reset`);
       m.close();
+      handOverDialog(nu, pw, must);
       reload();
     });
   };
@@ -2280,6 +2386,7 @@ async function boot() {
   if (!ME.can.officeApp) { location.replace('/floor'); return; }
   for (const [k, v] of Object.entries(ME.can)) document.body.classList.toggle(`can-${k}`, !!v);
   document.body.dataset.role = ME.user.role;
+  try { localStorage.setItem(`fs.lastApp.${ME.user.username}`, '/'); } catch { /* private mode */ } // the log in page opens this app next time
   $('#who-name').textContent = ME.user.name;
   $('#who-role').textContent = ME.roles?.[ME.user.role] || ME.user.role;
   $('#who-box').hidden = false;
