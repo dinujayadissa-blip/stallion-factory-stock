@@ -313,3 +313,22 @@ test('issue #2: floor stats count by login id; only old movements (no id) by nam
   assert.equal(inv.floorStats({ userId: 102, name: 'Sam Smith' }).mine_took, 3);
   assert.equal(inv.floorStats('Sam Smith').mine_took, 1); // a plain name: only rows without a login id
 });
+
+test('issue #13: tries left before the lock, when it ends, the owner\'s Unlock', () => {
+  const t = auth.createThrottle();
+  const now = Date.UTC(2026, 9, 21, 1, 0, 0);
+  assert.deepEqual([1, 2, 3, 4, 5].map(i => t.fail('10.1.1.1', 'Sam', now + i)), [4, 3, 2, 1, 0]);
+  assert.equal(t.lockedUntil('10.1.1.1', 'sam', now + 10), now + 5 + 15 * 60 * 1000);
+  assert.equal(t.lockedUntil('10.1.1.2', 'sam', now + 10), 0);
+  t.fail('10.1.1.9', 'other', now);
+  assert.deepEqual([...t.lockedUsers(now + 10)], [['sam', now + 5 + 15 * 60 * 1000]]);
+  t.unlockUser('SAM');
+  assert.equal(t.locked('10.1.1.1', 'sam', now + 10), false);
+  assert.equal(t.lockedUsers(now + 10).size, 0);
+  // the cookie name carries the port
+  auth.setCookiePort(3000);
+  assert.match(auth.sessionCookie('tok'), /^fs_session_3000=tok;/);
+  assert.equal(auth.readCookie('fs_session=old; fs_session_3000=new'), 'new');
+  auth.setCookiePort(0);
+  assert.match(auth.sessionCookie('tok'), /^fs_session=tok;/);
+});

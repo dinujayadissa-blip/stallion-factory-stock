@@ -15,7 +15,9 @@ function safeNext() {
   return n;
 }
 // Where to go after logging in: the page asked for, or the worker app for workers / leading hands.
-const home = user => safeNext() || (['worker', 'leadhand'].includes(user.role) ? '/floor' : '/');
+// A leading hand goes back to the app they used last on this device (office app or worker app).
+const lastApp = user => { try { return localStorage.getItem(`fs.lastApp.${user.username}`) || ''; } catch { return ''; } };
+const home = user => safeNext() || (user.role === 'worker' ? '/floor' : user.role === 'leadhand' ? (lastApp(user) === '/' ? '/' : '/floor') : '/');
 const go = user => location.replace(home(user));
 
 async function call(method, url, body) {
@@ -44,6 +46,16 @@ function wireShow() {
     };
   });
 }
+// "3:45 pm" — when a lock ends (this device's clock).
+const clockAt = ms => { const d = new Date(ms); const h = d.getHours(); return `${h % 12 || 12}:${String(d.getMinutes()).padStart(2, '0')} ${h < 12 ? 'am' : 'pm'}`; };
+// The server's answer to a wrong try, in plain words: tries left before the lock, or when the lock ends.
+function tryMessage(e) {
+  const d = e.data || {};
+  if (d.until) return `Too many tries — wait 15 minutes. You can try again at ${clockAt(d.until)}.`;
+  if (e.status === 401 && d.left > 0 && d.left <= 2) return `${e.message} — ${d.left} tr${d.left === 1 ? 'y' : 'ies'} left, then a 15-minute wait.`;
+  return e.message;
+}
+const ENDED = "You've been logged out — your login may have been changed or turned off. Ask the owner if you can't log in.";
 const showError = msg => {
   let e = $('.lg-err', card);
   if (!e) { e = document.createElement('div'); e.className = 'lg-err'; e.setAttribute('role', 'alert'); card.querySelector('form').prepend(e); }
@@ -61,10 +73,11 @@ function onSubmit(form, fn) {
 }
 
 // ── Log in ──
-function loginForm(note = '') {
+function loginForm(note = '', warn = '') {
   card.innerHTML = `<form id="f" novalidate>
       <h1>Log in</h1>
       ${note ? `<div class="lg-ok">${esc(note)}</div>` : ''}
+      ${warn ? `<div class="lg-warn" role="status">${esc(warn)}</div>` : ''}
       <label class="lg-field" for="u">Username
         <input id="u" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" required maxlength="64"></label>
       ${pwField('p', 'Password')}
@@ -79,7 +92,7 @@ function loginForm(note = '') {
     if (!password) { $('#p').focus(); throw new Error('Type your password'); }
     let r;
     try { r = await call('POST', '/api/login', { username, password }); }
-    catch (e) { $('#p').value = ''; $('#p').focus(); throw e; }
+    catch (e) { $('#p').value = ''; $('#p').focus(); throw new Error(tryMessage(e)); }
     if (r.user.mustChange) return changeForm(r.user, password);
     go(r.user);
   });
@@ -104,7 +117,9 @@ function changeForm(user, current = '') {
     const cur = current || $('#c').value, n1 = $('#n1').value, n2 = $('#n2').value;
     if (n1.length < 8) { $('#n1').focus(); throw new Error('Use at least 8 characters for the password'); }
     if (n1 !== n2) { $('#n2').value = ''; $('#n2').focus(); throw new Error("The two new passwords aren't the same — type them again"); }
-    const r = await call('POST', '/api/me/password', { current: cur, password: n1 });
+    let r;
+    try { r = await call('POST', '/api/me/password', { current: cur, password: n1 }); }
+    catch (e) { throw new Error(tryMessage(e)); }
     go(r.user);
   });
 }
@@ -156,11 +171,12 @@ async function start() {
     return;
   }
   // Already logged in on this browser: straight on (or the new-password step first).
+  let ended = params.get('ended') === '1';
   try {
     const me = await call('GET', '/api/me');
     if (me.user.mustChange) return changeForm(me.user);
     return go(me.user);
-  } catch { /* not logged in */ }
-  loginForm(params.has('out') ? "You're logged out." : '');
+  } catch (e) { if (e.data?.ended) ended = true; /* not logged in */ }
+  loginForm(params.has('out') ? "You're logged out." : '', ended ? ENDED : '');
 }
 start();

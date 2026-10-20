@@ -68,14 +68,14 @@ async function api(method, url, body) {
     throw new Error(method === 'GET' ? 'No signal — check the Wi-Fi and try again' : 'No signal. Not sure it saved. Check the list before trying again.');
   } finally { clearTimeout(timer); }
   // Not logged in (any more), or a new password to choose first: the log in page, then back here.
-  if (res.status === 401 || (res.status === 403 && data.mustChange)) toLogin();
+  if (res.status === 401 || (res.status === 403 && data.mustChange)) toLogin(!!data.ended);
   if (!res.ok) throw Object.assign(new Error(data.error || 'Something went wrong — try again'), { status: res.status, confirm: data.confirm });
   return data;
 }
-function toLogin() {
+function toLogin(ended = false) {
   if (toLogin.going) return;
   toLogin.going = true;
-  location.href = `/login?next=${encodeURIComponent(`/floor${location.hash}`)}`;
+  location.href = `/login?next=${encodeURIComponent(`/floor${location.hash}`)}${ended ? '&ended=1' : ''}`;
 }
 // A one-off id for a request, so a retry isn't booked twice (crypto.randomUUID needs https).
 const requestId = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
@@ -956,6 +956,7 @@ async function boot() {
   }
   if (ME.user.mustChange) return toLogin();
   me = ME.user.name;
+  try { localStorage.setItem(`fs.lastApp.${ME.user.username}`, '/floor'); } catch { /* private mode */ } // the log in page opens this app next time
   if (ME.user.role === 'worker') trade = ME.user.trade; // fixed: only their own trade
   else trade = store.get(tradeKey(), '') || store.get('trade', '') || ''; // (the trade picked on this phone before logins)
   if (location.hash === '#name') history.replaceState(history.state, '', '#home'); // the old "type your name" screen is gone

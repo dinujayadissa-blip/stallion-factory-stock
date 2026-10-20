@@ -52,3 +52,4 @@ button, input { font: inherit; color: inherit; }
 .lg-err { background: var(--bad-soft); color: var(--bad); border: 1px solid #ecc2ba; border-radius: 6px; padding: 10px 12px; margin: 0 0 14px; font-weight: 600; }
 .lg-ok { background: var(--ok-soft); color: #4d6b2f; border: 1px solid #cfd8b5; border-radius: 6px; padding: 10px 12px; margin: 0 0 14px; font-weight: 600; }
 .lg-foot { text-align: center; color: var(--muted); font-size: 13px; margin-top: 18px; }
+.lg-warn { background: #fbf0dc; color: #7a4a00; border: 1px solid #eed6a6; border-radius: 6px; padding: 10px 12px; margin: 0 0 14px; font-weight: 600; line-height: 1.4; }

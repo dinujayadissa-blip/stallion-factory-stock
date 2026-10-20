@@ -32,6 +32,7 @@ const app = express();
 // PORT=0 picks any free port (the tests use it); unset = 3000.
 const PORT = process.env.PORT != null && String(process.env.PORT).trim() !== '' ? Number(process.env.PORT) : 3000;
 let listenPort = PORT; // the port really in use (set once listening)
+auth.setCookiePort(PORT);
 const dir = path.dirname(fileURLToPath(import.meta.url));
 // Local date and time for the log ("2026-10-12 14:05:09"), so "it failed yesterday afternoon" can be found.
 const now = () => new Date().toLocaleString('sv-SE');
@@ -61,6 +62,11 @@ app.use((req, res, next) => {
       req.user = s.user;
       req.sessionHash = s.tokenHash;
       if (s.refreshed) res.append('Set-Cookie', auth.sessionCookie(token, { secure: req.secure })); // 30 more days
+    } else {
+      // The browser still had a session that has ended (turned off, new role, password reset, logged out on
+      // another device, 30 days unused): the log in page says so once, and the old cookie goes.
+      req.sessionEnded = true;
+      res.append('Set-Cookie', auth.clearCookie({ secure: req.secure }));
     }
   }
   next();
@@ -91,7 +97,7 @@ app.use('/api', (req, res, next) => {
   const rule = auth.apiRule(req.method, req.baseUrl + req.path);
   req.rule = rule;
   if (rule.who === 'public') return next();
-  if (!req.user) return res.status(401).json({ error: 'Please log in' });
+  if (!req.user) return res.status(401).json({ error: 'Please log in', ...(req.sessionEnded ? { ended: true } : {}) });
   if (req.user.mustChange && rule.who !== 'session') return res.status(403).json({ error: 'Choose a new password first', mustChange: true });
   if (!auth.roleAllowed(rule, req.user.role)) return res.status(403).json({ error: NO_RIGHTS });
   next();
@@ -106,7 +112,7 @@ app.use('/api', (req, res, next) => {
 // ── Pages: the office app and the worker app need a login; the login page doesn't ──
 // index.html and floor.html live in views/ (not public/), so no odd address (/%69ndex.html, //index.html…) can
 // reach them through the static files without these checks.
-const nextTo = req => `/login?next=${encodeURIComponent(req.originalUrl)}`;
+const nextTo = req => `/login?next=${encodeURIComponent(req.originalUrl)}${req.sessionEnded ? '&ended=1' : ''}`;
 const noStore = res => res.setHeader('Cache-Control', 'no-store');
 app.get(['/', '/index.html'], (req, res) => {
   noStore(res);
@@ -118,7 +124,7 @@ app.get(['/', '/index.html'], (req, res) => {
 });
 app.get(['/floor', '/floor.html'], (req, res) => {
   noStore(res);
-  if (!req.user || req.user.mustChange) return res.redirect(302, '/login?next=%2Ffloor');
+  if (!req.user || req.user.mustChange) return res.redirect(302, `/login?next=%2Ffloor${req.sessionEnded ? '&ended=1' : ''}`);
   if (req.path !== '/floor') return res.redirect(302, '/floor');
   res.sendFile(path.join(dir, 'views', 'floor.html'));
 });
@@ -154,7 +160,9 @@ const h = fn => async (req, res) => {
     if (!e.status) console.error(now(), req.method, req.originalUrl, e);
     // confirm: the action needs a yes first (e.g. taking another van's part); problems: every reason a save was refused.
     res.status(e.status || 500).json({ error: e.status ? e.message : 'Something went wrong — try again',
-      ...(e.status && e.confirm ? { confirm: e.confirm } : {}), ...(e.status && e.problems ? { problems: e.problems } : {}) });
+      ...(e.status && e.confirm ? { confirm: e.confirm } : {}), ...(e.status && e.problems ? { problems: e.problems } : {}),
+      // log in: tries left before the lock, and when a lock ends (ms) — the log in page says so
+      ...(e.status && e.left != null ? { left: e.left } : {}), ...(e.status && e.until ? { until: e.until } : {}) });
   }
 };
 const id = req => Number(req.params.id);
@@ -181,7 +189,8 @@ app.post('/api/me/password', h(async req => {
   // Wrong "current password" counts like a wrong log in (same lockout), so a phone left logged in can't be used to
   // guess the password.
   const ip = clientIp(req);
-  if (throttle.locked(ip, req.user.username)) throw inv.httpError(429, auth.LOCKED);
+  const lockEnd = throttle.lockedUntil(ip, req.user.username);
+  if (lockEnd) throw Object.assign(inv.httpError(429, auth.LOCKED), { until: lockEnd });
   try { await auth.changeOwnPassword(req.user.id, String(req.body.current ?? ''), String(req.body.password ?? ''), req.sessionHash); }
   catch (e) { if (e.wrongCurrent) throttle.fail(ip, req.user.username); throw e; }
   return meOut({ ...req.user, mustChange: false });
@@ -197,7 +206,17 @@ app.post('/api/setup', h(async (req, res) => {
   return meOut(u);
 }));
 // The Logins page (owner only — see the table in src/auth.js).
-app.get('/api/users', h(() => ({ users: auth.listUsers(), roles: auth.ROLES, trades: TRADES })));
+// locked_until: a username locked after wrong passwords (from any device) — the owner can Unlock it.
+app.get('/api/users', h(() => {
+  const locks = throttle.lockedUsers();
+  return { users: auth.listUsers().map(u => ({ ...u, locked_until: locks.get(u.username.toLowerCase()) || 0 })), roles: auth.ROLES, trades: TRADES };
+}));
+app.post('/api/users/:id/unlock', h(req => {
+  const u = auth.getUser(id(req));
+  if (!u) throw inv.httpError(404, 'That login no longer exists — refresh');
+  throttle.unlockUser(u.username);
+  console.log(now(), `Login unlocked: ${u.username} by ${req.user.username}`);
+}));
 app.post('/api/users', h(async req => {
   const b = req.body || {};
   const u = await auth.createUser({ username: b.username, name: b.name, role: String(b.role || ''), trade: String(b.trade || ''),
@@ -213,6 +232,7 @@ app.put('/api/users/:id', h(req => {
 }));
 app.post('/api/users/:id/password', h(async req => {
   const u = await auth.resetPassword(id(req), req.body.password, { mustChange: req.body.must_change !== false });
+  throttle.unlockUser(u.username); // a new password also lifts a lock from wrong tries
   console.log(now(), `Password reset: ${u.username} by ${req.user.username}`);
   return u;
 }));
@@ -717,6 +737,7 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   // Shows at a glance if the app has opened the wrong (or a brand-new, empty) data folder.
   console.log(`  Data folder:         ${DATA_DIR} - ${c.vans} vans, ${c.items} items${c.vans ? '' : '  (NO VANS - is this the right data folder?)'}`);
   listenPort = server.address().port;
+  auth.setCookiePort(listenPort);
   console.log(`  On this PC:          http://localhost:${listenPort}`);
   lan.forEach(ip => console.log(`  Other PCs / tablets:  http://${ip}:${listenPort}`));
   lan.forEach(ip => console.log(`  Workers' phones:      http://${ip}:${listenPort}/floor`));

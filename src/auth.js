@@ -417,7 +417,10 @@ export async function changeOwnPassword(userId, current, next, keepTokenHash = n
 // Cookie fs_session = a random 32-byte token; the database keeps only sha256(token). Sliding expiry:
 // 30 days from the last use, so phones stay logged in.
 
-export const COOKIE = 'fs_session';
+// The cookie's name carries the port the app runs on (fs_session_3000): browsers keep cookies per PC name, not
+// per port, so a second copy on the same PC (a test copy on another port) no longer logs the real one out.
+export let COOKIE = 'fs_session';
+export function setCookiePort(port) { COOKIE = Number(port) > 0 ? `fs_session_${Number(port)}` : 'fs_session'; }
 export const SESSION_DAYS = 30;
 const SESSION_MS = SESSION_DAYS * 24 * 60 * 60 * 1000;
 const TOUCH_MS = 5 * 60 * 1000; // write "last seen" at most every 5 minutes
@@ -453,7 +456,7 @@ export function endUserSessions(userId, exceptHash = null) {
 }
 export const pruneSessions = (now = Date.now()) => run('DELETE FROM sessions WHERE expires_at <= ?', now).changes;
 
-export function readCookie(header, name = COOKIE) {
+export function readCookie(header, name = COOKIE) { // (default = the name in use now)
   for (const part of String(header || '').split(';')) {
     const i = part.indexOf('=');
     if (i > 0 && part.slice(0, i).trim() === name) return part.slice(i + 1).trim();
@@ -481,18 +484,31 @@ export function createThrottle({ perUser = 5, perIp = 30, windowMs = 15 * 60 * 1
     if (map.size < 5000) return;
     for (const [k, e] of map) if (e.until <= now && !e.times.some(t => now - t < windowMs)) map.delete(k);
   }
+  // Returns how many tries are left before the lock (0 = locked now).
   const bump = (k, limit, now) => {
     const e = entry(k);
     e.times = e.times.filter(t => now - t < windowMs);
     e.times.push(now);
-    if (e.times.length >= limit) { e.until = now + lockMs; e.times = []; }
+    if (e.times.length >= limit) { e.until = now + lockMs; e.times = []; return 0; }
+    return limit - e.times.length;
   };
+  const until = (k, now) => { const u = map.get(k)?.until || 0; return u > now ? u : 0; };
+  const nameOf = k => k.slice(k.indexOf('|') + 1);
   return {
-    locked(ip, user, now = Date.now()) {
-      return (map.get(iKey(ip))?.until || 0) > now || (map.get(uKey(ip, user))?.until || 0) > now;
-    },
-    fail(ip, user, now = Date.now()) { prune(now); bump(uKey(ip, user), perUser, now); bump(iKey(ip), perIp, now); },
+    locked(ip, user, now = Date.now()) { return this.lockedUntil(ip, user, now) > 0; },
+    // When the lock for this username from this address ends (ms), or 0.
+    lockedUntil(ip, user, now = Date.now()) { return Math.max(until(iKey(ip), now), until(uKey(ip, user), now)); },
+    // A wrong try: how many are left for this username from this address (and the address as a whole).
+    fail(ip, user, now = Date.now()) { prune(now); const u = bump(uKey(ip, user), perUser, now); const i = bump(iKey(ip), perIp, now); return Math.min(u, i); },
     success(ip, user) { map.delete(uKey(ip, user)); },
+    // Usernames locked right now (from any address) → when the lock ends: for the Logins page.
+    lockedUsers(now = Date.now()) {
+      const out = new Map();
+      for (const [k, e] of map) if (k.startsWith('u:') && e.until > now) out.set(nameOf(k), Math.max(out.get(nameOf(k)) || 0, e.until));
+      return out;
+    },
+    // The owner's Unlock (and a password reset): every address's lock and wrong tries for this username.
+    unlockUser(user) { const n = String(user).trim().toLowerCase(); for (const k of [...map.keys()]) if (k.startsWith('u:') && nameOf(k) === n) map.delete(k); },
     clear() { map.clear(); },
   };
 }
@@ -500,12 +516,15 @@ export function createThrottle({ perUser = 5, perIp = 30, windowMs = 15 * 60 * 1
 // Same answer for an unknown username, a wrong password and a login that is turned off.
 export async function login({ username, password, ip = '', ua = '' }, throttle, now = Date.now()) {
   const uname = cleanUsername(username).slice(0, 64);
-  if (throttle.locked(ip, uname, now)) throw httpError(429, LOCKED);
+  const lockEnd = throttle.lockedUntil(ip, uname, now);
+  if (lockEnd) throw httpError(429, LOCKED, { until: lockEnd });
   const row = uname ? get('SELECT * FROM users WHERE username = ?', uname) : null;
   const ok = await verifyPassword(String(password ?? '').slice(0, 200), row?.pass_hash || DUMMY_HASH);
   if (!row || !ok || !row.active) {
-    throttle.fail(ip, uname, now);
-    throw httpError(401, WRONG);
+    const left = throttle.fail(ip, uname, now);
+    // `left`: tries left before the 15-minute lock (the page warns at 2 and 1) — the same for any username, so it
+    // says nothing about which usernames exist.
+    throw httpError(401, WRONG, { left, ...(left === 0 ? { until: throttle.lockedUntil(ip, uname, now) } : {}) });
   }
   throttle.success(ip, uname);
   run('UPDATE users SET last_login = ? WHERE id = ?', nowText(), row.id);

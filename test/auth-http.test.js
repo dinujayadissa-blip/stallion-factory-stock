@@ -40,7 +40,7 @@ function call(method, p, { body, as, headers = {}, host = '127.0.0.1' } = {}) {
     const data = body === undefined ? null : Buffer.from(JSON.stringify(body));
     const r = http.request({ host, port, method, path: p, headers: {
       ...(data ? { 'Content-Type': 'application/json', 'Content-Length': data.length } : {}),
-      ...(as ? { Cookie: `fs_session=${as}` } : {}), ...headers } }, res => {
+      ...(as ? { Cookie: `fs_session_${port}=${as}` } : {}), ...headers } }, res => {
       let text = '';
       res.setEncoding('utf8');
       res.on('data', c => { text += c; });
@@ -48,7 +48,7 @@ function call(method, p, { body, as, headers = {}, host = '127.0.0.1' } = {}) {
         let json = null;
         try { json = JSON.parse(text); } catch { /* not json */ }
         const cookies = [res.headers['set-cookie'] || []].flat();
-        const set = cookies.map(c => /^fs_session=([^;]*)/.exec(c)?.[1]).filter(v => v != null).pop();
+        const set = cookies.map(c => new RegExp(`^fs_session_${port}=([^;]*)`).exec(c)?.[1]).filter(v => v != null).pop();
         resolve({ status: res.statusCode, headers: res.headers, json, text, cookie: set, cookies });
       });
     });
@@ -109,7 +109,7 @@ test('first login: refused from another PC and through a proxy; made on this PC;
   r = await call('POST', '/api/setup', { body });
   assert.equal(r.status, 200, r.text);
   assert.equal(r.json.user.role, 'owner');
-  assert.match(r.cookies.join('\n'), /fs_session=[A-Za-z0-9_-]{43}; Path=\/; HttpOnly; SameSite=Lax; Max-Age=2592000/);
+  assert.match(r.cookies.join('\n'), new RegExp(`fs_session_${port}=[A-Za-z0-9_-]{43}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000`));
   S.owner = r.cookie;
   r = await call('POST', '/api/setup', { body: { ...body, username: 'boss2' } });
   assert.equal(r.status, 409);
@@ -323,7 +323,13 @@ test('the last owner stays an owner; a new role or a turned-off login logs that 
   // turned off: logged out, and can't log in
   r = await call('POST', `/api/users/${id.pat}/active`, { as: S.owner, body: { active: false } });
   assert.equal(r.status, 200, r.text);
-  assert.equal((await call('GET', '/api/floor/map', { as: S.pat })).status, 401);
+  let gone = await call('GET', '/api/floor/map', { as: S.pat });
+  assert.equal(gone.status, 401);
+  assert.equal(gone.json.ended, true); // issue #13: the page says the login was changed / turned off
+  assert.ok(gone.cookies.some(c => /Max-Age=0/.test(c))); // and the dead cookie goes
+  gone = await call('GET', '/', { as: S.pat });
+  assert.match(gone.headers.location, /ended=1/);
+  assert.equal((await call('GET', '/api/me')).json.ended, undefined); // never logged in: no such message
   r = await call('POST', '/api/login', { body: { username: 'pat', password: 'pat-pass-1' } });
   assert.equal(r.status, 401);
   assert.equal(r.json.error, 'Wrong username or password');
@@ -336,7 +342,7 @@ test('the last owner stays an owner; a new role or a turned-off login logs that 
 test('log out ends the session on the office PC', async () => {
   const r = await call('POST', '/api/logout', { as: S.olive });
   assert.equal(r.status, 200);
-  assert.ok(r.cookies.some(c => /^fs_session=;.*Max-Age=0/.test(c)));
+  assert.ok(r.cookies.some(c => new RegExp(`^fs_session_${port}=;.*Max-Age=0`).test(c)));
   assert.equal((await call('GET', '/api/me', { as: S.olive })).status, 401);
   assert.equal((await call('GET', '/', { as: S.olive })).status, 302);
 });
@@ -345,10 +351,26 @@ test('5 wrong passwords lock that username for 15 minutes; changes from another 
   for (let i = 0; i < 5; i++) {
     const r = await call('POST', '/api/login', { body: { username: 'sam', password: `wrong-${i}-x` } });
     assert.equal(r.json.error, 'Wrong username or password');
+    assert.equal(r.json.left, 4 - i); // issue #13: the page warns "2 tries left", "1 try left"
+    if (i === 4) assert.ok(r.json.until > Date.now());
   }
   let r = await call('POST', '/api/login', { body: { username: 'sam', password: 'sam-pass-1' } });
   assert.equal(r.status, 429);
   assert.equal(r.json.error, 'Too many tries — wait 15 minutes');
+  assert.ok(r.json.until > Date.now() + 14 * 60 * 1000); // when the lock ends
+  // issue #13: the owner sees the lock on Logins and can lift it
+  let list = (await call('GET', '/api/users', { as: S.owner })).json.users;
+  assert.ok(list.find(u => u.username === 'sam').locked_until > Date.now());
+  assert.equal(list.find(u => u.username === 'boss').locked_until, 0);
+  assert.equal((await call('POST', `/api/users/${id.sam}/unlock`, { as: S.owner })).status, 200);
+  assert.ok(await login('sam', 'sam-pass-1'));
+  // a password reset lifts a lock too
+  for (let i = 0; i < 5; i++) await call('POST', '/api/login', { body: { username: 'sam', password: `wrong-${i}-y` } });
+  assert.equal((await call('POST', '/api/login', { body: { username: 'sam', password: 'sam-pass-1' } })).status, 429);
+  assert.equal((await call('POST', `/api/users/${id.sam}/password`, { as: S.owner, body: { password: 'sam-new-pass-2', must_change: false } })).status, 200);
+  list = (await call('GET', '/api/users', { as: S.owner })).json.users;
+  assert.equal(list.find(u => u.username === 'sam').locked_until, 0);
+  assert.ok(await login('sam', 'sam-new-pass-2'));
   // another username from the same address still works
   assert.ok(await login('olive', 'olive-pass-1'));
   // another website in the same browser
