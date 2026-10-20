@@ -165,6 +165,9 @@ test('a worker: only the worker app, only their own trade', async () => {
   assert.equal((await call('GET', '/api/summary', { as: S.sam })).status, 403);
   assert.deepEqual((await call('GET', '/api/vans', { as: S.sam })).json, { error: NO });
   assert.equal((await call('POST', '/api/items/1/receive', { as: S.sam, body: { qty: 1 } })).status, 403);
+  // issue #1: the office lists under /api/items/… are not the worker's /api/items/:id
+  for (const p of ['/api/items/unassigned', '/api/items/many-specs', '/api/items/still-to-order']) assert.equal((await call('GET', p, { as: S.sam })).status, 403, p);
+  assert.equal((await call('GET', '/api/items/unassigned', { as: S.stu })).status, 200);
   assert.equal((await call('POST', '/api/vans/1/move', { as: S.sam, body: { area_id: null } })).status, 403);
   let r = await call('GET', '/', { as: S.sam });
   assert.equal(r.status, 302);

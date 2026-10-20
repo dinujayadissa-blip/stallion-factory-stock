@@ -2560,3 +2560,12 @@ Copy the files above, then restart. On start the two new tables are made (nothin
 login is made, nobody can use the app:** straight after the restart, on the office PC itself, open
 `http://localhost:3000` and create the owner login, then add everyone else's on **Logins**. Phones that had the worker
 app open go to the log in page; each worker logs in once (30 days, renewed by use).
+
+### Logins — fixes after review
+
+**#1 — workers could read three office stock lists** (`src/auth.js`, tests)
+- Why: the table line `GET /api/items/:id` (everyone) came before `GET /api/items/unassigned`, `/many-specs` and
+  `/still-to-order` (office pages), and the first matching line won — so a worker got those lists.
+- Now, of the lines that match, the one with the fewest `:x` parts wins (a named path always beats `:id`), and the
+  three lines sit next to `/api/items`. A new test checks that **every** line of the table can be reached (it fails
+  on any line swallowed by another), and the HTTP test checks a worker gets 403 on the three lists.

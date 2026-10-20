@@ -36,6 +36,9 @@ const SESSION = 'session';  // any login — also one that still has to choose a
 
 // ───────────────────────── who may use which route ─────────────────────────
 // [method, path, who, extra]. Method 'GET' also covers HEAD; '*' = any method. ':x' = one path part.
+// When several lines match, the one with the fewest ':x' parts wins (so '/api/items/unassigned' is never
+// swallowed by '/api/items/:id'); between equals the first line wins. test/auth.test.js checks every line
+// can be reached.
 // extra.only: for that role, the request body may only contain these fields (or these values).
 export const API_RULES = [
   // ── logging in (no login needed) ──
@@ -65,6 +68,10 @@ export const API_RULES = [
   ['POST', '/api/floor/receive/undo', ALL],      // a worker: only their own bookings (checked in server.js)
   ['POST', '/api/floor/items/:id/place', ALL],   // Find a part → Set place (rack / shelf)
   ['GET', '/api/items', ALL],                    // part search on the phone
+  // (office lists under /api/items/… — the literal names win over /api/items/:id, see apiRule)
+  ['GET', '/api/items/unassigned', STAFF],
+  ['GET', '/api/items/many-specs', STAFF],
+  ['GET', '/api/items/still-to-order', STAFF],
   ['GET', '/api/items/:id', ALL],                // Find a part / Book in
   ['GET', '/api/layout', ALL],                   // the floor map
   ['GET', '/api/vans/:id/floor', ALL],           // a van's notes and reminders
@@ -119,11 +126,8 @@ export const API_RULES = [
   ['GET', '/api/plan-conflicts', STAFF],
   ['GET', '/api/counts/choices', STAFF],
   ['GET', '/api/bought-for-van', STAFF],
-  ['GET', '/api/items/unassigned', STAFF],
   ['GET', '/api/catalogue', STAFF],
   ['GET', '/api/stock-checks', STAFF],
-  ['GET', '/api/items/many-specs', STAFF],
-  ['GET', '/api/items/still-to-order', STAFF],
   ['GET', '/api/rules', STAFF],
   ['GET', '/api/shortages', STAFF],
   ['GET', '/api/suppliers', STAFF],
@@ -184,19 +188,21 @@ export const API_RULES = [
 ];
 
 const compiled = API_RULES.map(([method, path, who, extra = {}]) => ({
-  method, path, who, ...extra,
+  method, path, who, ...extra, params: (path.match(/:[a-z]+/gi) || []).length,
   re: new RegExp(`^${path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/:[a-z]+/gi, '[^/]+')}/?$`, 'i'), // like Express: capitals don't matter
 }));
 const OWNER_ONLY = { method: '*', path: '(not in the table)', who: OWNER, re: /^/, fallback: true };
 
-// The rule for a request (the first match), or the owner-only fallback.
+// The rule for a request — of the matching lines the most exact one (fewest ':x' parts, then the first) —
+// or the owner-only fallback.
 export function apiRule(method, path) {
   const m = String(method || '').toUpperCase();
+  let best = null;
   for (const r of compiled) {
     if (r.method !== '*' && r.method !== m && !(r.method === 'GET' && m === 'HEAD')) continue;
-    if (r.re.test(path)) return r;
+    if (r.re.test(path) && (!best || r.params < best.params)) best = r;
   }
-  return OWNER_ONLY;
+  return best || OWNER_ONLY;
 }
 
 // May this role use the route? (PUBLIC / SESSION rules: anyone / any login.)

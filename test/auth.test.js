@@ -288,3 +288,18 @@ test('which addresses may send changes: this PC and its names, ALLOWED_HOSTS, ne
   const lan = Object.values(os.networkInterfaces()).flat().find(n => n?.family === 'IPv4' && !n.internal);
   if (lan) assert.equal(auth.hostAllowed(`${lan.address}:3000`), true);
 });
+
+test('issue #1: every line of the table can be reached — a ":id" line never swallows a named path', () => {
+  const methods = m => (m === '*' ? ['GET', 'POST', 'PUT', 'DELETE'] : [m]);
+  for (const [method, p] of auth.API_RULES) {
+    const concrete = p.replace(/:[a-z]+/gi, '7');
+    const hit = methods(method).some(m => { const r = auth.apiRule(m, concrete); return r.method === method && r.path === p; });
+    assert.ok(hit, `${method} ${p} is shadowed by ${auth.apiRule(methods(method)[0], concrete).path}`);
+  }
+  // the three office lists under /api/items/… are not open to workers
+  for (const p of ['/api/items/unassigned', '/api/items/many-specs', '/api/items/still-to-order']) {
+    assert.equal(auth.allowed('GET', p, 'worker'), false, p);
+    assert.equal(auth.allowed('GET', p, 'stores'), true, p);
+  }
+  assert.equal(auth.allowed('GET', '/api/items/12', 'worker'), true);
+});
