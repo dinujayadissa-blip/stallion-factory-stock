@@ -1,0 +1,1053 @@
+/* Stallion Caravans theme — colours, fonts and logo from stallioncaravans.com.au */
+:root {
+  --limestone: #f1ebe1;
+  --bark: #512b1a;
+  --espresso: #201e16;
+  --olive: #6c724b;
+  --olive-dark: #565b3a;
+  --bg: #f6f2eb;
+  --panel: #fffdfa;
+  --ink: #201e16;
+  --muted: #6b6355;
+  --faint: #9a9285;
+  --line: #e8e1d5;
+  --line-strong: #d6ccbc;
+  --brand: #512b1a;
+  --brand-ink: #f1ebe1;
+  --brand-soft: #f1ebe1;
+  --ok: #4d6b2f;
+  --ok-soft: #e9eedc;
+  --info: #2f5f8a;
+  --info-soft: #e6eef5;
+  --warn: #9a5b00;
+  --warn-soft: #fbf0dc;
+  --bad: #b42318;
+  --bad-soft: #fbe7e3;
+  --gray-soft: #efebe4;
+  --radius: 6px;
+  --shadow: 0 1px 2px rgba(32, 30, 22, .05), 0 1px 3px rgba(32, 30, 22, .06);
+  --font: Inter, "Segoe UI", system-ui, -apple-system, Roboto, Arial, sans-serif;
+  --font-head: "Work Sans", Inter, "Segoe UI", system-ui, sans-serif;
+  --font-mono: "DM Mono", Consolas, "Cascadia Mono", monospace;
+  font-family: var(--font);
+  font-size: 14px;
+  color: var(--ink);
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); }
+a { color: var(--bark); text-decoration: none; }
+a:hover { text-decoration: underline; text-underline-offset: 2px; }
+h1, h2, h3 { font-family: var(--font-head); color: var(--espresso); }
+h1 { font-size: 24px; margin: 0; font-weight: 500; text-transform: uppercase; letter-spacing: .04em; }
+h2 { font-size: 14px; margin: 0 0 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; }
+h3 { font-size: 14px; margin: 0 0 8px; font-weight: 600; }
+.muted { color: var(--muted); }
+.faint { color: var(--faint); }
+.small { font-size: 12px; }
+.mono { font-family: var(--font-mono); font-size: 12.5px; }
+.nowrap { white-space: nowrap; }
+.right { text-align: right; }
+.grow { flex: 1; }
+.hidden { display: none !important; }
+
+/* Layout */
+.shell { display: grid; grid-template-columns: 228px 1fr; min-height: 100vh; }
+.side { background: var(--espresso); color: var(--limestone); padding: 22px 14px 18px; position: sticky; top: 0; height: 100vh; display: flex; flex-direction: column; gap: 3px; }
+.brand { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 2px 6px 20px; margin-bottom: 10px; border-bottom: 1px solid rgba(241, 235, 225, .12); color: var(--limestone); text-decoration: none; }
+.brand:hover { text-decoration: none; }
+.brand .mark { width: 54px; height: auto; display: block; }
+.brand .word { width: 100%; max-width: 184px; height: auto; display: block; }
+.brand span { font-family: var(--font-mono); font-size: 10.5px; font-weight: 500; color: #a8a08f; letter-spacing: .22em; text-transform: uppercase; }
+.nav a { display: flex; align-items: center; gap: 10px; color: rgba(241, 235, 225, .78); padding: 9px 12px; border-radius: 4px; font-family: var(--font-head); font-weight: 500; font-size: 12.5px; text-transform: uppercase; letter-spacing: .08em; }
+.nav a:hover { background: rgba(241, 235, 225, .07); color: var(--limestone); text-decoration: none; }
+.nav a.active { background: var(--limestone); color: var(--bark); }
+.nav .count { margin-left: auto; background: var(--bad); color: #fff; border-radius: 10px; font-family: var(--font); font-size: 11px; padding: 1px 7px; font-weight: 600; letter-spacing: 0; }
+.side .foot { margin-top: auto; font-size: 11px; color: #8f8878; padding: 0 12px; line-height: 1.5; }
+main { padding: 22px 28px 60px; min-width: 0; }
+.page-head { display: flex; align-items: center; gap: 12px; margin-bottom: 18px; flex-wrap: wrap; }
+.page-head .actions { margin-left: auto; display: flex; gap: 8px; flex-wrap: wrap; }
+.banner { background: var(--warn-soft); color: var(--warn); border: 1px solid #eed6a6; padding: 8px 12px; border-radius: var(--radius); margin-bottom: 16px; font-weight: 500; }
+
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); padding: 16px; margin-bottom: 16px; }
+.panel.flush { padding: 0; overflow: hidden; }
+.panel.flush > h2 { padding: 14px 16px 0; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.stack > * + * { margin-top: 10px; }
+
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 16px; }
+.tile { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; box-shadow: var(--shadow); display: block; color: inherit; }
+a.tile:hover { text-decoration: none; border-color: var(--line-strong); }
+.tile { border-top: 3px solid var(--limestone); }
+.tile .n { font-family: var(--font-head); font-size: 30px; font-weight: 500; line-height: 1.1; font-variant-numeric: tabular-nums; color: var(--espresso); }
+.tile .l { color: var(--muted); font-family: var(--font-mono); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; margin-top: 6px; }
+.tile.bad { border-top-color: var(--bad); }
+.tile.warn { border-top-color: #e2a33a; }
+.tile.bad .n { color: var(--bad); }
+.tile.warn .n { color: var(--warn); }
+
+/* Tables */
+table { width: 100%; border-collapse: collapse; }
+th, td { padding: 8px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+th { font-family: var(--font-mono); font-size: 11px; font-weight: 500; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); background: #faf7f2; position: sticky; top: 0; z-index: 1; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+tbody tr:hover { background: #fbf8f3; }
+tr.clickable { cursor: pointer; }
+tr.group td { background: #f4efe6; font-weight: 600; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .3px; padding: 6px 10px; }
+.table-wrap { overflow-x: auto; }
+.spec { color: var(--muted); font-size: 12.5px; margin-top: 2px; max-width: 520px; }
+
+/* Chips & progress */
+.chip { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11.5px; font-weight: 600; white-space: nowrap; }
+.chip.ready { background: var(--ok-soft); color: var(--ok); }
+.chip.issued { background: var(--gray-soft); color: var(--muted); }
+.chip.on_order { background: var(--info-soft); color: var(--info); }
+.chip.to_order { background: var(--bad-soft); color: var(--bad); }
+.chip.planned { background: var(--brand-soft); color: var(--brand); }
+.chip.in_production { background: var(--warn-soft); color: var(--warn); }
+.chip.completed, .chip.cancelled, .chip.closed { background: var(--gray-soft); color: var(--muted); }
+.chip.open { background: var(--info-soft); color: var(--info); }
+.chip.perv { background: #f1ebfa; color: #6b3fa0; }
+/* Stock clean-up tags */
+.chip.check { background: #fff3c4; color: #7a5a00; border: 1px solid #ecd27a; }
+.chip.urgent { background: var(--bad); color: #fff; }
+.chip.tbc { background: #fff3c4; color: #7a5a00; }
+.chip.locked { background: var(--gray-soft); color: var(--espresso); }
+.chip.notcounted { background: var(--gray-soft); color: var(--muted); font-weight: 500; }
+.dueflag { display: block; font-size: 11.5px; font-weight: 600; color: var(--warn); white-space: nowrap; }
+.forcol { font-size: 12px; color: var(--olive-dark); margin-top: 1px; }
+.cnt-big td { background: #fff8e1; }
+#cnt-check [hidden] { display: none !important; } /* count check: rows show / hide their questions live */
+.cnt-table input.qty { width: 90px; }
+.diff-neg { color: var(--bad); font-weight: 600; }
+.diff-pos { color: var(--ok); font-weight: 600; }
+.report-step { border-top: 1px solid var(--line); padding: 12px 16px; }
+.report-step summary { cursor: pointer; font-weight: 600; }
+.bo-input { width: 64px; }
+.bar { height: 8px; background: var(--gray-soft); border-radius: 4px; overflow: hidden; min-width: 90px; display: flex; }
+.bar > i { display: block; height: 100%; }
+.bar .g { background: var(--olive); }
+.bar .s { background: #b3aa9a; }
+
+/* Forms */
+input, select, textarea, button { font: inherit; color: inherit; }
+input[type=text], input[type=number], input[type=date], input[type=search], select, textarea {
+  border: 1px solid var(--line-strong); border-radius: 4px; padding: 7px 9px; background: #fff; min-width: 0;
+}
+input:focus, select:focus, textarea:focus { outline: 2px solid rgba(108, 114, 75, .35); outline-offset: 0; border-color: var(--olive); }
+textarea { width: 100%; resize: vertical; }
+label.field { display: flex; flex-direction: column; gap: 4px; font-size: 12.5px; color: var(--muted); font-weight: 500; }
+label.field input, label.field select, label.field textarea { color: var(--ink); font-size: 14px; }
+.form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
+.hint { font-size: 12px; color: var(--faint); }
+input.qty { width: 80px; text-align: right; }
+
+/* Buttons follow the website: DM Mono capitals, olive primary */
+.btn { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line-strong); background: #fff; color: var(--espresso); padding: 8px 14px; border-radius: 3px; cursor: pointer;
+  font-family: var(--font-mono); font-size: 12.5px; font-weight: 500; text-transform: uppercase; letter-spacing: .05em; white-space: nowrap; transition: background .15s, border-color .15s; }
+.btn:hover { background: #faf7f2; border-color: #c4b8a5; text-decoration: none; }
+.btn.primary { background: var(--olive); border-color: var(--olive); color: var(--limestone); }
+.btn.primary:hover { background: var(--olive-dark); border-color: var(--olive-dark); }
+.btn.danger { color: var(--bad); border-color: #ecc2ba; }
+.btn.danger:hover { background: var(--bad-soft); }
+.btn.small { padding: 4px 9px; font-size: 11.5px; }
+.btn.link { border: none; background: none; color: var(--bark); padding: 2px 4px; font-family: var(--font); font-size: inherit; text-transform: none; letter-spacing: 0; font-weight: 500; }
+.btn.link:hover { text-decoration: underline; }
+.btn:disabled { opacity: .5; cursor: not-allowed; }
+
+.tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--line); margin-bottom: 14px; flex-wrap: wrap; }
+.tabs button { border: none; background: none; padding: 10px 14px; cursor: pointer; font-family: var(--font-mono); font-size: 12px; font-weight: 500; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); border-bottom: 2px solid transparent; margin-bottom: -1px; }
+.tabs button:hover { color: var(--espresso); }
+.tabs button.active { color: var(--bark); border-bottom-color: var(--bark); }
+.tabs .badge { background: var(--bad); color: #fff; border-radius: 9px; font-family: var(--font); font-size: 11px; padding: 0 6px; margin-left: 4px; letter-spacing: 0; }
+
+/* Drop zone */
+.drop { display: block; border: 2px dashed var(--line-strong); border-radius: 8px; padding: 40px 20px; text-align: center; background: #fbf9f5; cursor: pointer; }
+.drop.over { border-color: var(--olive); background: var(--limestone); }
+.drop strong { display: block; font-family: var(--font-head); font-size: 16px; font-weight: 600; margin-bottom: 4px; }
+
+/* Review list */
+.review-item { display: flex; gap: 12px; align-items: flex-start; padding: 10px 12px; border: 1px solid #eed6a6; background: #fdf8ee; border-radius: 6px; }
+.review-item + .review-item { margin-top: 8px; }
+.review-item .lbl { font-weight: 600; }
+.kv { display: grid; grid-template-columns: minmax(160px, 34%) 1fr; gap: 0; }
+.kv > div { padding: 6px 8px; border-bottom: 1px solid var(--line); }
+.kv > div:nth-child(odd) { color: var(--muted); font-size: 12.5px; }
+.kv .sec { grid-column: 1 / -1; background: #f4efe6; font-weight: 600; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .3px; }
+
+/* Modal & toast */
+.modal-bg { position: fixed; inset: 0; background: rgba(32, 30, 22, .5); display: flex; align-items: flex-start; justify-content: center; padding: 6vh 16px; z-index: 50; overflow-y: auto; }
+.modal { background: var(--panel); border-radius: 8px; width: min(640px, 100%); box-shadow: 0 20px 50px rgba(32,30,22,.3); border-top: 4px solid var(--bark); }
+.modal.wide { width: min(980px, 100%); }
+.modal header { padding: 14px 18px; border-bottom: 1px solid var(--line); display: flex; align-items: center; }
+.modal header h2 { margin: 0; }
+.modal header .x { margin-left: auto; border: none; background: none; font-size: 22px; cursor: pointer; color: var(--muted); line-height: 1; }
+.modal .body { padding: 16px 18px; }
+.modal footer { padding: 12px 18px; border-top: 1px solid var(--line); display: flex; justify-content: flex-end; gap: 8px; }
+#toasts { position: fixed; bottom: 18px; right: 18px; display: flex; flex-direction: column; gap: 8px; z-index: 60; }
+.toast { background: var(--espresso); color: var(--limestone); padding: 10px 14px; border-radius: 6px; box-shadow: 0 6px 20px rgba(0,0,0,.2); max-width: 380px; }
+.toast.err { background: var(--bad); }
+.empty { padding: 30px; text-align: center; color: var(--muted); }
+
+/* Item photos */
+.thumb { display: inline-block; flex: none; border-radius: 6px; object-fit: cover; border: 1px solid var(--line); background: #f4efe6; vertical-align: middle; }
+.thumb.empty { background: repeating-linear-gradient(45deg, #f6f2eb 0 6px, #eee8dd 6px 12px); }
+.item-cell { display: flex; gap: 10px; align-items: flex-start; }
+.item-head { display: flex; gap: 18px; align-items: flex-start; margin-bottom: 4px; flex-wrap: wrap; }
+.photo-box { width: 240px; flex: none; }
+.photo-box img { display: block; width: 240px; max-height: 240px; object-fit: contain; border-radius: 8px; border: 1px solid var(--line); background: #faf7f2; }
+.photo-empty { width: 240px; height: 160px; border: 2px dashed var(--line-strong); border-radius: 8px; display: flex; align-items: center; justify-content: center; color: var(--faint); }
+.photo-box.over img, .photo-box.over .photo-empty { outline: 3px solid var(--olive); outline-offset: 2px; }
+.photo-box.busy { opacity: .5; pointer-events: none; }
+@media (max-width: 600px) { .photo-box, .photo-box img, .photo-empty { width: 100%; } }
+
+/* Factory floor */
+.seg { display: inline-flex; border: 1px solid var(--line-strong); border-radius: 3px; overflow: hidden; background: #fff; }
+.seg button { border: none; background: none; padding: 8px 14px; font-family: var(--font-mono); font-size: 12px; font-weight: 500; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); cursor: pointer; }
+.seg button + button { border-left: 1px solid var(--line-strong); }
+.seg button.on { background: var(--bark); color: var(--limestone); }
+.factory { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 16px; align-items: start; }
+.fmap-wrap { padding: 0; }
+.fmap { min-height: 0; }
+.fmap.is3d { height: min(72vh, 760px); }
+.fmap .fm-svg { max-height: 78vh; }
+.fm-legend { display: flex; gap: 14px; flex-wrap: wrap; padding: 8px 12px; border-top: 1px solid var(--line); }
+.fm-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 5px; vertical-align: -1px; }
+.fside .panel h3 { margin-bottom: 8px; }
+.unplaced { display: flex; flex-direction: column; gap: 6px; max-height: 50vh; overflow: auto; }
+.uvan { display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; background: #faf7f2; cursor: grab; }
+.uvan:hover { border-color: var(--olive); }
+.rem { display: flex; gap: 8px; align-items: flex-start; padding: 6px 0; border-bottom: 1px solid var(--line); }
+.rem input { margin-top: 3px; width: 18px; height: 18px; }
+.rem.done > div { text-decoration: line-through; color: var(--faint); }
+.overdue { color: var(--bad); font-weight: 600; }
+#radd input[type=date] { width: 140px; }
+.note-item { padding: 8px 0; border-bottom: 1px solid var(--line); }
+.miss { display: flex; flex-direction: column; gap: 6px; max-height: 340px; overflow: auto; }
+.mi { display: flex; gap: 8px; align-items: center; }
+@media (max-width: 1100px) { .factory { grid-template-columns: 1fr; } }
+
+/* Production plan grid — colours match the spreadsheet legend */
+.p-none { background: #ffffff; }
+.p-ordered { background: #f4cccc; }
+.p-received { background: #d9d9d9; }
+.p-done { background: #9fc5e8; }
+.p-info { background: #fff; color: var(--faint); }
+.legend { display: flex; gap: 6px; flex-wrap: wrap; }
+.legend span, .plan-chip { font-size: 11.5px; padding: 2px 8px; border-radius: 4px; border: 1px solid var(--line-strong); white-space: nowrap; }
+.plan-wrap { overflow: auto; max-height: calc(100vh - 210px); border-top: 1px solid var(--line); }
+table.plan { border-collapse: separate; border-spacing: 0; width: max-content; font-size: 12px; }
+table.plan th, table.plan td { border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); padding: 4px 6px; width: 150px; max-width: 150px; vertical-align: top; }
+table.plan th { position: sticky; top: 0; z-index: 2; background: #f1ebe1; font-size: 10.5px; line-height: 1.25; white-space: normal; letter-spacing: .03em; }
+table.plan .stick { position: sticky; z-index: 1; background: #fff; }
+table.plan th.stick { z-index: 3; background: #f1ebe1; }
+table.plan .c1 { left: 0; width: 76px; min-width: 76px; max-width: 76px; }
+table.plan .c2 { left: 76px; width: 170px; min-width: 170px; max-width: 170px; }
+table.plan .c3 { left: 246px; width: 78px; min-width: 78px; max-width: 78px; box-shadow: 2px 0 0 var(--line-strong); }
+table.plan td.p-done.c1 { background: #9fc5e8; }
+table.plan td.click { cursor: pointer; }
+table.plan td.click:hover { outline: 2px solid var(--olive); outline-offset: -2px; }
+table.plan tbody tr:hover td { filter: brightness(0.97); }
+.clip { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.clip3 { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+
+/* Purchasing (Order now / Coming up / Later), line statuses, POs to check */
+.chip.cust { background: #f1ebfa; color: #6b3fa0; }
+.chip.late, .late { color: var(--bad); font-weight: 600; font-size: 12px; }
+.chip.late { background: var(--bad-soft); }
+.pur-sec > summary, .pur-sec > .sec-head { list-style: none; cursor: pointer; padding: 10px 16px; background: #f6f2ea; border-top: 1px solid var(--line); display: flex; gap: 10px; align-items: baseline; }
+.pur-sec > summary::-webkit-details-marker { display: none; }
+.pur-sec > summary::before { content: '▸'; color: var(--muted); }
+.pur-sec[open] > summary::before { content: '▾'; }
+.pur-sec .sec-title { font-weight: 700; }
+.sup-head { padding: 8px 16px; background: #fafbfc; border-top: 1px solid var(--line); flex-wrap: wrap; }
+.sup-head .lead { font-size: 12px; color: var(--muted); }
+.sup-head .lead.assumed { color: var(--warn); font-weight: 600; }
+.sup-head input.lead-in { width: 56px; }
+.sup-head input.lead-in:placeholder-shown { width: 100px; } /* round 4: empty box shows "14 (default)" */
+table.pur { width: 100%; table-layout: fixed; }
+table.pur td { vertical-align: top; overflow-wrap: anywhere; }
+table.pur td:nth-child(1) { width: 34px; }
+table.pur td:nth-child(3) { width: 120px; }
+table.pur td:nth-child(4) { width: 170px; }
+table.pur td:nth-child(5) { width: 130px; }
+table.pur .when { font-size: 12px; color: var(--muted); white-space: nowrap; }
+.filters { padding: 10px 16px; gap: 8px; flex-wrap: wrap; }
+.chk-group { border-top: 1px solid var(--line); padding: 10px 16px; }
+.chk-group .lines { margin-top: 6px; }
+.chk-group .lines label { display: flex; gap: 8px; align-items: flex-start; padding: 2px 0; font-size: 13px; }
+/* round 2: Check already ordered? — which PO a "Yes" adds to, and the "later vans" fold */
+.chk-group .chk-yes { font-size: 12px; color: var(--muted); margin-top: 4px; }
+.chk-group .chk-yes strong { color: var(--ink); }
+.chk-group .chk-need { font-size: 12px; color: var(--muted); white-space: nowrap; }
+.chk-group .chk-need.today { color: var(--bad); font-weight: 600; }
+/* round 4: first van and how late ("#1 ST0367 – 26 days late"); needed now but not late = amber */
+.chk-group .chk-need.now { color: var(--warn); font-weight: 600; }
+.chk-group .late-txt { color: var(--bad); font-weight: 600; }
+.chk-allsup { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding: 10px 16px; border-top: 1px solid var(--line); background: var(--ok-soft); }
+.chk-group .chk-sup { width: 170px; font-size: 12px; padding: 3px 6px; }
+details.chk-later > summary { padding: 10px 16px; cursor: pointer; border-top: 1px solid var(--line); background: #fafbfc; }
+.chip.plancheck { background: #fff3c4; color: #7a5a00; border: 1px solid #ecd27a; white-space: normal; }
+tr.is-check td { background: #fffcf2; }
+.order-count { font-weight: 600; color: var(--ink); }
+/* round 2: link dialog — suggestion, "link all with this text", one-off */
+.lp-sug, .lp-oneoff { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; padding: 10px 12px; border-radius: var(--radius); }
+.lp-sug { border: 1px solid #c9d7b4; background: var(--ok-soft); }
+.lp-oneoff { border: 1px dashed var(--line-strong); background: var(--panel); }
+.lp-all { display: flex; gap: 8px; align-items: flex-start; padding: 8px 12px; border: 1px solid var(--line); border-radius: var(--radius); background: #fafbfc; }
+/* round 3: "This van already has … – same thing?" */
+.lp-sug.lp-already { border-color: #eed6a6; background: var(--warn-soft); }
+.lp-already-line { color: var(--warn); }
+.lp-clash { padding: 6px 12px; border: 1px dashed var(--line-strong); border-radius: var(--radius); }
+
+/* round 3: Purchasing tabs, suppliers folded to one line */
+.tabs .badge.quiet { background: var(--gray-soft); color: var(--muted); }
+.sup-block > .sup-head { cursor: pointer; }
+.sup-block > .sup-head:hover { background: #f3efe7; }
+.sup-block.open > .sup-head { background: #f1ece2; }
+.sup-block:not(.open) > .sup-body { display: none; }
+.sup-tog { border: none; background: none; padding: 0 2px; cursor: pointer; color: var(--muted); font-size: 13px; width: 18px; }
+.sup-block > .sup-head { flex-wrap: nowrap; gap: 10px; }
+.sup-head .sup-facts { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.sup-head .lead, .sup-head strong, .sup-head .btn { white-space: nowrap; }
+@media (max-width: 900px) { .sup-block > .sup-head { flex-wrap: wrap; } }
+.sup-head .sup-ticked { color: var(--ok); font-weight: 600; white-space: nowrap; }
+.pur-sec .sec-tools { display: flex; gap: 10px; align-items: center; padding: 6px 16px; border-top: 1px solid var(--line); }
+.chip.bo { background: var(--gray-soft); color: var(--espresso); font-family: var(--font-mono); }
+.need-now { color: var(--bad); }
+.banner.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+/* round 3: the van line just changed lights up for a moment (the page keeps its place) */
+@keyframes flash-line { from { background: var(--warn-soft); } to { background: transparent; } }
+tr.flash > td { animation: flash-line 2.4s ease-out; }
+.po-chk { border-top: 1px solid var(--line); padding: 10px 16px; }
+.po-chk .form-grid { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); margin-top: 6px; }
+.rcv-item { border: 1px solid var(--line); border-radius: var(--radius); padding: 10px 12px; margin-bottom: 10px; }
+.rcv-item table td { padding: 4px 6px; vertical-align: top; }
+.state-sel { font-size: 12px; padding: 3px 4px; width: auto; color: var(--muted); }
+.warn-text { color: var(--warn); font-weight: 600; font-size: 12.5px; }
+
+/* Print: picking list */
+.print-only { display: none; }
+@media print {
+  .side, .page-head .actions, .tabs, .no-print, #toasts { display: none !important; }
+  .shell { display: block; }
+  main { padding: 0; }
+  .panel { box-shadow: none; border: none; padding: 0; }
+  .print-only { display: block; }
+  body, html { background: #fff; }
+  th { position: static; }
+}
+
+/* Phone batch 1 (C2): the top bar's page name and Menu button only exist under 900px */
+.page-name, .menu-btn { display: none; }
+@media (max-width: 900px) {
+  .shell { grid-template-columns: 1fr; grid-template-rows: auto 1fr; } /* rows: the bar stays 52px on a short page (phone batch 2) */
+  /* A sticky 52px bar instead of the 285px block of links: horse mark, page name, Menu */
+  .side { position: sticky; top: 0; z-index: 40; height: auto; min-height: 52px; flex-direction: row; flex-wrap: nowrap; align-items: center; gap: 10px;
+    padding: env(safe-area-inset-top) max(8px, env(safe-area-inset-right)) 0 max(12px, env(safe-area-inset-left)); box-shadow: 0 1px 4px rgba(0, 0, 0, .25); }
+  .brand { flex: none; flex-direction: row; align-items: center; gap: 0; width: auto; padding: 0; margin: 0; border: 0; min-height: 44px; }
+  .brand .mark { width: 30px; }
+  .brand .word, .brand span { display: none; }
+  .page-name { display: block; flex: 1; min-width: 0; font-family: var(--font-head); font-weight: 500; font-size: 15px; text-transform: uppercase; letter-spacing: .06em;
+    color: var(--limestone); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .menu-btn { display: inline-flex; align-items: center; gap: 8px; flex: none; min-height: 44px; min-width: 44px; padding: 0 14px; border: 1px solid rgba(241, 235, 225, .35);
+    border-radius: 4px; background: transparent; color: var(--limestone); font-family: var(--font-mono); font-size: 13px; text-transform: uppercase; letter-spacing: .06em; cursor: pointer; }
+  .side.open .menu-btn { background: var(--limestone); color: var(--bark); }
+  .menu-btn .count { background: var(--bad); color: #fff; border-radius: 10px; font-family: var(--font); font-size: 11.5px; padding: 1px 7px; font-weight: 600; letter-spacing: 0; }
+  .nav { display: none; }
+  /* Menu open: a full-screen Espresso list, the owner's main pages first */
+  .side.open .nav { display: flex; flex-direction: column; gap: 2px; position: fixed; inset: calc(52px + env(safe-area-inset-top)) 0 0; overflow: auto; z-index: 40;
+    background: var(--espresso); padding: 8px max(12px, env(safe-area-inset-right)) calc(20px + env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left)); overscroll-behavior: contain; }
+  .side.open .nav a { min-height: 48px; font-size: 14px; padding: 0 14px; order: 10; }
+  .side.open .nav a[data-route="home"] { order: 1; }
+  .side.open .nav a[data-route="vans"] { order: 2; }
+  .side.open .nav a[data-route="factory"] { order: 3; }
+  .side.open .nav a[data-route="purchasing"] { order: 4; border-bottom: 1px solid rgba(241, 235, 225, .14); margin-bottom: 6px; }
+  body.menu-open { overflow: hidden; }
+  .side .foot { display: none; }
+  main { padding: 16px; }
+  /* minmax(0, 1fr): a wide table scrolls inside its own box instead of pushing the whole page sideways (C3) */
+  .grid2, .grid3 { grid-template-columns: minmax(0, 1fr); }
+  .grid2 > *, .grid3 > * { min-width: 0; }
+  /* On phones only the chassis column stays pinned on the plan. */
+  table.plan .c2, table.plan .c3 { position: static; box-shadow: none; }
+}
+
+/* ── Round 1 batch 3: dashboard "needs action", go-live checklist, catalogue, stock checks ── */
+.action-panel { padding: 16px 18px; }
+.action-total { min-width: 150px; border-right: 1px solid var(--line); padding-right: 20px; }
+.action-total .n { font-family: var(--font-head); font-size: 54px; font-weight: 500; line-height: 1; color: var(--espresso); font-variant-numeric: tabular-nums; }
+.action-total.bad .n { color: var(--bad); }
+.action-total .l { color: var(--muted); font-family: var(--font-mono); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; margin-top: 8px; }
+.action-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 2px 18px; }
+.action-row { display: flex; gap: 10px; align-items: baseline; padding: 5px 6px; border-radius: var(--radius); color: inherit; text-decoration: none; }
+.action-row:hover { background: var(--gray-soft); }
+.action-row .an { min-width: 38px; text-align: right; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--bad); }
+.action-row.zero { opacity: .55; }
+.action-row.zero .an { color: var(--ok); }
+details.golive { padding: 12px 18px; }
+details.golive > summary { cursor: pointer; }
+.golive-steps { list-style: none; margin: 10px 0 0; padding: 0; }
+.golive-steps li { padding: 8px 0; border-top: 1px solid var(--line); }
+.golive-steps li.done { opacity: .6; }
+.golive-steps li.locked a { color: var(--faint); }
+.gl-tick { display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px; border-radius: 50%; background: var(--gray-soft);
+  font-weight: 700; font-family: var(--font-mono); margin-right: 10px; flex: none; text-transform: uppercase; }
+.golive-steps li.done .gl-tick { background: var(--ok-soft); color: var(--ok); }
+.gl-vans { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.warn-banner { display: flex; gap: 12px; align-items: center; }
+.panel.warn-panel { border-top: 3px solid #e2a33a; }
+.chip.miss { background: var(--bad-soft); color: var(--bad); }
+button.tile { text-align: left; cursor: pointer; font: inherit; }
+button.tile.on { border-top-color: var(--brand); box-shadow: 0 0 0 2px var(--brand-soft); }
+.bulk-bar { background: #fafbfc; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+#fx td { vertical-align: top; }
+#fx input[type=text], #fx input[type=number], #fx select { padding: 4px 6px; }
+tr.dirty td { background: #fffbea; }
+tr.acked td { opacity: .5; }
+.danger-zone { border-top: 3px solid var(--bad); }
+.diff-pos { color: var(--ok); font-weight: 600; }
+@media (max-width: 900px) {
+  .action-total { border-right: 0; padding-right: 0; }
+  .action-list { grid-template-columns: 1fr; }
+}
+
+/* ── Small fixes & phone round 1 (user-r4-1 … r4-4) ── */
+/* PO search: the PO whose number is exactly what was typed is first and marked */
+#po-table tr.po-exact > td { background: var(--brand-soft); }
+#po-table tr.po-exact > td:first-child { box-shadow: inset 3px 0 0 var(--bark); }
+/* special-part counts: "97 still to order · 160 in all" next to the heading */
+h2 .ph-count { font-family: var(--font); text-transform: none; letter-spacing: 0; font-weight: 500; color: var(--muted); font-size: 12.5px; margin-left: 6px; }
+/* Stock: one "not counted yet" banner instead of a badge on every row */
+.nc-banner { justify-content: flex-start; }
+.nc-banner .nc-why { font-weight: 400; }
+.nc-banner a { font-weight: 600; }
+/* Stock search: matches in the other tab */
+.other-hits { margin: -4px 16px 10px; padding: 7px 12px; border-radius: var(--radius); background: var(--info-soft); color: var(--info); font-size: 13px; }
+.other-hits a { color: var(--info); font-weight: 600; text-decoration: underline; text-underline-offset: 2px; }
+.ok-text { color: var(--ok); font-weight: 500; }
+@media (max-width: 600px) {
+  #sf, #po-q { width: 100% !important; flex: 1 1 100%; }
+  .nc-banner .nc-why { display: block; }
+  h2 .ph-count { display: block; margin: 4px 0 0; }
+  /* Purchase orders tab: "POs to check" / "Overdue deliveries" titles on one line, the help text under them */
+  .pur-sec > summary { flex-wrap: wrap; }
+  .pur-sec > summary .sec-title { white-space: nowrap; }
+  .pur-sec > summary > .small { flex: 1 1 100%; }
+}
+
+/* ── Small fixes & phone round 1, batch 2 (user-r4-5 … r4-8) ── */
+.chip.quiet { background: #efeae0; color: var(--muted); border: 1px solid var(--line); }
+/* Purchase orders: "unknown (from plan)" instead of a made-up ordered date */
+#po-table td.po-unk { min-width: 92px; }
+/* To order: suppliers with only "plan says ordered – check" lines, on one small line */
+.only-chk { padding: 8px 16px 10px; border-top: 1px solid var(--line); background: #fffcf2; line-height: 1.7; }
+.only-chk a { font-weight: 600; white-space: nowrap; }
+/* Special parts: a plan text that names several parts; a cell that is not a part */
+.ph-parts { margin-top: 4px; }
+.ph-parts ul { margin: 2px 0 0; padding-left: 18px; }
+.ph-parts li { margin: 1px 0; }
+tr.ph-notpart, tr.ph-notpart > td { background: #faf8f4; }
+tr.ph-notpart .spec { color: var(--muted); }
+/* "Add each part" dialog */
+.ap-row { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); cursor: pointer; }
+.ap-row.done { background: var(--ok-soft); border-color: #c9d7b4; cursor: default; }
+.ap-row input[type=checkbox] { margin-top: 3px; }
+.ap-row .ap-pick { display: block; width: 100%; margin: 6px 0 4px; }
+@media (max-width: 600px) {
+  /* Special parts list: each line as a small card (text, then amount + status, then the buttons) */
+  .ph-table, .ph-table tbody, .ph-table tr, .ph-table td { display: block; width: 100%; }
+  .ph-table tr { padding: 10px 16px; border-top: 1px solid var(--line); }
+  .ph-table tr:first-child { border-top: 0; }
+  .ph-table td { padding: 0; border: 0; }
+  .ph-table td.num, .ph-table td.small { display: inline-block; width: auto; margin: 6px 12px 0 0; text-align: left; }
+  .ph-table td.ph-acts { white-space: normal; text-align: left; margin-top: 8px; }
+  .ph-table td.ph-acts .btn { margin: 0 6px 6px 0; }
+  .only-chk { padding: 8px 12px 10px; }
+}
+.not-parts { padding: 10px 16px 12px; border-top: 1px solid var(--line); }
+.panel.empty .not-parts { border-top: 0; padding: 8px 0 0; text-align: left; }
+@media (max-width: 600px) {
+  /* To order: the supplier's facts ("47 to check (75 in all)") wrap instead of being cut off */
+  .sup-head .sup-facts { white-space: normal; overflow: visible; flex: 1 1 100%; }
+}
+/* (the To order phone cards moved to "Phone batch 1" at the end of this file) */
+
+/* ── Small fixes & phone round 1, batch 3 (user-r4-9, check-r4-1 … r4-3) ── */
+/* New dealer order: "Customer supplies" suggested on a line, one click to accept / undo */
+.cs-banner { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 0 16px 10px; padding: 8px 12px; border-radius: var(--radius); background: var(--info-soft); color: var(--info); font-size: 13px; }
+.cs-sug { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 4px; }
+.cs-sug .btn.link { padding: 2px 4px; }
+tr.cs-row > td:first-child { background: #faf8f4; }
+.cs-note { margin-top: 4px; color: var(--info); }
+/* Van page / item page: what covers a line from another van's spare PO */
+.cover-note { margin-top: 3px; color: var(--info); line-height: 1.35; }
+.spare-box { margin: 0 0 14px; padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--info-soft); }
+.spare-box h3 { margin: 0 0 6px; }
+.spare-box > div + div { margin-top: 4px; }
+/* "Yes, all on order": one ordered-on and expected-by date */
+.ya-dates { display: flex; gap: 16px; flex-wrap: wrap; margin: 6px 0 0; }
+.ya-date { display: flex; flex-direction: column; gap: 4px; }
+.ya-date .field { margin: 0; }
+.ya-unk { display: inline-flex; gap: 6px; align-items: center; }
+/* POs to check: a long reason ("1 still coming for ST0380 (van finished) – …") wraps instead of being cut off */
+.po-chk .chip.check { white-space: normal; max-width: 100%; text-align: left; line-height: 1.35; }
+@media (max-width: 600px) {
+  .cs-banner { margin: 0 12px 10px; }
+  .cs-sug .btn { flex: 0 0 auto; }
+  .ya-dates { flex-direction: column; gap: 10px; }
+  .ya-date input[type=date] { width: 100%; }
+}
+/* (the van page parts-list cards moved to "Phone batch 2" at the end of this file) */
+/* Item page: "ST0390: coming on PO 50 – ST0367's, spare" under the van's row */
+tr.cover-row > td { padding-top: 0; border-top: 0; }
+@media (max-width: 600px) {
+  table.usage-t th, table.usage-t td { padding-left: 6px; padding-right: 6px; }
+  table.usage-t th { letter-spacing: 0; }
+}
+
+/* ── Small fixes & phone round 1 — phone batch 1 (C1 Purchasing, C2 top bar, C3 Dashboard, C4 cards) ──
+   Everything that changes the layout is inside @media (max-width: 600px) (the top bar is in the 900px block
+   above). Outside it only new pieces are styled, so the desktop pages look as before. */
+.sm-only, .today-tiles, .filt-tog, .sec-help-list { display: none; }
+.still-n { color: var(--bad); font-weight: 500; }
+.tile .still-detail { margin-top: 4px; }
+/* Dashboard headline: vans, not a sum of parts + POs + vans */
+.action-total .ah { display: block; color: inherit; text-decoration: none; }
+.action-total .ah:hover { text-decoration: none; }
+.action-total .ah .n, .action-total .ah .l { display: block; }
+.action-total .ah2 { margin-top: 14px; }
+.action-total .ah2 .n { font-size: 34px; }
+.todo-h { font-family: var(--font-mono); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 2px 0 6px 6px; }
+/* Reminders: delete at the far end (asks first), long text 2 lines until tapped */
+.rem-tick { display: flex; flex: none; }
+.rem-text { cursor: pointer; }
+.rem-text:not(.open) { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.rem-del { flex: none; margin-left: 8px; border: none; background: none; color: var(--faint); font-size: 18px; line-height: 1; padding: 2px 6px; cursor: pointer; border-radius: 4px; }
+.rem-del:hover { color: var(--bad); background: var(--bad-soft); }
+.rem-all { margin-top: 8px; }
+/* "How this list works" / "How the build order works" */
+.how-help > summary { cursor: pointer; color: var(--bark); }
+.pur-how { margin: -6px 0 4px; }
+.pur-how > summary { padding: 2px 16px 8px; }
+.pur-how > p { padding: 0 16px; margin: 0 0 8px; }
+.pur-how > ul { padding: 0 16px 0 34px; margin: 0 0 8px; }
+.how-help:not(.pur-how) { margin: -6px 0 12px; }
+.how-help:not(.pur-how) > p { margin: 6px 0 0; }
+
+@media (max-width: 600px) {
+  /* 16px text in boxes: iPhones don't zoom in when one is tapped */
+  input[type=text], input[type=number], input[type=date], input[type=search], select, textarea { font-size: 16px; }
+  .sm-only { display: inline; }
+  .lg-only, .sm-hide { display: none !important; }
+  /* Tabs stay on one line and scroll sideways (Purchasing's 4 tabs no longer take 4 lines) */
+  .tabs { flex-wrap: nowrap; overflow-x: auto; overflow-y: hidden; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
+  .tabs::-webkit-scrollbar { display: none; }
+  .tabs button { flex: none; min-height: 44px; white-space: nowrap; }
+  /* Van page tiles: two across; the delivery date fits its tile */
+  .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+  .tiles .tile { padding: 12px; }
+  .tiles .tile .n { font-size: 24px; overflow-wrap: anywhere; }
+
+  /* ── Dashboard: Today tiles first, then the vans, the office to-do, …, the go-live checklist near the end ── */
+  .dash { display: flex; flex-direction: column; }
+  .dash-grid, .dash-right { display: contents; }
+  .today-tiles { display: block; order: 1; }
+  .today-tiles h2 { margin: 0 0 8px; }
+  .tt-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 16px; }
+  .tile.tt { padding: 12px; min-height: 76px; }
+  .tile.tt .n { font-size: 28px; }
+  .dash-vans { order: 2; } .dash-action { order: 3; } .dash-rem { order: 4; } .dash-wait { order: 5; } .dash-order { order: 6; }
+  .dash-overdue { order: 7; } .dash-dec { order: 8; } .dash-golive { order: 9; } .dash-recent { order: 10; }
+  .action-panel > .row { flex-direction: column; gap: 10px !important; }
+  .action-total { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 16px; min-width: 0; }
+  .action-total .ah { display: flex; align-items: baseline; gap: 6px; min-height: 44px; }
+  .action-total .ah .n, .action-total .ah2 .n { font-size: 30px; }
+  .action-total .ah2 { margin-top: 0; }
+  .action-total .ah2::before { content: '·'; color: var(--faint); margin-right: 10px; font-size: 22px; }
+  .action-row { min-height: 44px; align-items: center; }
+  .rem { align-items: center; gap: 4px; padding: 2px 0; }
+  .rem-tick { width: 44px; height: 44px; align-items: center; justify-content: center; margin-left: -10px; }
+  .rem-tick input { margin: 0; width: 22px; height: 22px; }
+  .rem-del { width: 44px; height: 44px; font-size: 24px; margin-right: -8px; }
+  .rem-all { width: 100%; min-height: 44px; justify-content: center; }
+  table.wait-t td:first-child { white-space: normal; width: 34%; }
+
+  /* ── Tables as cards (table.cards-sm): header hidden, each row a small card, labels from data-label ── */
+  .table-wrap:has(> table.cards-sm) { overflow: visible; }
+  table.cards-sm, table.cards-sm tbody { display: block; width: 100%; }
+  table.cards-sm thead { display: none; }
+  table.cards-sm tr { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 10px; padding: 10px 12px; border-top: 1px solid var(--line); }
+  table.cards-sm tbody tr:first-child { border-top: 0; }
+  table.cards-sm td { display: block; padding: 0; border: 0; min-width: 0; text-align: left; white-space: normal; }
+  table.cards-sm td[data-label]::before { content: attr(data-label) ' '; color: var(--muted); font-size: 12px; font-weight: 400; }
+  table.cards-sm td.empty { grid-column: 1 / -1; padding: 20px 0; }
+  table.cards-sm .bar { min-width: 0; }
+  /* Van cards (Dashboard and Vans): "#1 ST0367 · status" / model / "due 18/9 · 30 days late" / parts bar + "N still missing" */
+  #dash-vans td.vc-ch { grid-column: 1; grid-row: 1; }
+  #dash-vans td.vc-st { grid-column: 2; grid-row: 1; justify-self: end; }
+  #dash-vans td.vc-model, #dash-vans td.vc-due, #dash-vans td.vc-parts { grid-column: 1 / -1; }
+  .vc-pos { color: var(--muted); font-weight: 600; }
+  td.vc-model > div { display: inline; margin-left: 4px; }
+  #vans-table tr { grid-template-columns: auto auto minmax(0, 1fr) auto; }
+  #vans-table td.vc-pos { grid-column: 1; grid-row: 1; }
+  #vans-table td.vc-ch { grid-column: 2; grid-row: 1; }
+  #vans-table td.vc-st { grid-column: 3; grid-row: 1; }
+  #vans-table td.vc-bo { grid-column: 4; grid-row: 1 / 4; align-self: start; text-align: center; }
+  #vans-table td.vc-bo[data-label]::before { display: block; font-size: 11px; margin-bottom: 2px; }
+  #vans-table td.vc-bo .bo-input { width: 60px; min-height: 44px; text-align: center; }
+  #vans-table td.vc-model, #vans-table td.vc-due { grid-column: 1 / 4; }
+  #vans-table td.vc-parts { grid-column: 1 / -1; }
+  #vans-table td.vc-cust { display: none; }
+  /* Stock cards: photo + name, then "On hand 8 · Free 0 · Short 2"; supplier, rack, reorder, last counted hidden */
+  #stk tr { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; }
+  #stk td.sc-item { flex: 1 1 calc(100% - 120px); order: 1; }
+  #stk td.sc-btn { flex: none; order: 2; margin-left: auto; }
+  #stk td.sc-btn .btn { min-height: 44px; }
+  #stk td.sc-n { order: 3; flex: none; text-align: left; }
+  #stk td.sc-n:empty { display: none; }
+  /* PO cards: "PO 29 · supplier · status" / vans / expected + received / a full-width Receive… */
+  #po-table td.po-no { grid-column: 1; grid-row: 1; overflow-wrap: anywhere; }
+  #po-table td.po-no .po-sup-in { font-weight: 500; }
+  #po-table td.po-st { grid-column: 2; grid-row: 1; }
+  #po-table td.po-vans { grid-column: 1 / -1; }
+  #po-table td.po-exp { grid-column: 1; }
+  #po-table td.po-rcv { grid-column: 2; text-align: right; }
+  #po-table td.po-btn { grid-column: 1 / -1; }
+  #po-table td.po-btn:empty { display: none; }
+  #po-table td.po-btn .btn { width: 100%; min-height: 44px; justify-content: center; }
+  #po-table tr.po-exact > td:first-child { box-shadow: none; }
+  #po-table tr.po-exact { box-shadow: inset 3px 0 0 var(--bark); background: var(--brand-soft); }
+
+  /* ── Purchasing → To order ── */
+  .filt-tog { display: inline-flex; margin: 0 16px 10px; min-height: 44px; }
+  #pf-row:not(.filt-open) { display: none; }
+  #pf-row select, #pf-row > label { flex: 1 1 100%; }
+  #pf-row select { min-height: 44px; }
+  .pur-sec > summary .sec-help { display: none; }
+  .sec-help-list { display: block; }
+  .pur-sec > summary { min-height: 44px; align-items: center; }
+  /* A supplier on two lines: name + counts, then lead time + a full-width "Create PO" */
+  .sup-block > .sup-head { flex-wrap: wrap; gap: 6px 10px; padding: 10px 12px; }
+  .sup-head .sup-tog { min-width: 32px; min-height: 32px; }
+  .sup-head > .grow { display: none; }
+  .sup-head .lead { display: inline-flex; align-items: center; gap: 6px; }
+  .sup-head input.lead-in { min-height: 40px; width: 64px; }
+  .sup-head input.lead-in:placeholder-shown { width: 128px; }
+  .sup-head [data-po] { flex: 1 1 100%; min-height: 44px; justify-content: center; }
+  /* Each line: tick on the left over 3 rows; the part across; then the van #; then needed-by / order-by; the amount on the right */
+  table.pur { table-layout: auto; }
+  table.pur, table.pur tbody { display: block; width: 100%; }
+  table.pur tr[data-row] { display: grid; grid-template-columns: 36px minmax(0, 1fr) auto; gap: 4px 10px; padding: 10px 12px; border-top: 1px solid var(--line); }
+  table.pur tr[data-row] > td { display: block; width: auto !important; min-width: 0; padding: 0; border: 0; }
+  table.pur tr[data-row] > td:nth-child(1) { grid-column: 1; grid-row: 1 / 4; }
+  table.pur tr[data-row] > td:nth-child(1) input { width: 22px; height: 22px; margin: 2px 0 0; }
+  table.pur tr[data-row] > td:nth-child(2) { grid-column: 2 / 4; grid-row: 1; }
+  table.pur tr[data-row] > td:nth-child(3) { grid-column: 2; grid-row: 2; white-space: normal; }
+  table.pur tr[data-row] > td:nth-child(4) { grid-column: 2; grid-row: 3; white-space: normal; }
+  table.pur tr[data-row] > td:nth-child(5) { grid-column: 3; grid-row: 2 / 4; align-self: center; text-align: right; }
+  table.pur tr[data-row] > td:nth-child(5) input.qty { width: 72px; min-height: 44px; }
+  table.pur tr.is-check { display: block; border-top: 1px solid var(--line); }
+  table.pur tr.is-check > td { display: block; width: auto !important; padding: 10px 12px; border: 0; }
+  table.pur tr.is-check > td:first-child { display: none; }
+  /* Special parts / waiting on a decision: a card per line; the two buttons side by side, 44px tall */
+  .table-wrap:has(> .ph-table) { overflow: visible; }
+  .ph-table td.ph-acts { display: flex; flex-wrap: wrap; gap: 8px; }
+  .ph-table td.ph-acts .btn { flex: 1 1 calc(50% - 8px); min-height: 44px; justify-content: center; margin: 0; white-space: normal; text-align: center; }
+  .dec-table td.dec-van { margin-bottom: 2px; }
+}
+
+/* ── Small fixes & phone round 1 — phone batch 2 (C5 van page, C8 windows) ──
+   As in batch 1, everything that changes the layout is inside @media (max-width: 600px); outside it only
+   new pieces are styled (and hidden), so the PC looks as before. */
+.ln-more, .modal footer.sm-foot { display: none; }
+.tile-due .late { margin-top: 4px; }
+.lmiss { padding: 0 16px 10px; font-size: 13px; color: var(--muted); }
+.lmiss .btn.link { font-weight: 600; text-decoration: underline; text-underline-offset: 2px; }
+details.van-fold > summary { list-style: none; cursor: pointer; display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; padding: 12px 16px; min-height: 44px; }
+details.van-fold > summary::-webkit-details-marker { display: none; }
+details.van-fold > summary::before { content: '▸'; color: var(--muted); }
+details.van-fold[open] > summary::before { content: '▾'; }
+details.van-fold > summary h2 { margin: 0; flex: 1; }
+details.van-fold[open] > summary { padding-bottom: 6px; }
+
+@media (max-width: 600px) {
+  .no-phone { display: none !important; }
+
+  /* ── C5 Van page: 3 small tiles across, "Still missing" across the top, the due date says how late ── */
+  .tiles.van-tiles { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; margin-bottom: 12px; }
+  .van-tiles .tile { padding: 8px; }
+  .van-tiles .tile .n { font-size: 20px; }
+  .van-tiles .tile .l { font-size: 10px; letter-spacing: .04em; margin-top: 3px; line-height: 1.25; }
+  /* first row: "57 Still missing" (2 wide) and the delivery date / how late; the counts under them */
+  .van-tiles .tile:first-child { grid-column: span 2; order: -2; display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 8px; }
+  .van-tiles .tile:first-child .still-detail { flex-basis: 100%; margin-top: 2px; line-height: 1.3; }
+  .van-tiles .tile-due { order: -1; }
+  .van-tiles .tile-due .n { font-size: 15px; }
+  .van-tiles .tile-due .late { font-size: 11.5px; margin-top: 3px; }
+  /* van page buttons on one line (Print picking list is hidden on a phone) */
+  .van-head { gap: 6px 10px; margin-bottom: 12px; }
+  .van-head .actions { width: 100%; flex-wrap: nowrap; gap: 6px; }
+  .van-head .actions .btn { flex: 1 1 auto; min-height: 44px; padding: 4px 8px; justify-content: center; text-align: center; white-space: normal; font-size: 11.5px; line-height: 1.2; }
+  /* Filter: the box full width; the status drop-down (opens on "Missing") and + Add part under it */
+  .lf-row { padding: 10px 12px !important; }
+  .lf-row #lf { width: 100% !important; flex: 1 1 100%; min-height: 44px; }
+  .lf-row #ls { flex: 1 1 0; min-width: 0; min-height: 44px; }
+  .lf-row > .grow { display: none; }
+  .lf-row #add { min-height: 44px; }
+  .lmiss { padding: 0 12px 8px; }
+  .lmiss .btn.link { min-height: 44px; padding: 0 4px; }
+  /* Parts list as cards: the part + its status across, then "Need 1 ea · Set aside 1 · Issued 0", then Change… */
+  .table-wrap:has(> #lines) { overflow: visible; }
+  #lines, #lines tbody { display: block; width: 100%; }
+  #lines thead { display: none; }
+  #lines tr.group:not(.hidden), #lines tr.group > td { display: block; }
+  #lines tr[data-line]:not(.hidden) { display: grid; grid-template-columns: auto auto auto minmax(0, 1fr); gap: 6px 14px; align-items: center; padding: 10px 12px; border-top: 1px solid var(--line); }
+  #lines tr[data-line] > td { display: block; padding: 0; border: 0; min-width: 0 !important; width: auto; text-align: left; white-space: normal; }
+  #lines tr[data-line] > td.ln-item { grid-column: 1 / -1; grid-row: 1; }
+  #lines tr[data-line] > td.ln-st { grid-column: 1 / -1; grid-row: 2; }
+  #lines tr[data-line] > td.num { grid-row: 3; white-space: nowrap; }
+  #lines tr[data-line] > td.num::before { content: attr(data-label) ' '; color: var(--muted); font-size: 12px; }
+  #lines tr[data-line] > td.ln-acts { grid-column: 4; grid-row: 3; justify-self: end; }
+  #lines tr[data-line] .spec { max-width: none; }
+  #lines .ln-more { display: inline-flex; min-height: 44px; padding: 0 14px; }
+  #lines td.ln-acts > :not(.ln-more) { display: none; }
+  /* "Change…" open: Normal / Customer supplies, Edit and Why? as 44px buttons on their own line */
+  #lines tr.acts-open > td.ln-acts { grid-column: 1 / -1; grid-row: 4; justify-self: stretch; display: flex; flex-wrap: wrap; gap: 8px; }
+  #lines tr.acts-open > td.ln-acts > * { display: inline-flex; min-height: 44px; flex: 1 1 auto; justify-content: center; align-items: center; }
+  #lines tr.acts-open > td.ln-acts > select { display: block; flex: 1 1 100%; font-size: 16px; }
+  #lines tr.acts-open > td.ln-acts > .ln-more { order: 9; }
+  #lines tr.acts-open > td.ln-acts > .btn.link { border: 1px solid var(--line-strong); }
+
+  /* ── C8 Windows fill the phone: the title + × stay at the top, the buttons stay at the bottom ── */
+  .modal-bg { padding: 0; overscroll-behavior: contain; }
+  .modal, .modal.wide { width: 100%; min-height: 100vh; min-height: 100dvh; border-radius: 0; display: flex; flex-direction: column; }
+  .modal header { position: sticky; top: 0; z-index: 3; background: var(--panel); padding: max(6px, env(safe-area-inset-top)) 6px 6px 16px; gap: 8px; box-shadow: 0 1px 0 var(--line); }
+  .modal header h2 { flex: 1; min-width: 0; overflow-wrap: anywhere; line-height: 1.3; }
+  .modal header .x { flex: none; width: 48px; height: 48px; font-size: 30px; }
+  .modal .body { flex: 1; padding: 14px 16px; }
+  .modal footer, .modal footer.sm-foot { position: sticky; bottom: 0; z-index: 3; display: flex; flex-wrap: wrap; gap: 8px; background: var(--panel);
+    padding: 10px 16px max(12px, env(safe-area-inset-bottom)); box-shadow: 0 -4px 12px rgba(32, 30, 22, .08); }
+  .modal footer .btn { flex: 1 1 auto; min-height: 44px; justify-content: center; }
+  .modal footer > .grow { display: none; }
+  /* Item window: tiles two across (the general .tiles rule), Receive / Count / Edit in the bottom bar */
+  .modal .item-head > .grow { flex: 1 1 100%; min-width: 0; }
+  /* Receive delivery: each van row is a small card; "arrives …" / "supplier cancelled" get their own line */
+  .rcv-item { padding: 10px; }
+  .rcv-item > .row > label.small { flex: 1 1 100%; display: flex; align-items: center; gap: 8px; }
+  .rcv-item input.qty { min-height: 44px; width: 88px; }
+  .rcv-item table, .rcv-item tbody { display: block; width: 100%; }
+  .rcv-item tr[data-pl] { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 4px 8px; align-items: center; padding: 8px 0; border-top: 1px solid var(--line); }
+  .rcv-item tr[data-pl] > td { display: block; padding: 0; border: 0; white-space: normal; min-width: 0; }
+  .rcv-item tr[data-pl] > td:nth-child(1) { grid-column: 1; grid-row: 1; }
+  .rcv-item tr[data-pl] > td:nth-child(2) { grid-column: 2 / -1; grid-row: 1; }
+  .rcv-item tr[data-pl] > td:nth-child(3) { grid-column: 1 / 3; grid-row: 2; }
+  .rcv-item tr[data-pl] > td:nth-child(4) { grid-column: 3; grid-row: 2; white-space: nowrap; }
+  .rcv-item tr[data-pl] > td.rest { grid-column: 1 / -1; grid-row: 3; }
+  .rcv-item tr[data-pl] > td.rest:empty { display: none; }
+  .rcv-item td.rest label { display: flex; align-items: center; gap: 8px; min-height: 44px; }
+  .rcv-item td.rest input[type=date] { flex: 1; min-width: 0; }
+  .rcv-item td.rest input[type=checkbox] { width: 22px; height: 22px; margin: 0; }
+}
+
+/* ── Small fixes & phone round 1 — phone batch 3 (C10 office touch basics, C12 factory floor / plan) ──
+   Touch rules sit behind (pointer: coarse) and the phone rules behind max-width, so a PC with a mouse looks
+   exactly as before. */
+.touch-only, .touch-hint { display: none; }
+.touch-hint { font-size: 12px; color: var(--muted); white-space: normal; margin-top: 3px; line-height: 1.35; }
+/* 16px in boxes: iPhones and iPads don't zoom in when one is tapped */
+@media (max-width: 900px), (pointer: coarse) {
+  input, select, textarea { font-size: 16px !important; }
+}
+@media (pointer: coarse) {
+  .touch-only { display: inline; }
+  .hint.touch-only, .touch-hint { display: block; }
+  .mouse-only { display: none !important; }
+  .btn { min-height: 44px; }
+  .btn.small { min-height: 38px; }
+  .btn.link { padding: 10px 6px; }
+  .modal header .x { min-width: 44px; min-height: 44px; }
+  input[type=checkbox], input[type=radio] { width: 22px; height: 22px; }
+  .tabs button { min-height: 44px; }
+  .chk-group .lines label { padding: 8px 0; }
+  .sup-tog, .sup-head .sup-tog { width: 44px; height: 44px; min-width: 44px; min-height: 44px; }
+  .seg button { min-height: 44px; }
+}
+@media (max-width: 600px) {
+  :root { font-size: 15px; }
+  .small { font-size: 13px; }
+  th { font-size: 12px; }
+  .chip { font-size: 12.5px; }
+  .faint, .hint { color: var(--muted); }
+  /* toasts across the bottom, above the iPhone home bar */
+  #toasts { left: 12px; right: 12px; bottom: calc(18px + env(safe-area-inset-bottom)); }
+  .toast { max-width: none; }
+  /* van page "Change…" row: the Why? explanation on its own line */
+  #lines tr.acts-open > td.ln-acts > .touch-hint { flex: 1 1 100%; min-height: 0; justify-content: flex-start; }
+}
+@media (max-width: 900px) {
+  /* viewport-fit=cover (C10): keep the page clear of the notch on a phone turned sideways */
+  main { padding-left: max(16px, env(safe-area-inset-left)); padding-right: max(16px, env(safe-area-inset-right)); padding-bottom: calc(60px + env(safe-area-inset-bottom)); }
+}
+
+/* C12 — "More actions" (phones): the buttons that change the factory sit one tap further away */
+details.more-acts { position: relative; }
+details.more-acts > summary { list-style: none; }
+details.more-acts > summary::-webkit-details-marker { display: none; }
+.more-acts-body { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; padding: 10px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); }
+.more-acts-body .btn { justify-content: center; }
+/* Production plan: model + due date under the chassis (shown on phones only) */
+.c1-sub { display: none; }
+/* plan cell window on a touch screen: "Tap again: Mark fitted" */
+.btn.armed { background: var(--warn-soft); border-color: #e2a33a; color: var(--warn); }
+@media (max-width: 600px) {
+  /* Factory floor: the bays as a list above the map; the map scrolls sideways in its own box */
+  .bays-list { padding: 12px; }
+  .bays-list h2 { margin-bottom: 6px; }
+  .bay-row { display: flex; align-items: center; gap: 10px; min-height: 48px; padding: 6px 2px; border-top: 1px solid var(--line); color: inherit; }
+  .bay-row:first-of-type { border-top: 0; }
+  a.bay-row:hover { text-decoration: none; background: var(--gray-soft); }
+  .bay-row .bay-n { flex: none; width: 52px; font-family: var(--font-mono); font-size: 12px; text-transform: uppercase; color: var(--muted); }
+  .bay-row .go-arrow { flex: none; font-size: 22px; color: var(--muted); }
+  .bays-warn { margin: 0 0 8px; padding: 8px 10px; border-radius: var(--radius); background: var(--warn-soft); color: var(--warn); font-weight: 600; }
+  #fmap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  #fmap .fm-svg { min-width: 720px; max-height: none; }
+  #fmode { display: none; }   /* only the 2D map on a phone: no need for the switch */
+  #fmove { min-height: 44px; }
+  .page-head .actions { width: 100%; }
+  details.more-acts { flex: 1 1 100%; }
+  details.more-acts > summary.btn { width: 100%; justify-content: center; min-height: 44px; }
+  .uvan { cursor: pointer; min-height: 48px; justify-content: center; }
+  /* Production plan: only the chassis column (110px) is pinned, with the model and due date in it */
+  table.plan .c2, table.plan .c3 { display: none; }
+  table.plan .c1 { width: 110px; min-width: 110px; max-width: 110px; }
+  .c1-sub { display: block; font-size: 11.5px; color: var(--muted); line-height: 1.3; margin-top: 2px; overflow-wrap: anywhere; }
+  .plan-wrap { max-height: calc(100vh - 110px); max-height: calc(100dvh - 110px); }
+  /* the "Show columns matching…" box first, full width */
+  .plan-filters { padding: 10px 12px !important; }
+  .plan-filters #pc { order: -2; width: 100% !important; flex: 1 1 100%; min-height: 44px; }
+  .plan-filters #pv { order: -1; flex: 1 1 0; width: auto !important; min-height: 44px; }
+  .plan-filters > .grow { display: none; }
+  .plan-filters > .small { flex: 1 1 100%; }
+}
+@media (max-width: 900px) { #fside { scroll-margin-top: calc(64px + env(safe-area-inset-top)); } } /* the van panel's title clears the sticky top bar */
+
+/* ── Small fixes & phone round 2 (planner-r1-3): the van parts list fits a tablet without scrolling sideways ──
+   From 601px (phones have their own cards above) up to 900px, and up to 1100px on a touch screen (a tablet
+   turned sideways), each line is a two-column card: the part on the left; its status and "Need · Set aside ·
+   Issued" on the right; Normal / Customer supplies, Edit and Why? under it on the right, always shown.
+   A PC with a mouse wider than 900px, and the printed picking list, keep the table exactly as before. */
+@media screen and (min-width: 601px) and (max-width: 900px), screen and (min-width: 601px) and (max-width: 1100px) and (pointer: coarse) {
+  .table-wrap:has(> #lines) { overflow: visible; }
+  #lines, #lines tbody { display: block; width: 100%; }
+  #lines thead { display: none; }
+  #lines tr.group:not(.hidden), #lines tr.group > td { display: block; }
+  #lines tr[data-line]:not(.hidden) { display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto; gap: 6px 18px;
+    align-items: start; padding: 10px 16px; border-top: 1px solid var(--line); }
+  #lines tr[data-line] > td { display: block; padding: 0; border: 0; min-width: 0 !important; width: auto; white-space: normal; }
+  #lines tr[data-line] > td.ln-item { grid-column: 1; grid-row: 1 / span 3; }
+  #lines tr[data-line] > td.ln-st { grid-column: 2 / -1; grid-row: 1; text-align: left; }
+  #lines tr[data-line] > td.num { grid-row: 2; white-space: nowrap; text-align: left; }
+  #lines tr[data-line] > td.num:nth-child(2) { grid-column: 2; }
+  #lines tr[data-line] > td.num:nth-child(3) { grid-column: 3; }
+  #lines tr[data-line] > td.num:nth-child(4) { grid-column: 4; }
+  #lines tr[data-line] > td.num::before { content: attr(data-label) ' '; color: var(--muted); font-size: 12px; }
+  #lines tr[data-line] > td.ln-acts { grid-column: 2 / -1; grid-row: 3; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; }
+  #lines tr[data-line] > td.ln-acts > .ln-more { display: none; }
+  #lines tr[data-line] > td.ln-acts > .touch-hint { flex: 1 1 100%; order: 9; margin-top: 0; }
+  #lines tr[data-line] .spec { max-width: none; }
+  /* the due date ("18/09/2026") fits its tile, so the page doesn't scroll sideways either */
+  .van-tiles .tile-due .n { font-size: 22px; white-space: nowrap; }
+}
+
+/* ── Small fixes & phone round 2 — phone batch 1 (owner-r1-2 … owner-r1-4) ──
+   New pieces only outside the media queries (the PC looks as before). */
+/* Undo message after moving a van (owner-r1-3) */
+.toast-undo { display: flex; align-items: center; gap: 12px; }
+.toast-undo .btn { flex: none; background: var(--limestone); color: var(--espresso); border-color: var(--limestone); }
+/* Factory floor van card: "57 still missing · 31 days late" first, then the fitted bar with its label (owner-r1-2) */
+.fv-still { font-size: 16px; font-weight: 600; margin: 0 0 8px; }
+.fv-still.ok-text { font-weight: 600; }
+.fv-fit-l { margin-bottom: 3px; }
+/* Production plan "By van" (phones only, owner-r1-4) */
+.ph-only { display: none; }
+.pv-list { display: flex; flex-direction: column; }
+.pv-card { position: relative; display: block; padding: 12px 40px 12px 16px; border-top: 1px solid var(--line); cursor: pointer; min-height: 48px; }
+.pv-card:first-child { border-top: 0; }
+.pv-card:active { background: var(--gray-soft); }
+.pv-card .go-arrow { position: absolute; right: 14px; top: 50%; transform: translateY(-50%); font-size: 24px; color: var(--muted); }
+.pv-top { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.pv-top strong { font-size: 17px; }
+.pv-model { min-width: 0; overflow-wrap: anywhere; }
+.pv-due { margin: 2px 0 6px; }
+.pv-due .late { font-size: inherit; }
+.pv-bar { display: flex; gap: 2px; height: 12px; border: 1px solid var(--line-strong); border-radius: 3px; overflow: hidden; background: var(--line-strong); }
+.pv-bar i { display: block; min-width: 3px; }
+.pv-counts { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 6px; }
+.pv-counts span { white-space: nowrap; }
+.pv-sw { display: inline-block; width: 11px; height: 11px; border: 1px solid var(--line-strong); border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+details.pv-group { border-top: 1px solid var(--line); }
+details.pv-group > summary { list-style: none; display: flex; align-items: center; gap: 10px; min-height: 48px; cursor: pointer; }
+details.pv-group > summary::-webkit-details-marker { display: none; }
+details.pv-group > summary::before { content: '▸'; color: var(--muted); }
+details.pv-group[open] > summary::before { content: '▾'; }
+.pv-items { display: flex; flex-direction: column; gap: 6px; padding: 0 0 12px; }
+.pv-item { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; width: 100%; text-align: left; min-height: 48px; padding: 8px 12px;
+  border: 1px solid var(--line-strong); border-radius: var(--radius); font: inherit; color: var(--ink); }
+button.pv-item { cursor: pointer; }
+.pv-item.p-info { color: var(--muted); }
+.pv-col { font-family: var(--font-mono); font-size: 11.5px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); overflow-wrap: anywhere; }
+.pv-txt { font-size: 15px; overflow-wrap: anywhere; }
+@media (max-width: 600px) {
+  .ph-only { display: inline; }
+  .page-head .seg.plan-view { flex: 1 1 100%; }
+  .seg.plan-view button { flex: 1; min-height: 44px; }
+}
+
+/* ── Small fixes & phone round 3 — phone batch 1 (owner-r2-1, owner-r2-2) ──
+   New pieces only outside the media query (the PC looks as before). */
+/* Production plan "By van": parts counted the van page's way, "To check" apart from "Not ordered" (owner-r2-1) */
+.p-check { background: #fff3c4; }
+.p-decide { background: #f1ebfa; }
+.legend span.p-check, .plan-chip.p-check { border-color: #ecd27a; }
+.pv-item.p-check { background: #fffbea; border-color: #ecd27a; }
+.pv-item .pv-part { font-size: 12.5px; }
+.pv-item .pv-tag { margin-top: 3px; }
+.pv-help { padding: 0 2px 8px; line-height: 1.45; }
+.pv-help a { display: inline-block; padding: 6px 0; font-weight: 600; }
+/* Dashboard on a phone (owner-r2-2): "Show all N vans", and the lists below fold to one line each */
+.dv-all { display: none; }
+details.dash-fold > summary { list-style: none; cursor: pointer; display: flex; align-items: center; gap: 10px; min-height: 52px; padding: 6px 16px; }
+details.dash-fold > summary::-webkit-details-marker { display: none; }
+details.dash-fold > summary::before { content: '▸'; color: var(--muted); }
+details.dash-fold[open] > summary::before { content: '▾'; }
+details.dash-fold > summary h2 { margin: 0; flex: 1; font-size: 16px; }
+details.dash-fold .df-n { font-family: var(--font-mono); font-size: 13px; color: var(--muted); white-space: nowrap; }
+details.dash-fold .df-n .overdue { color: var(--bad); font-weight: 600; }
+details.dash-fold .df-body { padding-top: 4px; }
+details.dash-fold .df-body.df-pad { padding: 0 16px 12px; }
+@media (max-width: 600px) {
+  /* Dashboard: the Today tiles already say "N vans late" / "N waiting on parts" — no second headline */
+  .dash .action-total { display: none; }
+  #dash-vans:not(.show-all) tr.dv-more { display: none; }
+  .dv-all { display: flex; justify-content: center; width: calc(100% - 24px); min-height: 48px; margin: 4px 12px 12px; font-size: 15px; }
+  .dash-fold { margin-bottom: 10px; scroll-margin-top: calc(64px + env(safe-area-inset-top)); } /* clears the sticky top bar */
+  /* Office to-do: rows with nothing to do are left out on a phone */
+  .dash .action-row.zero { display: none; }
+  details.golive > summary { min-height: 44px; padding: 6px 0; line-height: 1.6; }
+}
+
+/* ── Small fixes & phone follow-up round 1 — planner batch (planner-r3-3) ──
+   Purchasing → To order on a tablet (601–900px, or up to 1100px on a touch screen): every supplier on the same two
+   lines — ▸ name · facts (· N ticked) on top; lead time on the left and "Create PO for ticked" on the right under it.
+   The lead-time box is wide enough for "14 (default)" at the 16px tablet font (with room for the arrows on a PC). */
+@media (min-width: 601px) { .sup-head input.lead-in:placeholder-shown { width: 120px; } }
+@media screen and (min-width: 601px) and (max-width: 900px), screen and (min-width: 601px) and (max-width: 1100px) and (pointer: coarse) {
+  .sup-block > .sup-head { flex-wrap: wrap; gap: 4px 10px; }
+  .sup-head .sup-facts { flex: 1 1 0; min-width: 0; white-space: normal; overflow: visible; }
+  .sup-head > .grow { flex: 0 0 100%; height: 0; } /* the line break: everything after it goes on line 2 */
+  .sup-head .lead { display: inline-flex; align-items: center; gap: 6px; }
+  .sup-head input.lead-in { min-height: 40px; width: 72px; }
+  .sup-head input.lead-in:placeholder-shown { width: 140px; }
+  .sup-head [data-po] { margin-left: auto; }
+}
+/* Top bar Menu (planner-r3-6): the badge = Purchasing "Order now"; a small dot = stock checks waiting; the opened
+   menu starts with one line saying what they are ("107 to order on Purchasing · 1 on Stock checks"). */
+.menu-dot, .nav-sum { display: none; }
+@media (max-width: 900px) {
+  .menu-btn .menu-dot { display: inline-block; width: 9px; height: 9px; margin-left: -2px; border-radius: 50%; background: var(--bad); box-shadow: 0 0 0 2px var(--limestone); }
+  .side.open .nav .nav-sum { display: block; order: 0; margin: 2px 14px 8px; font-size: 13px; line-height: 1.4; color: #c9c1b2; }
+  .menu-btn .menu-dot.hidden, .side.open .nav .nav-sum.hidden { display: none; }
+}
+
+/* ── Small fixes & phone follow-up round 1 — owner batch (owner-r3-1 … owner-r3-8) ──
+   New pieces are styled outside the media queries; everything that changes the layout on a phone or touch screen is
+   inside @media (max-width: 600px) or (pointer: coarse), so the PC looks as before. */
+/* owner-r3-1: "4 vans late" + "+ 1 date to check" on the Today tile; the date flag sits in the line it belongs to */
+.tile .tt-sub { font-size: 11.5px; font-weight: 600; color: var(--warn); margin-top: 2px; line-height: 1.25; }
+.sm-only .dueflag, .pv-due .dueflag, .fv-still .dueflag, .uvan .dueflag, .bay-row .dueflag, .bw-van .dueflag { display: inline; white-space: normal; }
+.uvan .dueflag { margin-left: 6px; }
+/* owner-r3-2: "18 waiting on PO · 29 still to order · 10 to check", then the parts by name */
+.wait-t .wait-split { display: block; }
+.wait-t .wait-parts { margin-top: 2px; }
+/* owner-r3-6: reminders grouped under one heading per van */
+.rem-grp { padding-top: 4px; }
+.rem-grp + .rem-grp { border-top: 1px solid var(--line-strong); margin-top: 4px; }
+.rem-van { display: flex; align-items: center; flex-wrap: wrap; gap: 0 8px; padding: 2px 0; }
+.rem-grp > .rem:last-child { border-bottom: 0; }
+/* owner-r3-7: "plan says ordered 29/06/2026 – check" may wrap on a narrow screen */
+.chip.pv-tag { white-space: normal; max-width: 100%; text-align: left; line-height: 1.35; }
+/* owner-r3-4: the vans in production but not in a bay, one per line with how late they are */
+.bays-warn .bw-van { display: flex; align-items: center; flex-wrap: wrap; gap: 0 8px; min-height: 44px; color: inherit; }
+.bays-warn .bw-van .small { font-weight: 500; }
+/* owner-r3-3: Purchasing summary (phone only — it is only drawn on a phone) */
+.pur-sum { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin: 0 0 12px; }
+.psum-i { display: block; min-height: 64px; padding: 10px 12px; border: 1px solid var(--line); border-top: 3px solid var(--limestone);
+  border-radius: var(--radius); background: var(--panel); color: inherit; line-height: 1.3; }
+.psum-i:hover { text-decoration: none; }
+.psum-i b { display: block; font-family: var(--font-head); font-size: 24px; font-weight: 500; color: var(--espresso); }
+.psum-i.bad { border-top-color: var(--bad); } .psum-i.bad b { color: var(--bad); }
+.psum-i.warn { border-top-color: #e2a33a; } .psum-i.warn b { color: var(--warn); }
+.psum-i .psum-s { display: block; font-size: 12px; color: var(--muted); }
+@media (max-width: 600px) {
+  /* owner-r3-3: a closed supplier is one name + facts line — no ticks count, lead time or Create PO until it is opened */
+  .sup-block:not(.open) > .sup-head .lead, .sup-block:not(.open) > .sup-head [data-po], .sup-block:not(.open) > .sup-head .sup-ticked { display: none; }
+  /* owner-r3-5: Vans list — the build order is plain text ("#1" on the card); number boxes only after "Change build order" */
+  #vans-table:not(.bo-editing) td.vc-bo .bo-input, #vans-table:not(.bo-editing) td.vc-bo[data-label]::before { display: none; }
+  #vans-table.bo-editing td.vc-bo .bo-text { display: none; }
+  #vans-table td.vc-bo .bo-text { display: block; max-width: 72px; line-height: 1.25; }
+  #vans-table.bo-editing tr { background: #fffcf2; }
+  #bo-banner { position: sticky; top: calc(52px + env(safe-area-inset-top)); z-index: 5; flex-wrap: nowrap; gap: 8px; padding: 6px 10px; }
+  #bo-banner .btn { min-height: 44px; min-width: 72px; justify-content: center; }
+  /* owner-r3-8: the go-live checklist folds like the other Dashboard panels */
+  details.golive.dash-fold { padding: 0; }
+  details.golive.dash-fold > summary { min-height: 52px; padding: 6px 16px; line-height: normal; }
+  details.golive.dash-fold .gl-order { margin: 0 0 4px; }
+}
+@media (max-width: 600px), (pointer: coarse) {
+  /* owner-r3-6: 44px to tap — van names over the reminders and in Missing parts by van, "+ N more", tick boxes, × */
+  .rem-van .rem-vlink, .wait-t .wait-vlink, .wait-t .more-link { display: inline-flex; align-items: center; min-height: 44px; }
+  .wait-t .more-link { padding: 0 6px; margin-left: -6px; }
+  .rem-tick { width: 44px; height: 44px; align-items: center; justify-content: center; margin-left: -10px; }
+  .rem-tick input { margin: 0; width: 24px; height: 24px; }
+  .rem .rem-del { width: 44px; height: 44px; font-size: 24px; margin-right: -8px; display: inline-flex; align-items: center; justify-content: center; }
+  .rem { align-items: center; }
+  .fv-rem .rem-text { cursor: pointer; }
+  .btn.small.rem-all { min-height: 44px; } /* "Show all 23 (+ 13 more)" */
+}
+
+/* ── Logins and job roles ──
+   Buttons and menu items a job role can't use are marked data-need="office|stock|issue|floor|layout|export|settings|webImage|users"
+   and hidden unless the page has the matching can-… class (set from /api/me). The server refuses them anyway. */
+body:not(.can-office) [data-need="office"], body:not(.can-stock) [data-need="stock"], body:not(.can-issue) [data-need="issue"],
+body:not(.can-floor) [data-need="floor"], body:not(.can-layout) [data-need="layout"], body:not(.can-export) [data-need="export"],
+body:not(.can-settings) [data-need="settings"], body:not(.can-webImage) [data-need="webImage"], body:not(.can-users) [data-need="users"],
+body:not(.can-poReceive) [data-need="poReceive"] { display: none !important; }
+.who-box[hidden] { display: none !important; }
+.who-box { margin-top: auto; padding: 12px 12px 4px; border-top: 1px solid rgba(241, 235, 225, .12); }
+.who-name { display: block; color: var(--limestone); font-weight: 600; font-size: 13px; overflow-wrap: anywhere; }
+.who-role { display: block; margin-top: 2px; font-family: var(--font-mono); font-size: 10.5px; letter-spacing: .14em; text-transform: uppercase; color: #a8a08f; }
+.who-acts { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+.who-act { background: transparent; border: 1px solid rgba(241, 235, 225, .3); color: var(--limestone); border-radius: 3px; padding: 6px 10px; font-size: 12px; cursor: pointer; }
+.who-act:hover { background: rgba(241, 235, 225, .08); }
+@media (min-width: 901px) {
+  /* PC sidebar: the links, then who is logged in at the bottom */
+  .nav { display: flex; flex-direction: column; flex: 1; min-height: 0; overflow-y: auto; }
+}
+@media (max-width: 900px) {
+  /* Phone / tablet Menu: who is logged in at the end of the list, big buttons */
+  .side.open .nav .who-box { order: 30; margin-top: 10px; padding: 14px 14px 4px; }
+  .who-name { font-size: 15px; }
+  .who-act { flex: 1; min-height: 48px; padding: 0 14px; font-size: 14px; }
+}
+.who-line { align-self: center; }
+/* Logins page */
+.role-help { margin: 0; padding-left: 18px; }
+.role-help li { margin: 2px 0; }
+tr.lg-off td { color: var(--muted); }
+td.lg-acts { white-space: nowrap; text-align: right; }
+@media (max-width: 600px) {
+  td.lg-acts { grid-column: 1 / -1; white-space: normal; text-align: left; display: flex !important; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+  td.lg-acts .btn { min-height: 44px; }
+}

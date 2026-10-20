@@ -1,0 +1,19 @@
+# Installed libraries (reinstall with npm install)
+node_modules/
+
+# Live data, backups and logs — never upload (customer names, stock, photos)
+data/
+backups/
+logs/
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+# Private test material: dealer orders and the production plan spreadsheet
+_extracted/
+_testdata/
+
+# Local settings
+.env
+.claude/

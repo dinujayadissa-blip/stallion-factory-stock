@@ -1,0 +1,29 @@
+{
+  "name": "factory-stock",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Dealer order → parts list → stock allocation for the caravan factory",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "seed": "node src/seed.js",
+    "reset": "node src/seed.js --reset",
+    "demo": "node src/seed.js --demo",
+    "backup": "node scripts/backup.js",
+    "users": "node scripts/users.js",
+    "test": "node --test \"test/*.test.js\""
+  },
+  "dependencies": {
+    "exceljs": "4.4.0",
+    "express": "4.22.3",
+    "pdfjs-dist": "4.10.38",
+    "three": "0.170.0",
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
+  },
+  "overrides": {
+    "uuid": "11.1.1"
+  }
+}

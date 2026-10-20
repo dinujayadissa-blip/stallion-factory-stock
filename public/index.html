@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#201e16">
+  <title>Stallion Caravans · Factory</title>
+  <link rel="icon" type="image/png" href="assets/brand/mark-bark.png">
+  <link rel="stylesheet" href="fonts/fonts.css">
+  <link rel="stylesheet" href="styles.css">
+  <!-- three.js for the 3D factory view, served from this PC (works without internet) -->
+  <script type="importmap">{ "imports": { "three": "/vendor/three/build/three.module.js", "three/addons/": "/vendor/three/addons/" } }</script>
+</head>
+<body>
+  <div class="shell">
+    <aside class="side">
+      <a class="brand" href="#/" aria-label="Stallion Caravans factory — dashboard">
+        <img class="mark" src="assets/brand/mark-limestone.png" alt="">
+        <img class="word" src="assets/brand/wordmark-limestone.png" alt="Stallion Caravans">
+        <span>Factory</span>
+      </a>
+      <!-- Phones / tablets (under 900px): a top bar with the page name and a Menu button (phone batch 1) -->
+      <span class="page-name" id="page-name" aria-live="polite"></span>
+      <button type="button" class="menu-btn" id="menu-btn" aria-expanded="false" aria-controls="nav">Menu <span class="count hidden" id="menu-count"></span><span class="menu-dot hidden" id="menu-dot"></span></button>
+      <nav class="nav" id="nav">
+        <!-- Phones / tablets: what the Menu badge is made of (follow-up round 1, planner-r3-6) -->
+        <p class="nav-sum hidden" id="nav-sum"></p>
+        <a href="#/" data-route="home">Dashboard</a>
+        <a href="#/import" data-route="import" data-need="office">New dealer order</a>
+        <a href="#/factory" data-route="factory">Factory floor</a>
+        <a href="#/plan" data-route="plan">Production plan</a>
+        <a href="#/vans" data-route="vans">Vans</a>
+        <a href="#/stock" data-route="stock">Stock</a>
+        <a href="#/purchasing" data-route="purchasing" data-need="stock">Purchasing <span class="count hidden" id="nav-order-count"></span></a>
+        <a href="#/checks" data-route="checks" data-need="stock">Stock checks <span class="count hidden" id="nav-check-count"></span></a>
+        <a href="#/rules" data-route="rules" data-need="office">Parts rules</a>
+        <a href="#/settings" data-route="settings" data-need="settings">Settings</a>
+        <a href="#/cleanup" data-route="cleanup" data-need="office">Clean-up report</a>
+        <a href="#/logins" data-route="logins" data-need="users">Logins</a>
+        <a href="/floor" target="_blank" rel="noopener">Worker screen ↗</a>
+        <!-- Who is logged in: Change password / Log out (logins and job roles). In the phone Menu too. -->
+        <div class="who-box" id="who-box" hidden>
+          <div class="who-id"><span class="who-name" id="who-name"></span><span class="who-role" id="who-role"></span></div>
+          <div class="who-acts"><button type="button" class="who-act" id="who-pw">Change password</button><button type="button" class="who-act" id="who-out">Log out</button></div>
+        </div>
+      </nav>
+      <div class="foot">Runs on your factory network.<br>Open it from any PC or tablet.</div>
+    </aside>
+    <main id="app"></main>
+  </div>
+  <div id="toasts"></div>
+  <script src="wording.js"></script>
+  <script src="factorymap.js"></script>
+  <script src="factory.js"></script>
+  <script src="stockcheck.js"></script>
+  <script src="purchasing.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,17 @@
+{
+  "name": "Stallion Floor",
+  "short_name": "Stallion",
+  "description": "Take parts for a van, book deliveries and find parts on the factory floor.",
+  "id": "/floor",
+  "start_url": "/floor",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#f1ebe1",
+  "theme_color": "#201e16",
+  "icons": [
+    { "src": "/assets/app/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/assets/app/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "/assets/app/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

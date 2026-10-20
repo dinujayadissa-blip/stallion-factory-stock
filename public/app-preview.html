@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Worker App Preview</title>
+  <link rel="icon" type="image/png" href="/assets/app/icon-192.png">
+  <link rel="stylesheet" href="/fonts/fonts.css">
+  <style>
+    :root { --limestone: #f1ebe1; --bark: #512b1a; --espresso: #201e16; --olive: #6c724b; --muted: #6b6355; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; background: var(--limestone); color: var(--espresso); font: 15px/1.5 Inter, "Segoe UI", system-ui, sans-serif;
+      display: flex; gap: 48px; align-items: center; justify-content: center; padding: 32px 16px; flex-wrap: wrap; }
+    h1 { font: 500 26px/1.15 "Work Sans", Inter, sans-serif; text-transform: uppercase; letter-spacing: .05em; margin: 0 0 6px; }
+    h2 { font: 600 13px "Work Sans", Inter, sans-serif; text-transform: uppercase; letter-spacing: .08em; margin: 22px 0 6px; color: var(--bark); }
+    p, li { margin: 0 0 6px; color: #3d382c; }
+    ol { padding-left: 20px; margin: 0; }
+    .side { max-width: 360px; }
+    .tag { display: inline-block; font: 500 11px "DM Mono", monospace; letter-spacing: .14em; text-transform: uppercase; color: var(--olive); margin-bottom: 10px; }
+    .btns { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 18px; }
+    .btns button { font: 500 12px "DM Mono", monospace; letter-spacing: .06em; text-transform: uppercase; padding: 9px 14px; border-radius: 3px; cursor: pointer;
+      border: 1px solid #c9bda9; background: #fff; color: var(--espresso); }
+    .btns button.primary { background: var(--olive); border-color: var(--olive); color: var(--limestone); }
+
+    /* Phone — scaled to fit the window (--s set by the script) */
+    .phone-wrap { --s: 1; width: calc(360px * var(--s)); height: calc(760px * var(--s)); flex: none; }
+    .phone-wrap > .phone { transform: scale(var(--s)); transform-origin: top left; }
+    .phone { width: 360px; height: 760px; border-radius: 52px; background: #111; padding: 12px; box-shadow: 0 30px 60px rgba(32,30,22,.35), inset 0 0 0 2px #2b2b2b; position: relative; flex: none; }
+    .screen { position: relative; width: 100%; height: 100%; border-radius: 41px; overflow: hidden; background: #000; }
+    .notch { position: absolute; top: 10px; left: 50%; transform: translateX(-50%); width: 96px; height: 26px; background: #000; border-radius: 14px; z-index: 5; }
+    .status { position: absolute; top: 0; left: 0; right: 0; height: 46px; display: flex; justify-content: space-between; align-items: center; padding: 0 28px; color: #fff;
+      font: 600 14px Inter, sans-serif; z-index: 4; pointer-events: none; }
+    .layer { position: absolute; inset: 0; transition: opacity .35s ease, transform .35s ease; }
+    .layer.off { opacity: 0; pointer-events: none; }
+
+    /* Home screen */
+    .home { background: radial-gradient(120% 80% at 30% 10%, #6c724b 0%, #3a3a2a 45%, #201e16 100%); padding: 70px 22px 24px; }
+    .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 22px 10px; }
+    .app { display: flex; flex-direction: column; align-items: center; gap: 6px; color: #fff; font: 500 11px Inter, sans-serif; background: none; border: none; padding: 0; cursor: pointer; }
+    .ico { width: 58px; height: 58px; border-radius: 14px; display: grid; place-items: center; font-size: 26px; box-shadow: 0 2px 6px rgba(0,0,0,.25); }
+    .ico img { width: 100%; height: 100%; border-radius: 14px; display: block; }
+    .app.ours .ico { animation: nudge 2.4s ease-in-out 1s 2; }
+    @keyframes nudge { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.08); } }
+    .hint { position: absolute; left: 0; right: 0; bottom: 120px; text-align: center; color: rgba(255,255,255,.85); font: 500 12px "DM Mono", monospace; letter-spacing: .08em; text-transform: uppercase; }
+    .dock { position: absolute; left: 14px; right: 14px; bottom: 18px; height: 84px; border-radius: 28px; background: rgba(255,255,255,.18); backdrop-filter: blur(8px);
+      display: flex; justify-content: space-around; align-items: center; }
+
+    /* Opening screen */
+    .splash { background: var(--espresso); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 18px; }
+    .splash img.horse { width: 112px; }
+    .splash img.word { width: 210px; }
+    .splash span { font: 500 11px "DM Mono", monospace; letter-spacing: .24em; color: #a8a08f; text-transform: uppercase; }
+
+    /* The real worker screen */
+    .appview { background: var(--espresso); padding-top: 34px; }
+    .appview iframe { width: 100%; height: 100%; border: 0; display: block; background: var(--limestone); }
+    .homebar { position: absolute; bottom: 7px; left: 50%; transform: translateX(-50%); width: 120px; height: 5px; border-radius: 3px; background: rgba(255,255,255,.75); z-index: 6; cursor: pointer; }
+    .appview ~ .homebar.dark { background: rgba(32,30,22,.55); }
+  </style>
+</head>
+<body>
+  <div class="phone-wrap" id="wrap"><div class="phone" aria-label="Phone preview">
+    <div class="screen">
+      <div class="notch"></div>
+      <div class="status" id="status"><span id="clock">7:30</span><span>📶 🔋</span></div>
+
+      <div class="layer home" id="home">
+        <div class="grid">
+          <button class="app" tabindex="-1"><span class="ico" style="background:#3b82f6">📞</span>Phone</button>
+          <button class="app" tabindex="-1"><span class="ico" style="background:#22c55e">💬</span>Messages</button>
+          <button class="app" tabindex="-1"><span class="ico" style="background:#9ca3af">📷</span>Camera</button>
+          <button class="app" tabindex="-1"><span class="ico" style="background:#f59e0b">🖼️</span>Photos</button>
+          <button class="app ours" id="openApp" aria-label="Open the Stallion app"><span class="ico"><img src="/assets/app/icon-192.png" alt=""></span>Stallion</button>
+        </div>
+        <div class="hint">Tap the Stallion app</div>
+        <div class="dock">
+          <span class="ico" style="background:#3b82f6">📞</span><span class="ico" style="background:#22c55e">💬</span>
+          <span class="ico" style="background:#ef4444">🎵</span><span class="ico" style="background:#64748b">⚙️</span>
+        </div>
+      </div>
+
+      <div class="layer splash off" id="splash">
+        <img class="horse" src="/assets/brand/mark-limestone.png" alt="">
+        <img class="word" src="/assets/brand/wordmark-limestone.png" alt="Stallion Caravans">
+        <span>Floor</span>
+      </div>
+
+      <div class="layer appview off" id="appview"><iframe id="frame" title="Stallion worker app" src="about:blank"></iframe></div>
+      <div class="homebar" id="homebar" title="Back to the home screen"></div>
+    </div>
+  </div></div>
+
+  <div class="side">
+    <div class="tag">Preview · Worker app</div>
+    <h1>Stallion Floor</h1>
+    <p>This is how the worker app would look on a phone. Tap the <b>Stallion</b> icon: it opens full screen like any app, with no browser bars, and runs the real worker screen on preview data.</p>
+
+    <h2>How a worker gets it</h2>
+    <ol>
+      <li><b>Android:</b> open the link once in Chrome → <i>Install app</i>. The horse icon goes on the home screen.</li>
+      <li><b>iPhone:</b> open the link in Safari → Share → <i>Add to Home Screen</i>.</li>
+      <li>No app store, no updates to install: when the office PC is updated, every phone gets it next time the app opens.</li>
+    </ol>
+
+    <h2>Good to know</h2>
+    <p>The full "install" button needs a secure link (https). That comes with the remote-access step (Tailscale or Cloudflare). Until then, phones on the office Wi-Fi can still add it to the home screen.</p>
+    <p>If the Wi-Fi drops, the app still opens and says it's waiting for signal. Nothing is saved on the phone except the screens.</p>
+
+    <div class="btns">
+      <button class="primary" id="btnOpen">Open the app</button>
+      <button id="btnHome">Home screen</button>
+      <button id="btnReset">Start as a new worker</button>
+    </div>
+  </div>
+
+  <script>
+    const $ = s => document.querySelector(s);
+    const show = id => ['home', 'splash', 'appview'].forEach(k => $('#' + k).classList.toggle('off', k !== id));
+    const tick = () => { const d = new Date(); $('#clock').textContent = `${d.getHours() % 12 || 12}:${String(d.getMinutes()).padStart(2, '0')}`; };
+    tick(); setInterval(tick, 20000);
+    const fit = () => $('#wrap').style.setProperty('--s', Math.max(0.55, Math.min(1, (innerHeight - 40) / 760)));
+    fit(); addEventListener('resize', fit);
+    let timer;
+    function openApp() {
+      clearTimeout(timer);
+      show('splash'); $('#status').style.color = '#fff';
+      if ($('#frame').src === 'about:blank' || !$('#frame').src.includes('/floor')) $('#frame').src = '/floor';
+      timer = setTimeout(() => { show('appview'); $('#status').style.color = '#fff'; $('#homebar').classList.add('dark'); }, 1300);
+    }
+    function goHome() { clearTimeout(timer); show('home'); $('#homebar').classList.remove('dark'); }
+    $('#openApp').onclick = openApp; $('#btnOpen').onclick = openApp;
+    $('#btnHome').onclick = goHome; $('#homebar').onclick = goHome;
+    $('#btnReset').onclick = () => {
+      try { Object.keys(localStorage).filter(k => k.startsWith('floor.')).forEach(k => localStorage.removeItem(k)); } catch {}
+      $('#frame').src = 'about:blank'; openApp();
+    };
+  </script>
+</body>
+</html>

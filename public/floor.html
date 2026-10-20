@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#201e16">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <title>Stallion · Floor</title>
+  <link rel="icon" type="image/png" href="assets/brand/mark-bark.png">
+  <link rel="apple-touch-icon" href="/assets/app/apple-touch-icon.png">
+  <link rel="manifest" href="/floor.webmanifest">
+  <meta name="apple-mobile-web-app-title" content="Stallion">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <link rel="stylesheet" href="fonts/fonts.css">
+  <link rel="stylesheet" href="floor.css">
+</head>
+<body>
+  <header class="top">
+    <button class="back hidden" id="back" aria-label="Back">‹</button>
+    <img class="mark" src="assets/brand/mark-limestone.png" alt="Stallion Caravans">
+    <div class="title" id="title">Stock</div>
+    <button class="who" id="who"></button>
+  </header>
+  <main id="screen"></main>
+  <div id="sheet" class="sheet-bg hidden"><div class="sheet" role="dialog" aria-modal="true"></div></div>
+  <div id="done" class="done hidden" role="status" aria-live="polite"></div>
+  <script src="wording.js"></script>
+  <script src="factorymap.js"></script>
+  <script src="floor.js"></script>
+  <script>if ('serviceWorker' in navigator && isSecureContext) navigator.serviceWorker.register('/floor-sw.js').catch(() => {});</script>
+</body>
+</html>
