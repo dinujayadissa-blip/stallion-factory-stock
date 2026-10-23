@@ -17,9 +17,11 @@
     "test": "node --test \"test/*.test.js\""
   },
   "dependencies": {
+    "@electric-sql/pglite": "0.3.16",
     "exceljs": "4.4.0",
     "express": "4.22.3",
     "pdfjs-dist": "4.10.38",
+    "postgres": "3.4.9",
     "three": "0.170.0",
     "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
   },
