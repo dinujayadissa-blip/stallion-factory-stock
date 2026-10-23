@@ -2,7 +2,7 @@
 import { test, beforeEach, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { freshDb } from './helpers.js';
-import { get, run, insert, tx, writeTx, dataVersion, closeDb } from '../src/db.js';
+import { get, run, insert, tx, writeTx, inTx, dataVersion, closeDb } from '../src/db.js';
 
 beforeEach(freshDb);
 after(closeDb);
@@ -58,6 +58,7 @@ test('melbourne time defaults with TZ=UTC', async () => {
       }).formatToParts(new Date()).map(x => [x.type, x.value]));
       return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`;
     };
+    await run(`SET TIME ZONE 'UTC'`); // the database session's own zone must not matter either
     const before = melb();
     const id = await insert(`INSERT INTO users(username, name, role, pass_hash) VALUES(?, ?, 'owner', 'x')`, 'sam', 'Sam');
     const afterwards = melb();
@@ -88,7 +89,7 @@ test('firm cap trigger clamps', async () => {
 test('username unique whatever its capitals', async () => {
   const add = (u) => run(`INSERT INTO users(username, name, role, pass_hash) VALUES(?, ?, 'worker', 'x')`, u, u);
   await add('Alex');
-  await assert.rejects(add('alex'));
+  await assert.rejects(add('alex'), e => e.code === '23505' || /duplicate key|unique/i.test(e.message));
   assert.equal((await get('SELECT username FROM users WHERE lower(username) = lower(?)', 'ALEX')).username, 'Alex');
 });
 
@@ -104,4 +105,17 @@ test('writeTx bumps data_version', async () => {
   await assert.rejects(writeTx(async () => { await newItem('C1'); throw new Error('boom'); }), /boom/);
   assert.equal(Number(await dataVersion()), v0 + 1);
   assert.equal(await count('items'), 2);
+});
+
+test('insert: a statement ending in a comment still returns its id; no row back is an error', async () => {
+  const id = await insert(`INSERT INTO items(sku, name) VALUES('A1', 'Part A1') -- trailing comment`);
+  assert.equal(typeof id, 'number');
+  await assert.rejects(insert(`INSERT INTO items(sku, name) VALUES('A1', 'again') ON CONFLICT DO NOTHING`), /no row/i);
+});
+
+test('inTx is true only inside tx / writeTx', async () => {
+  assert.equal(inTx(), false);
+  await tx(async () => { assert.equal(inTx(), true); });
+  await writeTx(async () => { assert.equal(inTx(), true); });
+  assert.equal(inTx(), false);
 });

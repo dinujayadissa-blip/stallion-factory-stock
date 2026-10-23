@@ -77,11 +77,13 @@ const translate = e => (unreachable(e)
 
 // The connection of the transaction we're inside (set by tx()), so every query in it — however deep in
 // the call chain — runs on that one connection. Outside a transaction: the driver itself.
-const inTx = new AsyncLocalStorage();
+const als = new AsyncLocalStorage();
+// Are we inside tx() / writeTx() right now? (replaces the old `db.isTransaction`)
+export const inTx = () => !!als.getStore();
 
 async function query(sql, p) {
   try {
-    const conn = inTx.getStore()?.conn ?? await driver();
+    const conn = als.getStore()?.conn ?? await driver();
     // No params: the SQL goes as it is (it may be several statements, e.g. a migration file).
     return await conn.query(p.length ? placeholders(sql) : sql, p);
   } catch (e) { throw translate(e); }
@@ -91,16 +93,22 @@ export const all = async (sql, ...p) => (await query(sql, p)).rows;
 export const get = async (sql, ...p) => (await query(sql, p)).rows[0];
 export const run = async (sql, ...p) => ({ changes: (await query(sql, p)).count });
 // INSERT … → the new row's id (replaces run(...).lastInsertRowid). Only for tables with an `id` column.
-export const insert = async (sql, ...p) => (await query(`${sql.trim().replace(/;$/, '')} RETURNING id`, p)).rows[0]?.id;
+// RETURNING goes on a new line, so a trailing "-- comment" in the SQL can't swallow it.
+export async function insert(sql, ...p) {
+  const row = (await query(`${sql.trim().replace(/;$/, '')}
+RETURNING id`, p)).rows[0];
+  if (!row) throw new Error('insert(): no row came back (does the statement insert a row, e.g. not skipped by ON CONFLICT DO NOTHING?)');
+  return row.id;
+}
 
 // ── Transactions ──
 // All or nothing. Re-entrant: called inside another tx() it just joins that transaction, so several
 // steps can be combined into one all-or-nothing change.
 export async function tx(fn) {
-  if (inTx.getStore()) return fn();
+  if (als.getStore()) return fn();
   const d = await driver().catch(e => { throw translate(e); });
   try {
-    return await d.begin(conn => inTx.run({ conn, write: false }, fn));
+    return await d.begin(conn => als.run({ conn, write: false }, fn));
   } catch (e) { throw translate(e); }
 }
 
@@ -109,11 +117,11 @@ export async function tx(fn) {
 // tell their figures are out of date. Inside a writeTx it just joins (one lock, one bump); inside a plain
 // tx() it takes the lock there and bumps the version once.
 export async function writeTx(fn) {
-  const cur = inTx.getStore();
+  const cur = als.getStore();
   if (cur?.write) return fn();
   const body = async () => {
     await run('SELECT pg_advisory_xact_lock(42)');
-    inTx.getStore().write = true;
+    als.getStore().write = true;
     const r = await fn();
     await run(`UPDATE settings SET value = (value::int + 1)::text WHERE key = 'data_version'`);
     return r;
