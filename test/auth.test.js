@@ -1,16 +1,15 @@
 // Logins and job roles (src/auth.js): passwords, sessions, throttling, setup, who may do what, last owner.
-// Runs on a new, empty database in a temp folder — never on the real data.   node --test test/
-import { test, after } from 'node:test';
+// Runs on a new, empty in-memory database (PGlite) — never on real data.   node --test test/
+// The tests share ONE database and build on each other, top to bottom (users made early are used later).
+import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
 import os from 'node:os';
-import path from 'node:path';
+import { freshDb } from './helpers.js';
+import { get, run, insert, closeDb } from '../src/db.js';
+import * as auth from '../src/auth.js';
 
-const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fs-test-'));
-process.env.DATA_DIR = dir;
-const { db, get, run } = await import('../src/db.js');
-const auth = await import('../src/auth.js');
-after(() => { try { db.close(); } catch { /* closed */ } fs.rmSync(dir, { recursive: true, force: true }); });
+before(freshDb);
+after(closeDb);
 
 const DAY = 24 * 60 * 60 * 1000;
 
@@ -36,7 +35,7 @@ test('users: unique username whatever the capitals, workers need a trade, the ha
   assert.deepEqual(auth.publicUser(u), { id: u.id, username: 'Sparky', name: 'Sam Sparks', role: 'worker', trade: 'electrician' });
   assert.equal(u.must_change, 1); // a temporary password by default
   assert.equal('pass_hash' in u, false);
-  assert.ok(auth.listUsers().every(x => !('pass_hash' in x)));
+  assert.ok((await auth.listUsers()).every(x => !('pass_hash' in x)));
   await assert.rejects(auth.createUser({ username: 'sparky', name: 'Other', role: 'office', password: 'abcdefgh1' }), /already taken/);
   await assert.rejects(auth.createUser({ username: 'pete', name: 'Pete', role: 'worker', password: 'abcdefgh1' }), /trade/);
   await assert.rejects(auth.createUser({ username: 'pete', name: 'Pete', role: 'boss', password: 'abcdefgh1' }), /job role/);
@@ -45,7 +44,7 @@ test('users: unique username whatever the capitals, workers need a trade, the ha
   // non-workers have no fixed trade
   const o = await auth.createUser({ username: 'office1', name: 'Olive Office', role: 'office', trade: 'plumber', password: 'office-123' });
   assert.equal(o.trade, '');
-  assert.equal(auth.findUser('SPARKY').id, u.id);
+  assert.equal((await auth.findUser('SPARKY')).id, u.id);
 });
 
 test('log in: right password works; wrong password, unknown username and a turned-off login all say the same', async () => {
@@ -55,17 +54,17 @@ test('log in: right password works; wrong password, unknown username and a turne
   assert.equal(ok.user.username, 'stores1');
   assert.equal(ok.user.mustChange, false);
   assert.match(ok.token, /^[A-Za-z0-9_-]{43}$/);
-  assert.ok(auth.findUser('stores1').last_login);
+  assert.ok((await auth.findUser('stores1')).last_login);
   // only sha256(token) is stored
-  assert.equal(get('SELECT COUNT(*) AS n FROM sessions WHERE token_hash = ?', ok.token).n, 0);
-  assert.equal(get('SELECT COUNT(*) AS n FROM sessions WHERE token_hash = ?', auth.tokenHash(ok.token)).n, 1);
+  assert.equal((await get('SELECT COUNT(*) AS n FROM sessions WHERE token_hash = ?', ok.token)).n, 0);
+  assert.equal((await get('SELECT COUNT(*) AS n FROM sessions WHERE token_hash = ?', auth.tokenHash(ok.token))).n, 1);
 
   await assert.rejects(auth.login({ username: 'stores1', password: 'wrong-one', ip: '10.0.0.5' }, t), { status: 401, message: auth.WRONG });
   await assert.rejects(auth.login({ username: 'nobody', password: 'shelves-99', ip: '10.0.0.5' }, t), { status: 401, message: auth.WRONG });
-  const id = auth.findUser('stores1').id;
-  run('UPDATE users SET active = 0 WHERE id = ?', id);
+  const id = (await auth.findUser('stores1')).id;
+  await run('UPDATE users SET active = 0 WHERE id = ?', id);
   await assert.rejects(auth.login({ username: 'stores1', password: 'shelves-99', ip: '10.0.0.5' }, t), { status: 401, message: auth.WRONG });
-  run('UPDATE users SET active = 1 WHERE id = ?', id);
+  await run('UPDATE users SET active = 1 WHERE id = ?', id);
   // a temporary password: logged in, but must choose a new one first
   const w = await auth.login({ username: 'sparky', password: 'volts-1234', ip: '10.0.0.5' }, t);
   assert.equal(w.user.mustChange, true);
@@ -79,45 +78,45 @@ test('log in: 5 wrong tries for a username from one address lock it 15 minutes; 
   await assert.rejects(auth.login({ username: 'stores1', password: 'shelves-99', ip: '10.0.0.9' }, t, now + 10), { status: 429, message: auth.LOCKED });
   // another address, or another username from this address, is not locked
   assert.ok((await auth.login({ username: 'stores1', password: 'shelves-99', ip: '10.0.0.10' }, t, now + 20)).token);
-  assert.equal(t.locked('10.0.0.9', 'office1', now + 30), false);
+  assert.equal(await t.locked('10.0.0.9', 'office1', now + 30), false);
   // 15 minutes later it works again
   assert.ok((await auth.login({ username: 'stores1', password: 'shelves-99', ip: '10.0.0.9' }, t, now + 15 * 60 * 1000 + 20)).token);
 
   // address lock: 30 wrong tries (different usernames) within 15 minutes
   const t2 = auth.createThrottle();
-  for (let i = 0; i < 30; i++) t2.fail('10.0.0.66', `user${i}`, now + i * 1000);
-  assert.equal(t2.locked('10.0.0.66', 'stores1', now + 31000), true);
-  assert.equal(t2.locked('10.0.0.67', 'stores1', now + 31000), false);
-  assert.equal(t2.locked('10.0.0.66', 'stores1', now + 31000 + 15 * 60 * 1000), false);
+  for (let i = 0; i < 30; i++) await t2.fail('10.0.0.66', `user${i}`, now + i * 1000);
+  assert.equal(await t2.locked('10.0.0.66', 'stores1', now + 31000), true);
+  assert.equal(await t2.locked('10.0.0.67', 'stores1', now + 31000), false);
+  assert.equal(await t2.locked('10.0.0.66', 'stores1', now + 31000 + 15 * 60 * 1000), false);
   // spread over more than 15 minutes: no lock
   const t3 = auth.createThrottle();
-  for (let i = 0; i < 30; i++) t3.fail('10.0.0.70', `user${i}`, now + i * 60 * 1000);
-  assert.equal(t3.locked('10.0.0.70', 'x', now + 30 * 60 * 1000), false);
+  for (let i = 0; i < 30; i++) await t3.fail('10.0.0.70', `user${i}`, now + i * 60 * 1000);
+  assert.equal(await t3.locked('10.0.0.70', 'x', now + 30 * 60 * 1000), false);
 });
 
 test('sessions: 30 days from the last use (phones stay logged in), then gone; log out ends it', async () => {
-  const u = auth.findUser('stores1');
+  const u = await auth.findUser('stores1');
   const t0 = Date.UTC(2026, 0, 1);
-  const token = auth.createSession(u.id, { ip: '1.2.3.4', ua: 'test' }, t0);
-  assert.equal(auth.sessionFromToken(token, t0 + 1000).user.username, 'stores1');
-  assert.equal(auth.sessionFromToken(token, t0 + 1000).refreshed, false); // not written on every request
+  const token = await auth.createSession(u.id, { ip: '1.2.3.4', ua: 'test' }, t0);
+  assert.equal((await auth.sessionFromToken(token, t0 + 1000)).user.username, 'stores1');
+  assert.equal((await auth.sessionFromToken(token, t0 + 1000)).refreshed, false); // not written on every request
   // used after 20 days: good for 30 more
-  const s20 = auth.sessionFromToken(token, t0 + 20 * DAY);
+  const s20 = await auth.sessionFromToken(token, t0 + 20 * DAY);
   assert.equal(s20.refreshed, true);
-  assert.ok(auth.sessionFromToken(token, t0 + 45 * DAY)); // 25 days after the last use
+  assert.ok(await auth.sessionFromToken(token, t0 + 45 * DAY)); // 25 days after the last use
   // not used for over 30 days: logged out, and the row is removed
-  assert.equal(auth.sessionFromToken(token, t0 + 45 * DAY + 31 * DAY), null);
-  assert.equal(get('SELECT COUNT(*) AS n FROM sessions WHERE token_hash = ?', auth.tokenHash(token)).n, 0);
+  assert.equal(await auth.sessionFromToken(token, t0 + 45 * DAY + 31 * DAY), null);
+  assert.equal((await get('SELECT COUNT(*) AS n FROM sessions WHERE token_hash = ?', auth.tokenHash(token))).n, 0);
 
   // log out
-  const t2 = auth.createSession(u.id);
-  assert.ok(auth.sessionFromToken(t2));
-  auth.endSession(auth.tokenHash(t2));
-  assert.equal(auth.sessionFromToken(t2), null);
+  const t2 = await auth.createSession(u.id);
+  assert.ok(await auth.sessionFromToken(t2));
+  await auth.endSession(auth.tokenHash(t2));
+  assert.equal(await auth.sessionFromToken(t2), null);
   // rubbish cookies are just "not logged in"
-  assert.equal(auth.sessionFromToken('abc'), null);
-  assert.equal(auth.sessionFromToken(undefined), null);
-  assert.equal(auth.sessionFromToken('A'.repeat(43)), null);
+  assert.equal(await auth.sessionFromToken('abc'), null);
+  assert.equal(await auth.sessionFromToken(undefined), null);
+  assert.equal(await auth.sessionFromToken('A'.repeat(43)), null);
   // the cookie
   const c = auth.sessionCookie('tok', { secure: false });
   assert.match(c, /^fs_session=tok; Path=\/; HttpOnly; SameSite=Lax; Max-Age=2592000$/);
@@ -127,38 +126,38 @@ test('sessions: 30 days from the last use (phones stay logged in), then gone; lo
 });
 
 test('password changes: own change keeps this session and ends the others; reset / turn off / new role end them all', async () => {
-  const u = auth.findUser('office1');
-  const a = auth.createSession(u.id), b = auth.createSession(u.id);
+  const u = await auth.findUser('office1');
+  const a = await auth.createSession(u.id), b = await auth.createSession(u.id);
   await assert.rejects(auth.changeOwnPassword(u.id, 'wrong-pass', 'new-office-1', auth.tokenHash(a)), /current password/);
   await assert.rejects(auth.changeOwnPassword(u.id, 'office-123', 'short', auth.tokenHash(a)), /8 characters/);
   await auth.changeOwnPassword(u.id, 'office-123', 'new-office-1', auth.tokenHash(a));
-  assert.ok(auth.sessionFromToken(a));
-  assert.equal(auth.sessionFromToken(b), null);
-  assert.equal(auth.findUser('office1').must_change, 0);
+  assert.ok(await auth.sessionFromToken(a));
+  assert.equal(await auth.sessionFromToken(b), null);
+  assert.equal((await auth.findUser('office1')).must_change, 0);
   const t = auth.createThrottle();
   await assert.rejects(auth.login({ username: 'office1', password: 'office-123' }, t), { message: auth.WRONG });
   assert.ok(await auth.login({ username: 'office1', password: 'new-office-1' }, t));
 
   // the owner resets it: every session ends, temporary password
-  const c = auth.createSession(u.id);
+  const c = await auth.createSession(u.id);
   await auth.resetPassword(u.id, 'temp-pass-1');
-  assert.equal(auth.sessionFromToken(a), null);
-  assert.equal(auth.sessionFromToken(c), null);
-  assert.equal(auth.findUser('office1').must_change, 1);
+  assert.equal(await auth.sessionFromToken(a), null);
+  assert.equal(await auth.sessionFromToken(c), null);
+  assert.equal((await auth.findUser('office1')).must_change, 1);
 
   // a new job role ends the sessions; a name change alone doesn't
-  const d = auth.createSession(u.id);
-  auth.updateUser(u.id, { name: 'Olive O.' });
-  assert.ok(auth.sessionFromToken(d));
-  auth.updateUser(u.id, { role: 'stores' });
-  assert.equal(auth.sessionFromToken(d), null);
-  auth.updateUser(u.id, { role: 'office' });
+  const d = await auth.createSession(u.id);
+  await auth.updateUser(u.id, { name: 'Olive O.' });
+  assert.ok(await auth.sessionFromToken(d));
+  await auth.updateUser(u.id, { role: 'stores' });
+  assert.equal(await auth.sessionFromToken(d), null);
+  await auth.updateUser(u.id, { role: 'office' });
 
   // turned off: logged out at once
-  const e = auth.createSession(u.id);
-  auth.setActive(u.id, false);
-  assert.equal(auth.sessionFromToken(e), null);
-  auth.setActive(u.id, true);
+  const e = await auth.createSession(u.id);
+  await auth.setActive(u.id, false);
+  assert.equal(await auth.sessionFromToken(e), null);
+  await auth.setActive(u.id, true);
 });
 
 test('first login: only with no logins at all, only from this PC itself (never because of a header)', async () => {
@@ -178,8 +177,8 @@ test('first login: only with no logins at all, only from this PC itself (never b
 });
 
 test('first login on an empty database makes an owner who does not have to change the password', async () => {
-  run('DELETE FROM sessions'); run('DELETE FROM users');
-  assert.equal(auth.userCount(), 0);
+  await run('DELETE FROM sessions'); await run('DELETE FROM users');
+  assert.equal(await auth.userCount(), 0);
   const o = await auth.setupOwner({ username: 'boss', name: 'Bea Boss', password: 'owner-pass-1' });
   assert.equal(o.role, 'owner');
   assert.equal(o.must_change, 0);
@@ -187,21 +186,21 @@ test('first login on an empty database makes an owner who does not have to chang
 });
 
 test('the last active owner can never be turned off or given another role; nobody turns off themselves', async () => {
-  const boss = auth.findUser('boss');
-  assert.throws(() => auth.setActive(boss.id, false), /only owner/);
-  assert.throws(() => auth.updateUser(boss.id, { role: 'office' }), /only owner/);
+  const boss = await auth.findUser('boss');
+  await assert.rejects(auth.setActive(boss.id, false), /only owner/);
+  await assert.rejects(auth.updateUser(boss.id, { role: 'office' }), /only owner/);
   const two = await auth.createUser({ username: 'boss2', name: 'Second Owner', role: 'owner', password: 'owner-pass-2' });
   // owners can't turn off themselves or change their own role, even with another owner there
-  assert.throws(() => auth.setActive(boss.id, false, auth.publicUser(boss)), /your own login/);
-  assert.throws(() => auth.updateUser(boss.id, { role: 'office' }, auth.publicUser(boss)), /your own job role/);
+  await assert.rejects(auth.setActive(boss.id, false, auth.publicUser(boss)), /your own login/);
+  await assert.rejects(auth.updateUser(boss.id, { role: 'office' }, auth.publicUser(boss)), /your own job role/);
   // another owner can, now that there are two
-  auth.updateUser(boss.id, { role: 'office' }, auth.publicUser(two));
-  assert.throws(() => auth.setActive(two.id, false, auth.publicUser(boss)), /only owner/); // boss2 is the last owner now
-  auth.updateUser(boss.id, { role: 'owner' }, auth.publicUser(two));
-  auth.setActive(two.id, false, auth.publicUser(boss));
-  assert.equal(auth.findUser('boss2').active, 0);
+  await auth.updateUser(boss.id, { role: 'office' }, auth.publicUser(two));
+  await assert.rejects(auth.setActive(two.id, false, auth.publicUser(boss)), /only owner/); // boss2 is the last owner now
+  await auth.updateUser(boss.id, { role: 'owner' }, auth.publicUser(two));
+  await auth.setActive(two.id, false, auth.publicUser(boss));
+  assert.equal((await auth.findUser('boss2')).active, 0);
   // a turned-off owner doesn't count: boss is the only active one
-  assert.throws(() => auth.setActive(boss.id, false, auth.publicUser(two)), /only owner/);
+  await assert.rejects(auth.setActive(boss.id, false, auth.publicUser(two)), /only owner/);
 });
 
 test('who may do what: a sample of the table for every job role', () => {
@@ -304,31 +303,128 @@ test('issue #1: every line of the table can be reached — a ":id" line never sw
   assert.equal(auth.allowed('GET', '/api/items/12', 'worker'), true);
 });
 
-test('issue #2: floor stats count by login id; only old movements (no id) by name', async () => {
+// Needs src/inventory.js on Postgres (Task 3) — until then the module can't even be imported.
+test('issue #2: floor stats count by login id; only old movements (no id) by name', { skip: 'inventory.js not yet on Postgres (Task 3)' }, async () => {
   const inv = await import('../src/inventory.js');
-  const item = Number(run(`INSERT INTO items(sku, name) VALUES('ST-1', 'Stats part')`).lastInsertRowid);
+  const item = await insert(`INSERT INTO items(sku, name) VALUES('ST-1', 'Stats part')`);
   const mv = (worker, userId) => run(`INSERT INTO movements(item_id, qty, type, worker, user_id) VALUES(?, -1, 'issue', ?, ?)`, item, worker, userId);
-  mv('Sam Smith', 101); mv('Sam Smith', 102); mv('Sam Smith', 102); mv('Sam Smith', null);
-  assert.equal(inv.floorStats({ userId: 101, name: 'Sam Smith' }).mine_took, 2); // own (1) + the old one by name (1)
-  assert.equal(inv.floorStats({ userId: 102, name: 'Sam Smith' }).mine_took, 3);
-  assert.equal(inv.floorStats('Sam Smith').mine_took, 1); // a plain name: only rows without a login id
+  await mv('Sam Smith', 101); await mv('Sam Smith', 102); await mv('Sam Smith', 102); await mv('Sam Smith', null);
+  assert.equal((await inv.floorStats({ userId: 101, name: 'Sam Smith' })).mine_took, 2); // own (1) + the old one by name (1)
+  assert.equal((await inv.floorStats({ userId: 102, name: 'Sam Smith' })).mine_took, 3);
+  assert.equal((await inv.floorStats('Sam Smith')).mine_took, 1); // a plain name: only rows without a login id
 });
 
-test('issue #13: tries left before the lock, when it ends, the owner\'s Unlock', () => {
+test('issue #13: tries left before the lock, when it ends, the owner\'s Unlock', async () => {
   const t = auth.createThrottle();
   const now = Date.UTC(2026, 9, 21, 1, 0, 0);
-  assert.deepEqual([1, 2, 3, 4, 5].map(i => t.fail('10.1.1.1', 'Sam', now + i)), [4, 3, 2, 1, 0]);
-  assert.equal(t.lockedUntil('10.1.1.1', 'sam', now + 10), now + 5 + 15 * 60 * 1000);
-  assert.equal(t.lockedUntil('10.1.1.2', 'sam', now + 10), 0);
-  t.fail('10.1.1.9', 'other', now);
-  assert.deepEqual([...t.lockedUsers(now + 10)], [['sam', now + 5 + 15 * 60 * 1000]]);
-  t.unlockUser('SAM');
-  assert.equal(t.locked('10.1.1.1', 'sam', now + 10), false);
-  assert.equal(t.lockedUsers(now + 10).size, 0);
+  const lefts = [];
+  for (const i of [1, 2, 3, 4, 5]) lefts.push(await t.fail('10.1.1.1', 'Sam', now + i));
+  assert.deepEqual(lefts, [4, 3, 2, 1, 0]);
+  assert.equal(await t.lockedUntil('10.1.1.1', 'sam', now + 10), now + 5 + 15 * 60 * 1000);
+  assert.equal(await t.lockedUntil('10.1.1.2', 'sam', now + 10), 0);
+  await t.fail('10.1.1.9', 'other', now);
+  assert.deepEqual([...(await t.lockedUsers(now + 10))], [['sam', now + 5 + 15 * 60 * 1000]]);
+  await t.unlockUser('SAM');
+  assert.equal(await t.locked('10.1.1.1', 'sam', now + 10), false);
+  assert.equal((await t.lockedUsers(now + 10)).size, 0);
   // the cookie name carries the port
   auth.setCookiePort(3000);
   assert.match(auth.sessionCookie('tok'), /^fs_session_3000=tok;/);
   assert.equal(auth.readCookie('fs_session=old; fs_session_3000=new'), 'new');
   auth.setCookiePort(0);
   assert.match(auth.sessionCookie('tok'), /^fs_session=tok;/);
+});
+
+// ───────────── new with Postgres: lock-outs live in the database, case-insensitive usernames, old hashes ─────────────
+
+test('throttle survives a new throttle object (lock-outs are stored in the database, not in memory)', async () => {
+  const now = Date.UTC(2026, 9, 22, 3, 0, 0);
+  await auth.createUser({ username: 'persist1', name: 'Pia Persist', role: 'stores', password: 'persist-pass-1', mustChange: false });
+  const t1 = auth.createThrottle();
+  for (let i = 0; i < 5; i++) await assert.rejects(auth.login({ username: 'persist1', password: `wrong-${i}-zz`, ip: '10.2.2.2' }, t1, now + i), { status: 401, message: auth.WRONG });
+  // a brand-new throttle object (like a restarted / second server) still sees the lock
+  const t2 = auth.createThrottle();
+  assert.equal(await t2.locked('10.2.2.2', 'persist1', now + 10), true);
+  await assert.rejects(auth.login({ username: 'persist1', password: 'persist-pass-1', ip: '10.2.2.2' }, t2, now + 10),
+    { status: 429, message: auth.LOCKED, until: now + 4 + 15 * 60 * 1000 });
+  assert.deepEqual([...(await t2.lockedUsers(now + 10))], [['persist1', now + 4 + 15 * 60 * 1000]]);
+  // fewer wrong tries than the limit are remembered too
+  const a = auth.createThrottle(), b = auth.createThrottle();
+  assert.equal(await a.fail('10.2.2.3', 'persist1', now), 4);
+  assert.equal(await b.fail('10.2.2.3', 'persist1', now + 1), 3);
+  // the owner's Unlock works from yet another object, and a success clears the wrong tries
+  await auth.createThrottle().unlockUser('persist1');
+  assert.equal(await t2.locked('10.2.2.2', 'persist1', now + 10), false);
+  assert.ok((await auth.login({ username: 'persist1', password: 'persist-pass-1', ip: '10.2.2.3' }, b, now + 20)).token);
+  assert.equal(await a.fail('10.2.2.3', 'persist1', now + 30), 4); // the username's count started again
+  // old rows are tidied away once their time is up
+  await a.fail('10.2.2.4', 'x', now + 3 * 60 * 60 * 1000);
+  const keys = (await get(`SELECT COUNT(*) AS n FROM login_throttle WHERE key LIKE '%10.2.2.2%'`)).n;
+  assert.equal(keys, 0);
+});
+
+test('login is case-insensitive on username (and so are lock-outs)', async () => {
+  const now = Date.UTC(2026, 9, 22, 4, 0, 0);
+  const t = auth.createThrottle();
+  const u = await auth.createUser({ username: 'CaseyMix', name: 'Casey Mix', role: 'office', password: 'casey-pass-1', mustChange: false });
+  for (const name of ['CaseyMix', 'caseymix', 'CASEYMIX', '  caseyMIX  ']) {
+    const r = await auth.login({ username: name, password: 'casey-pass-1', ip: '10.3.3.3' }, t, now);
+    assert.equal(r.user.id, u.id);
+    assert.equal(r.user.username, 'CaseyMix'); // shown as it was made
+  }
+  assert.equal((await auth.findUser('cAsEyMiX')).id, u.id);
+  await assert.rejects(auth.createUser({ username: 'CASEYMIX', name: 'Other Casey', role: 'office', password: 'casey-pass-2' }), { status: 409, message: /already taken/ });
+  // wrong tries under different capitals add up to one lock
+  const caps = ['CaseyMix', 'caseymix', 'CASEYMIX', 'caseyMix', 'CaseyMIX'];
+  for (let i = 0; i < 5; i++) await assert.rejects(auth.login({ username: caps[i], password: 'nope-nope-1', ip: '10.3.3.4' }, t, now + i), { status: 401 });
+  await assert.rejects(auth.login({ username: 'cAsEYmIx', password: 'casey-pass-1', ip: '10.3.3.4' }, t, now + 10), { status: 429, message: auth.LOCKED });
+});
+
+test('existing scrypt hash verifies (a hash made by the old code for "Test-pass-123")', async () => {
+  const OLD = 'scrypt$16384$8$1$aF2jOgizRuIbv8XERUt4aw==$8p/X5hw3LX9zY/Bjx/W48KzBuyDQoV45/uOOFY7+sAdnyU2euDytbI5NAGfqDtFA7Pjfbxxb0aQFEc9h1omPxA==';
+  assert.equal(await auth.verifyPassword('Test-pass-123', OLD), true);
+  assert.equal(await auth.verifyPassword('Test-pass-124', OLD), false);
+  // and a copied-over user row with that hash logs in
+  await run(`INSERT INTO users(username, name, role, pass_hash, must_change) VALUES('copied1', 'Cory Copied', 'office', ?, 0)`, OLD);
+  const r = await auth.login({ username: 'copied1', password: 'Test-pass-123', ip: '10.4.4.4' }, auth.createThrottle());
+  assert.equal(r.user.name, 'Cory Copied');
+});
+
+test('two logins made at the same moment: only one gets the username or the name', async () => {
+  const mk = (username, name) => auth.createUser({ username, name, role: 'office', password: 'race-pass-123' });
+  let res = await Promise.allSettled([mk('RaceOne', 'Race One'), mk('raceone', 'Race Uno')]);
+  assert.deepEqual(res.map(r => r.status).sort(), ['fulfilled', 'rejected']);
+  assert.equal(res.find(r => r.status === 'rejected').reason.status, 409);
+  res = await Promise.allSettled([mk('racetwo', 'Race Two'), mk('racethree', 'RACE TWO')]);
+  assert.deepEqual(res.map(r => r.status).sort(), ['fulfilled', 'rejected']);
+  assert.equal(res.find(r => r.status === 'rejected').reason.status, 409);
+  assert.equal((await get(`SELECT COUNT(*) AS n FROM users WHERE lower(username) LIKE 'race%'`)).n, 2);
+});
+
+test('in the cloud (CLOUD=1): never "this PC", and the cookie is always fs_session', async () => {
+  const req = { socket: { remoteAddress: '127.0.0.1' }, headers: {} };
+  const old = process.env.CLOUD;
+  try {
+    process.env.CLOUD = '1';
+    assert.equal(auth.fromThisPc(req), false);
+    assert.equal(auth.fromThisPc({ socket: { remoteAddress: '::1' }, headers: {} }), false);
+    auth.setCookiePort(3000);
+    assert.equal(auth.COOKIE, 'fs_session');
+    assert.match(auth.sessionCookie('tok', { secure: true }), /^fs_session=tok; Path=\/; HttpOnly; SameSite=Lax; Max-Age=2592000; Secure$/);
+    assert.equal(auth.readCookie('fs_session_3000=a; fs_session=b'), 'b');
+  } finally {
+    if (old === undefined) delete process.env.CLOUD; else process.env.CLOUD = old;
+    auth.setCookiePort(0);
+  }
+  assert.equal(auth.fromThisPc(req), true); // back to normal off the cloud
+});
+
+test('pruneSessions removes only the expired ones and says how many', async () => {
+  const u = await auth.findUser('persist1');
+  const t0 = Date.UTC(2026, 5, 1);
+  const old = await auth.createSession(u.id, {}, t0);
+  const fresh = await auth.createSession(u.id, {}, t0 + 40 * DAY);
+  assert.ok((await auth.pruneSessions(t0 + 40 * DAY)) >= 1);
+  assert.equal(await auth.sessionFromToken(old, t0 + 40 * DAY), null);
+  assert.ok(await auth.sessionFromToken(fresh, t0 + 40 * DAY));
 });

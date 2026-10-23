@@ -1,4 +1,4 @@
-// Logins from the command line — on the office PC itself (also while the app is running).
+// Logins from the command line.
 //
 //   npm run users -- list
 //   npm run users -- add <username> <role> [trade]      role: owner / office / stores / leadhand / worker
@@ -6,11 +6,13 @@
 //   npm run users -- disable <username>                 turn a login off (logs it out everywhere)
 //   npm run users -- enable <username>
 //
-// Passwords are typed at the prompt (not shown, never on the command line). Uses the same data folder
-// as the app (DATA_DIR, or the "data" folder next to this one).
+// Passwords are typed at the prompt (not shown, never on the command line). Works on the same database as
+// the app: the cloud one when DATABASE_URL is set (this is how the first owner is made in the cloud, where the
+// first-time setup page is off), otherwise the local one in DATA_DIR (the "data" folder next to this one) —
+// that one can't be open in the running app at the same moment.
 import readline from 'node:readline';
 import * as auth from '../src/auth.js';
-import { db } from '../src/db.js';
+import { openDb, closeDb, get } from '../src/db.js';
 
 const [cmd, ...args] = process.argv.slice(2);
 const TRADES = auth.TRADE_KEYS.join(' / ');
@@ -85,8 +87,8 @@ function need(u, username) {
 async function main() {
   switch (cmd) {
     case 'list': {
-      const users = auth.listUsers();
-      if (!users.length) { console.log('No logins yet. Open the app on this PC (http://localhost:3000) to create the owner login, or: npm run users -- add <username> owner'); return; }
+      const users = await auth.listUsers();
+      if (!users.length) { console.log('No logins yet. Make the owner login with: npm run users -- add <username> owner (on the office PC you can also open the app and create it there)'); return; }
       const rows = users.map(u => [u.username, u.name, auth.ROLES[u.role]?.label || u.role, u.trade || '', u.active ? 'on' : 'OFF',
         u.last_login || 'never', u.must_change ? 'must choose a new password' : '']);
       const head = ['Username', 'Name', 'Role', 'Trade', 'Login', 'Last log in', ''];
@@ -99,7 +101,7 @@ async function main() {
       if (!username || !role) { usage(); process.exitCode = 1; return; }
       if (!auth.isRole(role)) throw new Error(`Role must be one of: ${ROLES}`);
       if (role === 'worker' && !auth.TRADE_KEYS.includes(trade)) throw new Error(`A worker needs a trade: ${TRADES}`);
-      if (auth.findUser(username)) throw new Error(`The username "${username}" is already taken`);
+      if (await auth.findUser(username)) throw new Error(`The username "${username}" is already taken`);
       const name = (await ask(`Name shown in the app [${username}]: `)).trim() || username;
       const password = await newPassword(username);
       const mustChange = await yes('Must they choose their own password when they first log in? (y/N): ');
@@ -110,12 +112,12 @@ async function main() {
     case 'reset': {
       const [username] = args;
       if (!username) { usage(); process.exitCode = 1; return; }
-      const u = need(auth.findUser(username), username);
+      const u = need(await auth.findUser(username), username);
       console.log(`New password for ${u.name} (${u.username}, ${auth.ROLES[u.role]?.label}).`);
       const password = await newPassword(u.username);
       const mustChange = await yes('Must they choose their own password at the next log in? (y/N): ');
       await auth.resetPassword(u.id, password, { mustChange });
-      if (!u.active) auth.setActive(u.id, true);
+      if (!u.active) await auth.setActive(u.id, true);
       console.log(`Password changed for ${u.username}${u.active ? '' : ' (the login was off — it is on again)'}. They are logged out everywhere and log in with the new password.`);
       return;
     }
@@ -123,8 +125,8 @@ async function main() {
     case 'enable': {
       const [username] = args;
       if (!username) { usage(); process.exitCode = 1; return; }
-      const u = need(auth.findUser(username), username);
-      auth.setActive(u.id, cmd === 'enable');
+      const u = need(await auth.findUser(username), username);
+      await auth.setActive(u.id, cmd === 'enable');
       console.log(`${u.username}: login ${cmd === 'enable' ? 'turned on' : 'turned off (logged out everywhere)'}.`);
       return;
     }
@@ -134,6 +136,9 @@ async function main() {
   }
 }
 
-try { await main(); }
-catch (e) { console.error(`Stopped: ${e.message}`); process.exitCode = 1; }
-finally { try { db.close(); } catch { /* closed */ } }
+try {
+  await openDb(); // DATABASE_URL if set, else the local database in DATA_DIR
+  if (!(await get(`SELECT to_regclass('public.users') AS t`)).t) throw new Error('This database has no tables yet — start the app once first (or apply supabase/migrations)');
+  await main();
+} catch (e) { console.error(`Stopped: ${e.message}`); process.exitCode = 1; }
+finally { try { await closeDb(); } catch { /* closed */ } }

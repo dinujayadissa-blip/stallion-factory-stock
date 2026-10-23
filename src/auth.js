@@ -10,7 +10,7 @@
 import crypto from 'node:crypto';
 import os from 'node:os';
 import { promisify } from 'node:util';
-import { all, get, run, tx } from './db.js';
+import { all, get, run, insert, writeTx } from './db.js';
 import { TRADES, isTrade } from './trades.js';
 
 // ───────────────────────── job roles ─────────────────────────
@@ -286,7 +286,8 @@ export function passwordProblem(password, username = '') {
 // ───────────────────────── users ─────────────────────────
 
 const httpError = (status, message, extra = {}) => Object.assign(new Error(message), { status, ...extra });
-const nowText = () => new Date().toLocaleString('sv-SE'); // "2026-10-20 14:05:09", this PC's time
+// "2026-10-20 14:05:09" in Melbourne, worked out by the database (the cloud server itself runs in UTC).
+const MELBOURNE_NOW = `to_char(now() AT TIME ZONE 'Australia/Melbourne','YYYY-MM-DD HH24:MI:SS')`;
 
 export const cleanUsername = u => String(u ?? '').trim();
 function checkUsername(u) {
@@ -312,17 +313,21 @@ export const publicUser = u => (u ? { id: u.id, username: u.username, name: u.na
 const USER_COLS = 'id, username, name, role, trade, active, must_change, created_at, created_by, last_login';
 
 // Two logins never share a display name (capitals and spaces ignored): it is the name on everything they do.
-function checkNameFree(name, exceptId = null) {
-  if (get('SELECT 1 FROM users WHERE lower(name) = lower(?) AND id <> ?', name, exceptId ?? -1)) {
+async function checkNameFree(name, exceptId = null) {
+  if (await get('SELECT 1 FROM users WHERE lower(name) = lower(?) AND id <> ?', name, exceptId ?? -1)) {
     throw httpError(409, `Someone already has the name "${name}" — add a surname or an initial so the two can be told apart`);
   }
 }
-export const userCount = () => get('SELECT COUNT(*) AS n FROM users').n;
+export const userCount = async () => (await get('SELECT COUNT(*) AS n FROM users')).n;
 export const listUsers = () => all(`SELECT ${USER_COLS} FROM users ORDER BY active DESC, CASE role WHEN 'owner' THEN 1 WHEN 'office' THEN 2
-  WHEN 'stores' THEN 3 WHEN 'leadhand' THEN 4 ELSE 5 END, name COLLATE NOCASE`);
+  WHEN 'stores' THEN 3 WHEN 'leadhand' THEN 4 ELSE 5 END, lower(name)`);
 export const getUser = id => get(`SELECT ${USER_COLS} FROM users WHERE id = ?`, Number(id));
-export const findUser = username => get(`SELECT ${USER_COLS} FROM users WHERE username = ?`, cleanUsername(username));
+// Usernames are matched whatever their capitals (the unique index is on lower(username)).
+export const findUser = username => get(`SELECT ${USER_COLS} FROM users WHERE lower(username) = lower(?)`, cleanUsername(username));
 
+// Everything that changes a login runs inside writeTx: one writer at a time across every server, so the
+// "already taken" / "last owner" checks and the change that follows can't be split by another request.
+// (The password is hashed first, outside it: that takes a moment and nothing depends on the database.)
 export async function createUser({ username, name, role, trade = '', password, mustChange = true }, createdBy = '', { firstLogin = false } = {}) {
   const u = cleanUsername(username);
   checkUsername(u);
@@ -330,131 +335,143 @@ export async function createUser({ username, name, role, trade = '', password, m
   const t = checkRoleTrade(role, trade);
   const bad = passwordProblem(password, u);
   if (bad) throw httpError(400, bad);
-  if (findUser(u)) throw httpError(409, `The username "${u}" is already taken`);
-  checkNameFree(n);
   const hash = await hashPassword(password);
-  // First-time setup: checked again right before saving (two browsers at once can't both make an owner).
-  if (firstLogin && userCount() > 0) throw httpError(409, 'The first login was already made — log in instead');
-  checkNameFree(n); // again: another login may have been added while the password was hashed
   try {
-    const r = run(`INSERT INTO users(username, name, role, trade, pass_hash, active, must_change, created_at, created_by)
-                   VALUES(?, ?, ?, ?, ?, 1, ?, ?, ?)`, u, n, role, t, hash, mustChange ? 1 : 0, nowText(), String(createdBy || '').slice(0, 40));
-    return getUser(Number(r.lastInsertRowid));
+    return await writeTx(async () => {
+      if (await findUser(u)) throw httpError(409, `The username "${u}" is already taken`);
+      await checkNameFree(n);
+      // First-time setup: two browsers at once can't both make an owner (this runs under the write lock).
+      if (firstLogin && await userCount() > 0) throw httpError(409, 'The first login was already made — log in instead');
+      const id = await insert(`INSERT INTO users(username, name, role, trade, pass_hash, active, must_change, created_by${firstLogin ? ', last_login' : ''})
+                              VALUES(?, ?, ?, ?, ?, 1, ?, ?${firstLogin ? `, ${MELBOURNE_NOW}` : ''})`,
+        u, n, role, t, hash, mustChange ? 1 : 0, String(createdBy || '').slice(0, 40)); // created_at: the column's own Melbourne default
+      return getUser(id);
+    });
   } catch (e) {
-    if (/UNIQUE/i.test(e.message)) throw httpError(409, `The username "${u}" is already taken`);
+    if (e.code === '23505') throw httpError(409, `The username "${u}" is already taken`); // outside the transaction, so it is already rolled back
     throw e;
   }
 }
 
-const activeOwners = (exceptId = null) => get(`SELECT COUNT(*) AS n FROM users WHERE role = 'owner' AND active = 1 AND id <> ?`, exceptId ?? -1).n;
+const activeOwners = async (exceptId = null) => (await get(`SELECT COUNT(*) AS n FROM users WHERE role = 'owner' AND active = 1 AND id <> ?`, exceptId ?? -1)).n;
 
 // Name / role / trade. A role change ends that person's sessions (they log in again with the new role).
 // `actor`: the owner doing it (they can't change their own role, and the last owner always stays an owner).
 export function updateUser(id, { name, role, trade } = {}, actor = null) {
-  return tx(() => {
-    const u = getUser(id);
+  return writeTx(async () => {
+    const u = await getUser(id);
     if (!u) throw httpError(404, 'That login no longer exists — refresh');
     const newRole = role === undefined ? u.role : role;
     const newTrade = checkRoleTrade(newRole, trade === undefined ? u.trade : trade);
     const newName = name === undefined ? u.name : cleanName(name);
-    if (newName.toLowerCase() !== u.name.toLowerCase()) checkNameFree(newName, u.id);
+    if (newName.toLowerCase() !== u.name.toLowerCase()) await checkNameFree(newName, u.id);
     if (newRole !== u.role) {
       if (actor && actor.id === u.id) throw httpError(400, "You can't change your own job role — ask another owner");
-      if (u.role === 'owner' && u.active && !activeOwners(u.id)) throw httpError(400, 'This is the only owner login — make someone else an owner first');
+      if (u.role === 'owner' && u.active && !await activeOwners(u.id)) throw httpError(400, 'This is the only owner login — make someone else an owner first');
     }
-    run('UPDATE users SET name = ?, role = ?, trade = ? WHERE id = ?', newName, newRole, newTrade, u.id);
-    if (newRole !== u.role || newTrade !== u.trade) endUserSessions(u.id);
+    await run('UPDATE users SET name = ?, role = ?, trade = ? WHERE id = ?', newName, newRole, newTrade, u.id);
+    if (newRole !== u.role || newTrade !== u.trade) await endUserSessions(u.id);
     return getUser(u.id);
   });
 }
 
 // Turn a login off (or back on). Turning it off ends its sessions at once.
 export function setActive(id, active, actor = null) {
-  return tx(() => {
-    const u = getUser(id);
+  return writeTx(async () => {
+    const u = await getUser(id);
     if (!u) throw httpError(404, 'That login no longer exists — refresh');
     if (!active) {
       if (actor && actor.id === u.id) throw httpError(400, "You can't turn off your own login");
-      if (u.role === 'owner' && u.active && !activeOwners(u.id)) throw httpError(400, 'This is the only owner login — make someone else an owner first');
+      if (u.role === 'owner' && u.active && !await activeOwners(u.id)) throw httpError(400, 'This is the only owner login — make someone else an owner first');
     }
-    run('UPDATE users SET active = ? WHERE id = ?', active ? 1 : 0, u.id);
-    if (!active) endUserSessions(u.id);
+    await run('UPDATE users SET active = ? WHERE id = ?', active ? 1 : 0, u.id);
+    if (!active) await endUserSessions(u.id);
     return getUser(u.id);
   });
 }
 
 // New password set by the owner (or `npm run users -- reset`): ends all of that person's sessions.
 export async function resetPassword(id, password, { mustChange = true } = {}) {
-  const u = getUser(id);
-  if (!u) throw httpError(404, 'That login no longer exists — refresh');
-  const bad = passwordProblem(password, u.username);
+  const first = await getUser(id); // (only for the username, which never changes; re-read under the lock below)
+  if (!first) throw httpError(404, 'That login no longer exists — refresh');
+  const bad = passwordProblem(password, first.username);
   if (bad) throw httpError(400, bad);
   const hash = await hashPassword(password);
-  tx(() => {
-    run('UPDATE users SET pass_hash = ?, must_change = ? WHERE id = ?', hash, mustChange ? 1 : 0, u.id);
-    endUserSessions(u.id);
+  return writeTx(async () => {
+    const u = await getUser(first.id);
+    if (!u) throw httpError(404, 'That login no longer exists — refresh');
+    await run('UPDATE users SET pass_hash = ?, must_change = ? WHERE id = ?', hash, mustChange ? 1 : 0, u.id);
+    await endUserSessions(u.id);
+    return getUser(u.id);
   });
-  return getUser(u.id);
 }
 
 // Someone changes their own password: the current one first. Their other sessions (other phones / PCs)
 // end; the one they are using stays.
 export async function changeOwnPassword(userId, current, next, keepTokenHash = null) {
-  const row = get('SELECT * FROM users WHERE id = ?', userId);
+  const row = await get('SELECT * FROM users WHERE id = ?', userId);
   if (!row || !row.active) throw httpError(401, 'Please log in');
   if (!(await verifyPassword(current, row.pass_hash))) throw httpError(400, 'Your current password is not right', { wrongCurrent: true });
   const bad = passwordProblem(next, row.username);
   if (bad) throw httpError(400, bad);
   if (await verifyPassword(next, row.pass_hash)) throw httpError(400, 'Choose a different password from the one you have now');
   const hash = await hashPassword(next);
-  tx(() => {
-    run('UPDATE users SET pass_hash = ?, must_change = 0 WHERE id = ?', hash, row.id);
-    endUserSessions(row.id, keepTokenHash);
+  await writeTx(async () => {
+    // Only if the password is still the one that was checked (another change may have come in meanwhile).
+    const r = await run('UPDATE users SET pass_hash = ?, must_change = 0 WHERE id = ? AND pass_hash = ? AND active = 1', hash, row.id, row.pass_hash);
+    if (!r.changes) throw httpError(409, 'Your password was just changed somewhere else — try again');
+    await endUserSessions(row.id, keepTokenHash);
   });
 }
 
 // ───────────────────────── sessions ─────────────────────────
 // Cookie fs_session = a random 32-byte token; the database keeps only sha256(token). Sliding expiry:
 // 30 days from the last use, so phones stay logged in.
+//
+// Sessions are single, self-contained statements (nothing is read and then written back on trust), so they
+// don't take the write lock: that is for business data, and a session touch on every request must not
+// queue behind it or bump data_version.
 
 // The cookie's name carries the port the app runs on (fs_session_3000): browsers keep cookies per PC name, not
 // per port, so a second copy on the same PC (a test copy on another port) no longer logs the real one out.
+// In the cloud (CLOUD=1) there is one address and one app, so the name is always plain fs_session.
+const inCloud = () => process.env.CLOUD === '1';
 export let COOKIE = 'fs_session';
-export function setCookiePort(port) { COOKIE = Number(port) > 0 ? `fs_session_${Number(port)}` : 'fs_session'; }
+export function setCookiePort(port) { COOKIE = !inCloud() && Number(port) > 0 ? `fs_session_${Number(port)}` : 'fs_session'; }
 export const SESSION_DAYS = 30;
 const SESSION_MS = SESSION_DAYS * 24 * 60 * 60 * 1000;
 const TOUCH_MS = 5 * 60 * 1000; // write "last seen" at most every 5 minutes
 export const tokenHash = token => crypto.createHash('sha256').update(String(token)).digest('hex');
 
-export function createSession(userId, { ip = '', ua = '' } = {}, now = Date.now()) {
+export async function createSession(userId, { ip = '', ua = '' } = {}, now = Date.now()) {
   const token = crypto.randomBytes(32).toString('base64url');
-  run('INSERT INTO sessions(token_hash, user_id, created_at, last_seen, expires_at, ip, ua) VALUES(?, ?, ?, ?, ?, ?, ?)',
+  await run('INSERT INTO sessions(token_hash, user_id, created_at, last_seen, expires_at, ip, ua) VALUES(?, ?, ?, ?, ?, ?, ?)',
     tokenHash(token), userId, now, now, now + SESSION_MS, String(ip).slice(0, 64), String(ua).slice(0, 200));
   return token;
 }
 
 // The login behind a cookie token, or null. `refreshed`: the expiry moved on (send the cookie again).
-export function sessionFromToken(token, now = Date.now()) {
+export async function sessionFromToken(token, now = Date.now()) {
   if (typeof token !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(token)) return null;
   const h = tokenHash(token);
-  const s = get('SELECT * FROM sessions WHERE token_hash = ?', h);
+  const s = await get('SELECT * FROM sessions WHERE token_hash = ?', h);
   if (!s) return null;
-  if (s.expires_at <= now) { run('DELETE FROM sessions WHERE token_hash = ?', h); return null; }
-  const u = get('SELECT * FROM users WHERE id = ?', s.user_id);
-  if (!u || !u.active) { run('DELETE FROM sessions WHERE token_hash = ?', h); return null; }
+  if (s.expires_at <= now) { await run('DELETE FROM sessions WHERE token_hash = ?', h); return null; }
+  const u = await get('SELECT * FROM users WHERE id = ?', s.user_id);
+  if (!u || !u.active) { await run('DELETE FROM sessions WHERE token_hash = ?', h); return null; }
   let refreshed = false;
   if (now - s.last_seen >= TOUCH_MS) {
-    run('UPDATE sessions SET last_seen = ?, expires_at = ? WHERE token_hash = ?', now, now + SESSION_MS, h);
+    await run('UPDATE sessions SET last_seen = ?, expires_at = ? WHERE token_hash = ?', now, now + SESSION_MS, h);
     refreshed = true;
   }
   return { tokenHash: h, user: { ...publicUser(u), mustChange: !!u.must_change }, refreshed };
 }
 
-export const endSession = hash => { run('DELETE FROM sessions WHERE token_hash = ?', hash); };
-export function endUserSessions(userId, exceptHash = null) {
-  run('DELETE FROM sessions WHERE user_id = ? AND token_hash <> ?', userId, exceptHash ?? '');
+export const endSession = async hash => { await run('DELETE FROM sessions WHERE token_hash = ?', hash); };
+export async function endUserSessions(userId, exceptHash = null) {
+  await run('DELETE FROM sessions WHERE user_id = ? AND token_hash <> ?', userId, exceptHash ?? '');
 }
-export const pruneSessions = (now = Date.now()) => run('DELETE FROM sessions WHERE expires_at <= ?', now).changes;
+export const pruneSessions = async (now = Date.now()) => (await run('DELETE FROM sessions WHERE expires_at <= ?', now)).changes;
 
 export function readCookie(header, name = COOKIE) { // (default = the name in use now)
   for (const part of String(header || '').split(';')) {
@@ -468,67 +485,84 @@ export const sessionCookie = (token, { secure = false } = {}) =>
 export const clearCookie = ({ secure = false } = {}) => `${COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secure ? '; Secure' : ''}`;
 
 // ───────────────────────── logging in, with throttling ─────────────────────────
-// In memory (a restart clears it): 5 wrong tries for one username from one address → that username
-// is locked for that address for 15 minutes; 30 wrong tries from one address within 15 minutes →
-// that address is locked for 15 minutes.
+// Kept in the database (table login_throttle), so a restart or a second server instance doesn't forget:
+// 5 wrong tries for one username from one address → that username is locked for that address for 15
+// minutes; 30 wrong tries from one address within 15 minutes → that address is locked for 15 minutes.
+// A row per key: 'u:<ip>|<username lower-cased>' or 'i:<ip>'. fails/first_at count the wrong tries in the
+// current 15-minute window (it starts at the first wrong try); locked_until is ms (0 = not locked).
+// Everything that changes a row runs in writeTx, so concurrent wrong tries are counted one by one.
 
 export const WRONG = 'Wrong username or password';
 export const LOCKED = 'Too many tries — wait 15 minutes';
 
 export function createThrottle({ perUser = 5, perIp = 30, windowMs = 15 * 60 * 1000, lockMs = 15 * 60 * 1000 } = {}) {
-  const map = new Map(); // key → { times: [ms], until: ms }
-  const entry = k => { let e = map.get(k); if (!e) { e = { times: [], until: 0 }; map.set(k, e); } return e; };
   const uKey = (ip, user) => `u:${ip}|${String(user).trim().toLowerCase()}`;
   const iKey = ip => `i:${ip}`;
-  function prune(now) {
-    if (map.size < 5000) return;
-    for (const [k, e] of map) if (e.until <= now && !e.times.some(t => now - t < windowMs)) map.delete(k);
+  // A wrong try on one key. Returns how many tries are left before the lock (0 = locked now). Inside writeTx.
+  async function bump(k, limit, now) {
+    const row = await get('SELECT fails, first_at, locked_until FROM login_throttle WHERE key = ?', k);
+    const fresh = !row || row.first_at == null || now - row.first_at >= windowMs; // no tries counted yet, or the window is over
+    const fails = (fresh ? 0 : row.fails) + 1;
+    const lock = fails >= limit;
+    await run(`INSERT INTO login_throttle(key, fails, first_at, locked_until) VALUES(?, ?, ?, ?)
+               ON CONFLICT (key) DO UPDATE SET fails = excluded.fails, first_at = excluded.first_at, locked_until = excluded.locked_until`,
+      k, lock ? 0 : fails, lock ? null : (fresh ? now : row.first_at), lock ? now + lockMs : (row?.locked_until ?? 0));
+    return lock ? 0 : limit - fails;
   }
-  // Returns how many tries are left before the lock (0 = locked now).
-  const bump = (k, limit, now) => {
-    const e = entry(k);
-    e.times = e.times.filter(t => now - t < windowMs);
-    e.times.push(now);
-    if (e.times.length >= limit) { e.until = now + lockMs; e.times = []; return 0; }
-    return limit - e.times.length;
-  };
-  const until = (k, now) => { const u = map.get(k)?.until || 0; return u > now ? u : 0; };
-  const nameOf = k => k.slice(k.indexOf('|') + 1);
   return {
-    locked(ip, user, now = Date.now()) { return this.lockedUntil(ip, user, now) > 0; },
+    async locked(ip, user, now = Date.now()) { return (await this.lockedUntil(ip, user, now)) > 0; },
     // When the lock for this username from this address ends (ms), or 0.
-    lockedUntil(ip, user, now = Date.now()) { return Math.max(until(iKey(ip), now), until(uKey(ip, user), now)); },
+    async lockedUntil(ip, user, now = Date.now()) {
+      const r = await get('SELECT MAX(locked_until) AS until FROM login_throttle WHERE key IN (?, ?) AND locked_until > ?', iKey(ip), uKey(ip, user), now);
+      return r?.until || 0;
+    },
     // A wrong try: how many are left for this username from this address (and the address as a whole).
-    fail(ip, user, now = Date.now()) { prune(now); const u = bump(uKey(ip, user), perUser, now); const i = bump(iKey(ip), perIp, now); return Math.min(u, i); },
-    success(ip, user) { map.delete(uKey(ip, user)); },
+    fail(ip, user, now = Date.now()) {
+      return writeTx(async () => {
+        // Tidy away rows whose lock and counting window are both over.
+        await run('DELETE FROM login_throttle WHERE locked_until <= ? AND (first_at IS NULL OR first_at <= ?)', now, now - windowMs);
+        const u = await bump(uKey(ip, user), perUser, now);
+        const i = await bump(iKey(ip), perIp, now);
+        return Math.min(u, i);
+      });
+    },
+    success(ip, user) { return writeTx(async () => { await run('DELETE FROM login_throttle WHERE key = ?', uKey(ip, user)); }); },
     // Usernames locked right now (from any address) → when the lock ends: for the Logins page.
-    lockedUsers(now = Date.now()) {
+    async lockedUsers(now = Date.now()) {
       const out = new Map();
-      for (const [k, e] of map) if (k.startsWith('u:') && e.until > now) out.set(nameOf(k), Math.max(out.get(nameOf(k)) || 0, e.until));
+      for (const r of await all(`SELECT key, locked_until FROM login_throttle WHERE left(key, 2) = 'u:' AND locked_until > ?`, now)) {
+        const name = r.key.slice(r.key.indexOf('|') + 1);
+        out.set(name, Math.max(out.get(name) || 0, r.locked_until));
+      }
       return out;
     },
     // The owner's Unlock (and a password reset): every address's lock and wrong tries for this username.
-    unlockUser(user) { const n = String(user).trim().toLowerCase(); for (const k of [...map.keys()]) if (k.startsWith('u:') && nameOf(k) === n) map.delete(k); },
-    clear() { map.clear(); },
+    unlockUser(user) {
+      const n = String(user).trim().toLowerCase();
+      return writeTx(async () => { await run(`DELETE FROM login_throttle WHERE left(key, 2) = 'u:' AND substr(key, strpos(key, '|') + 1) = ?`, n); });
+    },
+    clear() { return writeTx(async () => { await run('DELETE FROM login_throttle'); }); },
   };
 }
 
 // Same answer for an unknown username, a wrong password and a login that is turned off.
 export async function login({ username, password, ip = '', ua = '' }, throttle, now = Date.now()) {
   const uname = cleanUsername(username).slice(0, 64);
-  const lockEnd = throttle.lockedUntil(ip, uname, now);
+  const lockEnd = await throttle.lockedUntil(ip, uname, now);
   if (lockEnd) throw httpError(429, LOCKED, { until: lockEnd });
-  const row = uname ? get('SELECT * FROM users WHERE username = ?', uname) : null;
+  const row = uname ? await get('SELECT * FROM users WHERE lower(username) = lower(?)', uname) : null;
   const ok = await verifyPassword(String(password ?? '').slice(0, 200), row?.pass_hash || DUMMY_HASH);
   if (!row || !ok || !row.active) {
-    const left = throttle.fail(ip, uname, now);
+    const left = await throttle.fail(ip, uname, now);
     // `left`: tries left before the 15-minute lock (the page warns at 2 and 1) — the same for any username, so it
     // says nothing about which usernames exist.
-    throw httpError(401, WRONG, { left, ...(left === 0 ? { until: throttle.lockedUntil(ip, uname, now) } : {}) });
+    throw httpError(401, WRONG, { left, ...(left === 0 ? { until: await throttle.lockedUntil(ip, uname, now) } : {}) });
   }
-  throttle.success(ip, uname);
-  run('UPDATE users SET last_login = ? WHERE id = ?', nowText(), row.id);
-  const token = createSession(row.id, { ip, ua }, now);
+  await throttle.success(ip, uname);
+  const token = await writeTx(async () => {
+    await run(`UPDATE users SET last_login = ${MELBOURNE_NOW} WHERE id = ?`, row.id);
+    return createSession(row.id, { ip, ua }, now);
+  });
   return { token, user: { ...publicUser(row), mustChange: !!row.must_change } };
 }
 
@@ -541,13 +575,14 @@ export const isLoopback = addr => LOOPBACK.test(String(addr || ''));
 // A request that came through a proxy / tunnel (Cloudflare Tunnel, Tailscale serve…) arrives from this
 // PC too. Such headers never make a request trusted; they only rule out setup.
 const PROXY_HEADERS = ['x-forwarded-for', 'x-forwarded-host', 'x-real-ip', 'forwarded', 'cf-connecting-ip', 'true-client-ip', 'tailscale-user-login'];
-export const fromThisPc = req => isLoopback(req.socket?.remoteAddress) && !PROXY_HEADERS.some(h => req.headers?.[h] != null);
+// In the cloud (CLOUD=1) no request is ever "this PC", so first-time setup is off: the first owner is made with
+// `npm run users -- add <username> owner` against the cloud database.
+export const fromThisPc = req => !inCloud() && isLoopback(req.socket?.remoteAddress) && !PROXY_HEADERS.some(h => req.headers?.[h] != null);
 
 export async function setupOwner({ username, name, password }) {
-  if (userCount() > 0) throw httpError(409, 'The first login was already made — log in instead');
-  const u = await createUser({ username, name, role: 'owner', password, mustChange: false }, 'first setup', { firstLogin: true });
-  run('UPDATE users SET last_login = ? WHERE id = ?', nowText(), u.id); // logged straight in
-  return getUser(u.id);
+  if (await userCount() > 0) throw httpError(409, 'The first login was already made — log in instead');
+  // firstLogin: checked again under the write lock, and last_login is set (they are logged straight in)
+  return createUser({ username, name, role: 'owner', password, mustChange: false }, 'first setup', { firstLogin: true });
 }
 
 // ───────────────────────── which addresses the app answers changes on ─────────────────────────

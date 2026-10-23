@@ -1,37 +1,32 @@
-// Logins and job roles through the real server: the app is started on a new, empty database in a temp
-// folder, on a free port (PORT=0) — never on the real data, never on port 3000.   node --test test/
+// Logins and job roles through the real app: started in this process on a new, empty in-memory database
+// (PGlite) and a free port — never on real data, never on port 3000.   node --test test/
+// NOTE: needs createApp() from src/app.js, which arrives with Task 5 (server.js is split then); until then
+// this file cannot run. The database work below is already on the async db.js helpers.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
-import { DatabaseSync } from 'node:sqlite';
-import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { freshDb } from './helpers.js';
+import { get, run, insert, closeDb } from '../src/db.js';
+import { setCookiePort } from '../src/auth.js';
 
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fs-test-http-'));
-let child, port, db;
+let server, port;
 const lanIp = Object.values(os.networkInterfaces()).flat().find(n => n?.family === 'IPv4' && !n.internal)?.address;
 
 before(async () => {
-  child = spawn(process.execPath, ['server.js'], { cwd: root, env: { ...process.env, DATA_DIR: dir, PORT: '0', ALLOWED_HOSTS: '', TRUST_PROXY: '' }, stdio: ['ignore', 'pipe', 'pipe'] });
-  let out = '';
-  port = await new Promise((resolve, reject) => {
-    const t = setTimeout(() => reject(new Error(`server did not start:\n${out}`)), 90000);
-    const on = d => { out += d; const m = /On this PC:\s+http:\/\/localhost:(\d+)/.exec(out); if (m) { clearTimeout(t); resolve(Number(m[1])); } };
-    child.stdout.on('data', on);
-    child.stderr.on('data', on);
-    child.on('exit', code => { clearTimeout(t); reject(new Error(`server stopped (${code}):\n${out}`)); });
-  });
-  db = new DatabaseSync(path.join(dir, 'factory.db'));
-  db.exec('PRAGMA busy_timeout = 5000');
+  process.env.ALLOWED_HOSTS = '';
+  delete process.env.TRUST_PROXY;
+  delete process.env.CLOUD;
+  await freshDb();
+  const { createApp } = await import('../src/app.js');
+  server = createApp({ cloud: false }).listen(0, '0.0.0.0');
+  await new Promise(r => server.once('listening', r));
+  port = server.address().port;
+  setCookiePort(port); // the cookie is fs_session_<port>, as when server.js runs
 });
 after(async () => {
-  try { db?.close(); } catch { /* closed */ }
-  if (child && child.exitCode == null) { child.removeAllListeners('exit'); child.kill(); await new Promise(r => child.once('exit', r)); }
-  for (let i = 0; i < 10; i++) { try { fs.rmSync(dir, { recursive: true, force: true }); break; } catch { await new Promise(r => setTimeout(r, 300)); } }
+  if (server) await new Promise(r => server.close(r));
+  await closeDb();
 });
 
 // One request; `as` = the cookie of a logged-in person (or none).
@@ -142,12 +137,11 @@ test('the owner adds one login per job role; each logs in', async () => {
   assert.equal((await call('POST', '/api/users', { as: S.olive, body: { username: 'x1', name: 'X', role: 'owner', password: 'abcdefgh1' } })).status, 403);
 
   // fixtures for the tests below: a van in production with an electrician part, a plumber part, a supplier part
-  const item = (sku, name, trade) => Number(db.prepare(`INSERT INTO items(sku, name, category, supplier, trade, on_hand) VALUES(?, ?, 'General', 'Onex', ?, 10)`)
-    .run(sku, name, trade).lastInsertRowid);
-  id.sparkItem = item('T-SPARK', 'Test switch', 'electrician');
-  id.plumbItem = item('T-PLUMB', 'Test tap', 'plumber');
-  id.van = Number(db.prepare(`INSERT INTO vans(chassis, status, eta) VALUES('TST1', 'in_production', '2027-01-01')`).run().lastInsertRowid);
-  id.sparkLine = Number(db.prepare(`INSERT INTO van_lines(van_id, item_id, qty, source) VALUES(?, ?, 3, 'manual')`).run(id.van, id.sparkItem).lastInsertRowid);
+  const item = (sku, name, trade) => insert(`INSERT INTO items(sku, name, category, supplier, trade, on_hand) VALUES(?, ?, 'General', 'Onex', ?, 10)`, sku, name, trade);
+  id.sparkItem = await item('T-SPARK', 'Test switch', 'electrician');
+  id.plumbItem = await item('T-PLUMB', 'Test tap', 'plumber');
+  id.van = await insert(`INSERT INTO vans(chassis, status, eta) VALUES('TST1', 'in_production', '2027-01-01')`);
+  id.sparkLine = await insert(`INSERT INTO van_lines(van_id, item_id, qty, source) VALUES(?, ?, 3, 'manual')`, id.van, id.sparkItem);
 });
 
 test('a temporary password: nothing works until a new one is chosen', async () => {
@@ -201,43 +195,43 @@ test('the name on every change is the login\'s name — a "by" sent from the pag
   r = await call('POST', '/api/floor/take', { as: S.sam, body: { line_id: id.sparkLine, qty: 1, seen_issued: 0, by: 'Mallory' } });
   assert.equal(r.status, 200, r.text);
   id.take = r.json.movement_id;
-  assert.equal(db.prepare('SELECT worker FROM movements WHERE id = ?').get(id.take).worker, 'Sam Sparks');
+  assert.equal((await get('SELECT worker FROM movements WHERE id = ?', id.take)).worker, 'Sam Sparks');
   r = await call('GET', '/api/floor/stats?by=Mallory', { as: S.sam });
   assert.equal(r.json.mine_took, 1);
   // stores receiving at the office: the name is recorded too
   r = await call('POST', `/api/items/${id.plumbItem}/receive`, { as: S.stu, body: { qty: 2, by: 'Mallory' } });
   assert.equal(r.status, 200, r.text);
-  assert.equal(db.prepare(`SELECT worker FROM movements WHERE item_id = ? AND type = 'receive' ORDER BY id DESC`).get(id.plumbItem).worker, 'Stu Stores');
+  assert.equal((await get(`SELECT worker FROM movements WHERE item_id = ? AND type = 'receive' ORDER BY id DESC`, id.plumbItem)).worker, 'Stu Stores');
   // a reminder added by the leading hand
   r = await call('POST', '/api/reminders', { as: S.lee, body: { van_id: id.van, text: 'Check the A-frame', by: 'Mallory' } });
   assert.equal(r.status, 200, r.text);
-  assert.equal(db.prepare(`SELECT worker FROM reminders WHERE text = 'Check the A-frame'`).get().worker, 'Lee Leading');
+  assert.equal((await get(`SELECT worker FROM reminders WHERE text = 'Check the A-frame'`)).worker, 'Lee Leading');
 });
 
 test('a worker can undo only their own take — by login, not by name (issue #2)', async () => {
   // the take carries the login's id
-  assert.equal(db.prepare('SELECT user_id FROM movements WHERE id = ?').get(id.take).user_id, id.sam);
+  assert.equal((await get('SELECT user_id FROM movements WHERE id = ?', id.take)).user_id, id.sam);
   let r = await call('POST', '/api/floor/undo', { as: S.pat, body: { movement_id: id.take, line_id: id.sparkLine, van_id: id.van } });
   assert.equal(r.status, 403);
   assert.match(r.json.error, /Only the person who did it/);
   // same name on the movement but another login's id: still not theirs
-  db.prepare('UPDATE movements SET worker = ? WHERE id = ?').run('Pat Plumber', id.take);
+  await run('UPDATE movements SET worker = ? WHERE id = ?', 'Pat Plumber', id.take);
   r = await call('POST', '/api/floor/undo', { as: S.pat, body: { movement_id: id.take, line_id: id.sparkLine, van_id: id.van } });
   assert.equal(r.status, 403);
-  db.prepare('UPDATE movements SET worker = ? WHERE id = ?').run('Sam Sparks', id.take);
+  await run('UPDATE movements SET worker = ? WHERE id = ?', 'Sam Sparks', id.take);
   r = await call('POST', '/api/floor/undo', { as: S.sam, body: { movement_id: id.take, line_id: id.sparkLine, van_id: id.van } });
   assert.equal(r.status, 200, r.text);
   // a take saved before logins (no login id) still goes by the name
   r = await call('POST', '/api/floor/take', { as: S.sam, body: { line_id: id.sparkLine, qty: 1, seen_issued: 0 } });
   assert.equal(r.status, 200, r.text);
   const mv = r.json.movement_id;
-  db.prepare('UPDATE movements SET user_id = NULL WHERE id = ?').run(mv);
+  await run('UPDATE movements SET user_id = NULL WHERE id = ?', mv);
   assert.equal((await call('POST', '/api/floor/undo', { as: S.pat, body: { movement_id: mv, line_id: id.sparkLine, van_id: id.van } })).status, 403);
   assert.equal((await call('POST', '/api/floor/undo', { as: S.sam, body: { movement_id: mv, line_id: id.sparkLine, van_id: id.van } })).status, 200);
   // deliveries booked on the phone carry the login's id too
   r = await call('POST', '/api/floor/receive', { as: S.sam, body: { item_id: id.plumbItem, qty: 1 } });
   assert.equal(r.status, 200, r.text);
-  assert.equal(db.prepare('SELECT user_id FROM movements WHERE id = ?').get(r.json.movement_id).user_id, id.sam);
+  assert.equal((await get('SELECT user_id FROM movements WHERE id = ?', r.json.movement_id)).user_id, id.sam);
   assert.equal((await call('POST', '/api/floor/receive/undo', { as: S.pat, body: { movement_id: r.json.movement_id, item_id: id.plumbItem } })).status, 403);
   assert.equal((await call('POST', '/api/floor/receive/undo', { as: S.sam, body: { movement_id: r.json.movement_id, item_id: id.plumbItem } })).status, 200);
 });
@@ -261,7 +255,7 @@ test('stores: receive and say where parts are kept — not create purchase order
   assert.equal(r.status, 200, r.text);
   r = await call('PUT', `/api/items/${id.plumbItem}`, { as: S.stu, body: { location: 'Shelf 3', name: 'Renamed' } });
   assert.deepEqual(r.json, { error: NO });
-  assert.equal(db.prepare('SELECT name, location FROM items WHERE id = ?').get(id.plumbItem).name, 'Test tap');
+  assert.equal((await get('SELECT name, location FROM items WHERE id = ?', id.plumbItem)).name, 'Test tap');
   assert.equal((await call('POST', `/api/vans/${id.van}/move`, { as: S.stu, body: { area_id: null } })).status, 403);
   assert.equal((await call('GET', '/api/settings', { as: S.stu })).status, 403);
   assert.equal((await call('GET', '/', { as: S.stu })).status, 200);
