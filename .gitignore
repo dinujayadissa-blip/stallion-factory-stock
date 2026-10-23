@@ -17,3 +17,4 @@ _testdata/
 # Local settings
 .env
 .claude/
+.superpowers/
