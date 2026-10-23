@@ -1,0 +1,11 @@
+{
+  "name": "factory-stock-cloud-spike",
+  "version": "1.0.0",
+  "description": "Throwaway Edge/Pages spike tooling (not part of the app)",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "@noble/hashes": "^1.8.0",
+    "pdf-lib": "^1.17.1"
+  }
+}
