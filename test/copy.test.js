@@ -241,7 +241,12 @@ test('photos go to Storage when SUPABASE_URL is set; a missing photo fails the c
   const to = path.join(tmp('to'), 'pg');
   const oldFetch = globalThis.fetch;
   const oldEnv = { url: process.env.SUPABASE_URL, key: process.env.SUPABASE_SERVICE_ROLE_KEY };
-  globalThis.fetch = async (url, init) => { calls.push({ url: String(url), init }); return new Response('{}', { status: 200 }); };
+  globalThis.fetch = async (url, init = {}) => {
+    calls.push({ url: String(url), init });
+    // the bucket check (scripts/lib/bucket.mjs): there, private
+    if (String(url).endsWith('/storage/v1/bucket/item-photos')) return new Response(JSON.stringify({ id: 'item-photos', public: false }), { status: 200 });
+    return new Response('{}', { status: 200 });
+  };
   process.env.SUPABASE_URL = 'https://example.test';
   process.env.SUPABASE_SERVICE_ROLE_KEY = 'test-key';
   try {
@@ -256,16 +261,47 @@ test('photos go to Storage when SUPABASE_URL is set; a missing photo fails the c
     if (oldEnv.url === undefined) delete process.env.SUPABASE_URL; else process.env.SUPABASE_URL = oldEnv.url;
     if (oldEnv.key === undefined) delete process.env.SUPABASE_SERVICE_ROLE_KEY; else process.env.SUPABASE_SERVICE_ROLE_KEY = oldEnv.key;
   }
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0].url, 'https://example.test/storage/v1/object/item-photos/7-200.jpg');
-  assert.equal(calls[0].init.method, 'POST');
-  const h = new Headers(calls[0].init.headers);
+  // first the bucket: made private if missing, then checked (never public)
+  assert.equal(calls[0].url, 'https://example.test/storage/v1/bucket');
+  assert.equal(JSON.parse(calls[0].init.body).public, false);
+  assert.equal(calls[1].url, 'https://example.test/storage/v1/bucket/item-photos');
+  const uploads = calls.slice(2);
+  assert.equal(uploads.length, 1);
+  assert.equal(uploads[0].url, 'https://example.test/storage/v1/object/item-photos/7-200.jpg');
+  assert.equal(uploads[0].init.method, 'POST');
+  const h = new Headers(uploads[0].init.headers);
   assert.equal(h.get('authorization'), 'Bearer test-key');
   assert.equal(h.get('apikey'), 'test-key');
   assert.equal(h.get('content-type'), 'image/jpeg');
   assert.equal(h.get('x-upsert'), 'true');
-  assert.deepEqual(Buffer.from(calls[0].init.body), Buffer.from([0xff, 0xd8, 0xff, 9]));
+  assert.deepEqual(Buffer.from(uploads[0].init.body), Buffer.from([0xff, 0xd8, 0xff, 9]));
   // failed checks keep nothing — here not even the schema the copy put into the new PGlite folder
+  await withTarget(to, async d => assert.equal((await rows(d, `SELECT to_regclass('public.vans') IS NULL AS gone`))[0].gone, true));
+});
+
+test('a PUBLIC photo bucket stops the copy before any photo is sent, and the target is unchanged', async () => {
+  const photos = tmp('photos');
+  fs.writeFileSync(path.join(photos, '3-100.jpg'), Buffer.from([0xff, 0xd8, 0xff, 1]));
+  const calls = [];
+  const to = path.join(tmp('to'), 'pg');
+  const oldFetch = globalThis.fetch;
+  const oldEnv = { url: process.env.SUPABASE_URL, key: process.env.SUPABASE_SERVICE_ROLE_KEY };
+  globalThis.fetch = async (url, init = {}) => {
+    calls.push({ url: String(url), method: init.method || 'GET' });
+    if (String(url).endsWith('/storage/v1/bucket')) return new Response(JSON.stringify({ error: 'Duplicate', message: 'The resource already exists' }), { status: 400 });
+    if (String(url).endsWith('/storage/v1/bucket/item-photos')) return new Response(JSON.stringify({ id: 'item-photos', public: true }), { status: 200 });
+    return new Response('{}', { status: 200 });
+  };
+  process.env.SUPABASE_URL = 'https://example.test';
+  process.env.SUPABASE_SERVICE_ROLE_KEY = 'test-key';
+  try {
+    await assert.rejects(copyAll({ from: SRC, prepare: false, to, photosDir: photos }), /item-photos is PUBLIC/);
+  } finally {
+    globalThis.fetch = oldFetch;
+    if (oldEnv.url === undefined) delete process.env.SUPABASE_URL; else process.env.SUPABASE_URL = oldEnv.url;
+    if (oldEnv.key === undefined) delete process.env.SUPABASE_SERVICE_ROLE_KEY; else process.env.SUPABASE_SERVICE_ROLE_KEY = oldEnv.key;
+  }
+  assert.equal(calls.filter(c => c.url.includes('/storage/v1/object/')).length, 0, 'no photo was sent');
   await withTarget(to, async d => assert.equal((await rows(d, `SELECT to_regclass('public.vans') IS NULL AS gone`))[0].gone, true));
 });
 

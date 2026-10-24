@@ -17,7 +17,8 @@
 // - A PGlite folder with no tables gets supabase/migrations/*.sql first. A Postgres server must already
 //   have them (`npx supabase db push`).
 // - --photos: every file in that folder goes to Supabase Storage (bucket item-photos, same names) when
-//   SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are set; otherwise it is copied to --photos-to, or to the
+//   SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are set — the bucket is made private first if it is missing,
+//   and a public one stops the copy before anything is sent (scripts/lib/bucket.mjs); otherwise it is copied to --photos-to, or to the
 //   `photos` folder next to the PGlite folder (DATA_DIR/pg → DATA_DIR/photos).
 // - Only table names, counts and check results are printed — never row contents (customer names).
 import fs from 'node:fs';
@@ -27,6 +28,7 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { makeDriver } from '../src/pg.js';
+import { ensurePrivateBucket } from './lib/bucket.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SQLITE_FINAL_TAG = 'sqlite-final';
@@ -251,6 +253,7 @@ async function copyPhotos(dir, { to, photosTo }) {
   const base = process.env.SUPABASE_URL, key = process.env.SUPABASE_SERVICE_ROLE_KEY;
   if (!photosTo && base) {
     if (!key) throw new Error('SUPABASE_URL is set but SUPABASE_SERVICE_ROLE_KEY is not');
+    await ensurePrivateBucket({ base, key });
     const queue = [...names];
     const worker = async () => {
       for (let name; (name = queue.shift()) !== undefined;) {

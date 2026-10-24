@@ -1,4 +1,5 @@
-# Puts the app's server online: the database tables (supabase/migrations) and the Edge Function "api".
+# Puts the app's server online: the database tables (supabase/migrations), the Edge Function "api" and a check
+# that the private photo bucket item-photos is there (scripts/ensure-bucket.mjs).
 #
 #   powershell -ExecutionPolicy Bypass -File scripts\deploy-api.ps1 -Ref <project ref id>
 #   ... -SetSecrets   also asks for the function's secrets (typed here, never shown, never saved in a file)
@@ -78,6 +79,32 @@ if ($SetSecrets) {
 # --use-api: bundled on Supabase's side, so Docker isn't needed. --no-verify-jwt: the app has its own logins.
 Run-Step 'Deploy the Edge Function "api"' {
   npx supabase functions deploy api --project-ref $Ref --no-verify-jwt --use-api --workdir $stage
+}
+
+# ---- 5. The photo bucket item-photos: there, and private ----
+# (scripts/ensure-bucket.mjs: made private if it is missing; a PUBLIC bucket stops here.) The service key is
+# read from $env:SUPABASE_SERVICE_ROLE_KEY when it is set, otherwise typed here (not shown); it reaches node
+# through the environment of this window only, never the command line, and is removed again afterwards.
+Write-Host ""
+Write-Host "== The photo bucket item-photos (made private if missing; stops if it is public)" -ForegroundColor Cyan
+$hadKey = [bool]$env:SUPABASE_SERVICE_ROLE_KEY
+if (-not $hadKey) {
+  $secure = Read-Host -AsSecureString "Service key SUPABASE_SERVICE_ROLE_KEY (Supabase > Project Settings > API Keys; nothing is shown; Enter to skip)"
+  $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+  try { $env:SUPABASE_SERVICE_ROLE_KEY = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+}
+if ($env:SUPABASE_SERVICE_ROLE_KEY) {
+  $oldUrl = $env:SUPABASE_URL
+  $env:SUPABASE_URL = "https://$Ref.supabase.co"
+  try {
+    node (Join-Path $root 'scripts\ensure-bucket.mjs')
+    if ($LASTEXITCODE -ne 0) { throw "Stopped: the photo bucket check failed (see the line above). The function is deployed; fix the bucket, then run: node scripts\ensure-bucket.mjs" }
+  } finally {
+    $env:SUPABASE_URL = $oldUrl
+    if (-not $hadKey) { Remove-Item Env:SUPABASE_SERVICE_ROLE_KEY -ErrorAction SilentlyContinue }
+  }
+} else {
+  Write-Host "Skipped. Before photos are copied, run: node scripts\ensure-bucket.mjs (with the values set as in HANDOVER-CLOUD.md step 2)." -ForegroundColor Yellow
 }
 
 Write-Host ""

@@ -68,7 +68,7 @@ $env:SUPABASE_SERVICE_ROLE_KEY = "<service_role key>"
 node scripts/restore-photos.mjs "..\stallion-factory-backups\photos"
 ```
 
-It creates the private bucket `item-photos` if needed and uploads every picture (safe to run twice).
+It creates the private bucket `item-photos` if needed (it stops, uploading nothing, if the bucket is public) and uploads every picture (safe to run twice).
 It prints `Uploaded N of N photos`.
 
 ## 5. Check it is all there

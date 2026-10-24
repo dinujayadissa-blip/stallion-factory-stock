@@ -1,11 +1,12 @@
 // Puts a folder of item photos (the `photos/` folder of the private backup repo) back into the
 // private Supabase Storage bucket `item-photos`. Used when restoring a backup (docs/RESTORE.md).
 //   SUPABASE_URL=https://<ref>.supabase.co SUPABASE_SERVICE_ROLE_KEY=... node scripts/restore-photos.mjs <photos folder>
-// Creates the bucket (private) if it isn't there yet. Safe to run twice: existing files are overwritten.
+// Creates the bucket (private) if it isn't there yet, and stops if it is public (scripts/lib/bucket.mjs).
+// Safe to run twice: existing files are overwritten.
 import fs from 'node:fs';
 import path from 'node:path';
+import { ensurePrivateBucket, BUCKET } from './lib/bucket.mjs';
 
-const BUCKET = 'item-photos';
 const dir = process.argv[2];
 const base = (process.env.SUPABASE_URL || '').replace(/\/+$/, '');
 const key = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
@@ -27,12 +28,8 @@ async function main() {
   };
   walk('');
 
-  const made = await fetch(`${base}/storage/v1/bucket`, {
-    method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ id: BUCKET, name: BUCKET, public: false }),
-  });
-  if (made.ok) console.log(`Created the private bucket ${BUCKET}`);
-  else if (!/exist/i.test(await made.text())) throw new Error(`Creating bucket ${BUCKET} failed: HTTP ${made.status}`);
+  const { created } = await ensurePrivateBucket({ base, key });
+  console.log(created ? `Created the private bucket ${BUCKET}` : `The bucket ${BUCKET} is there and private`);
 
   let done = 0;
   const queue = [...files];
