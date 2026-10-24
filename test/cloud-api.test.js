@@ -1,5 +1,5 @@
 // The online version as the Edge Function runs it: createApp({ cloud: true }) behind the Cloudflare Pages
-// pass-through, which adds x-pass-secret, x-forwarded-for / -host / -proto. Started in this process on a new,
+// pass-through, which adds x-pass-secret, x-fs-client-ip / x-fs-host / x-fs-proto. Started in this process on a new,
 // empty in-memory database (PGlite) and a free port — never on real data.   node --test test/
 // The tests share ONE database and run top to bottom; the last one points the app at a database that isn't there.
 import { test, before, after } from 'node:test';
@@ -27,7 +27,7 @@ async function call(method, p, { body, as, secret = SECRET, ip = '192.0.2.1', ho
     headers: {
       ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
       ...(secret != null ? { 'x-pass-secret': secret } : {}),
-      'x-region': 'ap-southeast-2', 'x-forwarded-for': ip, 'x-forwarded-host': host, 'x-forwarded-proto': 'https',
+      'x-region': 'ap-southeast-2', 'x-fs-client-ip': ip, 'x-fs-host': host, 'x-fs-proto': 'https',
       ...(as ? { Cookie: `fs_session=${as}` } : {}), ...headers,
     },
     body: body === undefined ? undefined : JSON.stringify(body),
@@ -37,7 +37,7 @@ async function call(method, p, { body, as, secret = SECRET, ip = '192.0.2.1', ho
   try { json = JSON.parse(text); } catch { /* not json */ }
   const cookies = res.headers.getSetCookie();
   const cookie = cookies.map(c => /^fs_session=([^;]*)/.exec(c)?.[1]).filter(Boolean).pop();
-  return { status: res.status, json, text, cookies, cookie };
+  return { status: res.status, json, text, cookies, cookie, headers: res.headers };
 }
 const loginAs = (username, password, opts = {}) => call('POST', '/api/login', { body: { username, password }, ...opts });
 
@@ -76,7 +76,7 @@ test('request without the pass secret is refused (403)', async () => {
   } finally { await new Promise(r => bare.close(r)); }
 });
 
-test('with the pass secret, each x-forwarded-for address is throttled on its own (the first entry, not the socket)', async () => {
+test('with the pass secret, each x-fs-client-ip address is throttled on its own (the first entry, not the socket)', async () => {
   const A = '203.0.113.5', B = '198.51.100.7';
   // 30 wrong tries from A (different usernames, so it is the per-address lock that bites); Supabase's gateway
   // may add its own entries after the visitor's.
@@ -97,12 +97,33 @@ test('with the pass secret, each x-forwarded-for address is throttled on its own
   await auth.createThrottle().clear();
 });
 
-test('a trusted cloud request gets a Secure session cookie (x-forwarded-proto: https)', async () => {
+test('a trusted cloud request gets a Secure session cookie (x-fs-proto: https)', async () => {
   const r = await loginAs('boss', 'owner-pass-1');
   assert.equal(r.status, 200);
   const c = r.cookies.find(x => x.startsWith('fs_session='));
   assert.match(c, /; Secure$/);
   assert.match(c, /HttpOnly; SameSite=Lax/);
+});
+
+test('only x-fs-* are believed: the x-forwarded-* headers (as the Supabase gateway sends them) are never read', async () => {
+  const body = { username: 'boss', password: 'owner-pass-1' };
+  const forwardedOnly = { 'x-fs-client-ip': '', 'x-fs-host': '', 'x-fs-proto': '',
+    'x-forwarded-for': '203.0.113.200', 'x-forwarded-host': HOST, 'x-forwarded-proto': 'https' };
+  // the host check: x-forwarded-host does not count, so the change is refused
+  let r = await call('POST', '/api/login', { body, host: '', headers: forwardedOnly });
+  assert.equal(r.status, 403);
+  // the address and https: from x-fs-* only (the session is not Secure, and its address is not the x-forwarded-for one)
+  r = await call('POST', '/api/login', { body, headers: { 'x-fs-proto': 'http', 'x-forwarded-proto': 'https', 'x-forwarded-for': '203.0.113.201' }, ip: '192.0.2.55' });
+  assert.equal(r.status, 200, r.text);
+  assert.doesNotMatch(r.cookies.find(x => x.startsWith('fs_session=')), /Secure/);
+  assert.equal((await get('SELECT ip FROM sessions WHERE token_hash = ?', auth.tokenHash(r.cookie))).ip, '192.0.2.55');
+});
+
+test('every answer of the app carries the x-fs-app marker (the pass-through tells it from errors Supabase makes itself)', async () => {
+  for (const r of [await call('GET', '/api/me'), await call('GET', '/api/me', { secret: null }), await call('GET', '/api/nothing-here', { as: owner }),
+    await call('GET', '/api/me', { as: owner })]) {
+    assert.equal(r.headers.get('x-fs-app'), '1', String(r.status));
+  }
 });
 
 test('changes are checked against the forwarded host (ALLOWED_HOSTS), not the function\'s own', async () => {
@@ -185,6 +206,7 @@ test('the function entry: Supabase\'s path is the app\'s path, and the database 
     const port = s.address().port;
     let r = await fetch(`http://127.0.0.1:${port}/api/api/me`);
     assert.equal(r.status, 503);
+    assert.equal(r.headers.get('x-fs-app'), '1', 'our own answer: the pass-through passes it on as it is');
     assert.deepEqual(await r.json(), { error: ASLEEP });
     fail = false; // the database woke up: the next request tries again
     r = await fetch(`http://127.0.0.1:${port}/api/api/me`);

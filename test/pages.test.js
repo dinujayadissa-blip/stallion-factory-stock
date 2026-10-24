@@ -42,7 +42,8 @@ test('pass-through keeps cookies and body bytes', async () => {
     return new Response(got, { status: 201, headers: h });
   }, async seen => {
     const req = new Request('https://stallion-stock.pages.dev/api/import/dealer?x=1&y=2', {
-      method: 'POST', body: big, headers: { cookie: 'fs_session=tok', 'x-pass-secret': 'client-forged', 'content-type': 'application/pdf', 'cf-connecting-ip': '203.0.113.9' } });
+      method: 'POST', body: big, headers: { cookie: 'fs_session=tok', 'x-pass-secret': 'client-forged', 'content-type': 'application/pdf', 'cf-connecting-ip': '203.0.113.9',
+        'x-fs-client-ip': '198.51.100.66', 'x-fs-host': 'evil.example', 'x-fs-proto': 'http' } });
     const res = await forward(req, ENV_BASE);
     assert.equal(res.status, 201);
     assert.deepEqual(res.headers.getSetCookie(), ['a=1; Path=/; HttpOnly', 'b=2; Path=/; Max-Age=0']);
@@ -54,9 +55,12 @@ test('pass-through keeps cookies and body bytes', async () => {
     const h = new Headers(seen[0].init.headers);
     assert.equal(h.get('x-pass-secret'), ENV_BASE.PASS_SECRET, 'a secret sent by the browser is replaced, never passed on');
     assert.equal(h.get('x-region'), 'ap-southeast-2');
-    assert.equal(h.get('x-forwarded-host'), 'stallion-stock.pages.dev');
-    assert.equal(h.get('x-forwarded-for'), '203.0.113.9');
-    assert.equal(h.get('x-forwarded-proto'), 'https');
+    // the visitor's address, the public host and https go in our own headers (the Supabase gateway may change
+    // the x-forwarded-* ones); anything the browser sent under those names is replaced
+    assert.equal(h.get('x-fs-host'), 'stallion-stock.pages.dev');
+    assert.equal(h.get('x-fs-client-ip'), '203.0.113.9');
+    assert.equal(h.get('x-fs-proto'), 'https');
+    for (const x of ['x-forwarded-host', 'x-forwarded-for', 'x-forwarded-proto']) assert.equal(h.get(x), null, x);
     assert.equal(h.get('cookie'), 'fs_session=tok');
     assert.equal(h.get('content-type'), 'application/pdf');
     assert.equal(seen[0].init.method, 'POST');
@@ -70,10 +74,50 @@ test('pass-through for photos, and without the shared secret nothing is sent', a
     assert.equal(await res.text(), 'jpeg');
     assert.equal(seen[0].url, 'https://abc.supabase.co/functions/v1/api/photos/abc.jpg');
     assert.equal(seen[0].init.body, undefined, 'a GET has no body');
+    // a browser that sends our headers itself (and no cf-connecting-ip): they never reach the function
+    await forward(new Request('https://stallion-stock.pages.dev/api/me', { headers: { 'x-fs-client-ip': '198.51.100.66', 'x-fs-host': 'evil.example' } }), ENV_BASE);
+    const forged = new Headers(seen[1].init.headers);
+    assert.equal(forged.get('x-fs-client-ip'), null);
+    assert.equal(forged.get('x-fs-host'), 'stallion-stock.pages.dev');
     const none = await forward(page('/api/me'), { API_ORIGIN: ENV_BASE.API_ORIGIN });
     assert.equal(none.status, 500);
-    assert.equal(seen.length, 1, 'not forwarded');
+    assert.equal(seen.length, 2, 'not forwarded');
   });
+});
+
+// I2: the function not answering, or Supabase answering for it (a 5xx without the app's x-fs-app marker:
+// 502/503/504, 540 boot error, 546 resource limit): a plain JSON message, never Supabase's own error page.
+const ASLEEP = 'The database is asleep or unreachable — try again in a minute';
+test('pass-through: the function unreachable or failing outside the app gives a plain 503', async () => {
+  const thrown = await withFetch(() => { throw new TypeError('fetch failed'); }, () => forward(page('/api/stock'), ENV_BASE));
+  assert.equal(thrown.status, 503);
+  assert.match(thrown.headers.get('content-type'), /^application\/json/);
+  assert.deepEqual(await thrown.json(), { error: ASLEEP });
+  for (const [status, msg] of [[502, ASLEEP], [500, ASLEEP], [503, ASLEEP], [504, ASLEEP], [540, ASLEEP], [546, 'That took too long — try again']]) {
+    const res = await withFetch(() => new Response('<html>gateway error page</html>', { status, headers: { 'content-type': 'text/html' } }),
+      () => forward(page('/api/stock'), ENV_BASE));
+    assert.equal(res.status, 503, String(status));
+    assert.deepEqual(await res.json(), { error: msg }, String(status));
+    assert.equal(res.headers.get('cache-control'), 'no-store');
+  }
+  // the app's own answers (marked x-fs-app) pass through unchanged, errors included
+  for (const status of [500, 503, 404, 200]) {
+    const res = await withFetch(() => json(status, { error: `app says ${status}` }, { 'x-fs-app': '1' }), () => forward(page('/api/stock'), ENV_BASE));
+    assert.equal(res.status, status);
+    assert.deepEqual(await res.json(), { error: `app says ${status}` });
+  }
+});
+
+test('page gate: the session check failing outside the app gives the 503 page, the same message every way', async () => {
+  const MSG = "Can't reach the Factory Stock server just now. Wait a minute and reload.";
+  const thrown = await withFetch(() => { throw new TypeError('fetch failed'); },
+    () => gate({ request: page('/'), env: { ...ENV_BASE, ASSETS: assets() }, next }));
+  for (const res of [thrown, (await gateWith(new Response('x', { status: 546 }), '/')).res, (await gateWith(new Response('x', { status: 502 }), '/floor')).res,
+    (await gateWith(json(503, { error: ASLEEP }, { 'x-fs-app': '1' }), '/')).res]) {
+    assert.equal(res.status, 503);
+    assert.equal(await res.text(), MSG);
+    assert.equal(res.headers.get('cache-control'), 'no-store');
+  }
 });
 
 test('worker opening / is sent to /floor', async () => {
@@ -87,6 +131,7 @@ test('worker opening / is sent to /floor', async () => {
     const h = new Headers(seen[0].init.headers);
     assert.equal(h.get('cookie'), 'fs_session=abc');
     assert.equal(h.get('x-pass-secret'), ENV_BASE.PASS_SECRET);
+    assert.equal(h.get('x-fs-host'), 'stallion-stock.pages.dev');
   }
   // an office login gets the office app (no-store), /index.html goes to /
   const ok = await gateWith(meOf('owner'), '/');

@@ -31,7 +31,7 @@ export function edgeHandler({ open, app }) {
       await (opening ??= start());
     } catch (e) {
       console.error(new Date().toLocaleString('sv-SE'), 'The database could not be opened:', e?.cause?.message || e?.message || e);
-      res.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'x-fs-app': '1' });
       res.end(JSON.stringify({ error: ASLEEP }));
       return;
     }

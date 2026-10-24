@@ -25,7 +25,7 @@ let local, cloud, owner;
 // One request to one of the two servers; `as` = a session token (sent under the cookie name in use).
 // The cloud one is called as the Pages pass-through calls it (the pass secret, the host the visitor used).
 const PASS = 'server-test-pass-secret';
-const viaPages = { 'x-pass-secret': PASS, 'x-forwarded-host': '127.0.0.1', 'x-forwarded-for': '192.0.2.10' };
+const viaPages = { 'x-pass-secret': PASS, 'x-fs-host': '127.0.0.1', 'x-fs-client-ip': '192.0.2.10' };
 async function call(server, method, p, { body, as, headers = {} } = {}) {
   const res = await fetch(`http://127.0.0.1:${server.address().port}${p}`, {
     method, redirect: 'manual',

@@ -580,7 +580,8 @@ const LOOPBACK = /^(127\.\d{1,3}\.\d{1,3}\.\d{1,3}|::1|::ffff:127\.\d{1,3}\.\d{1
 export const isLoopback = addr => LOOPBACK.test(String(addr || ''));
 // A request that came through a proxy / tunnel (Cloudflare Tunnel, Tailscale serve…) arrives from this
 // PC too. Such headers never make a request trusted; they only rule out setup.
-const PROXY_HEADERS = ['x-forwarded-for', 'x-forwarded-host', 'x-real-ip', 'forwarded', 'cf-connecting-ip', 'true-client-ip', 'tailscale-user-login'];
+const PROXY_HEADERS = ['x-forwarded-for', 'x-forwarded-host', 'x-real-ip', 'forwarded', 'cf-connecting-ip', 'true-client-ip', 'tailscale-user-login',
+  'x-fs-client-ip', 'x-fs-host', 'x-pass-secret'];
 // In the cloud (CLOUD=1) no request is ever "this PC", so first-time setup is off: the first owner is made with
 // `npm run users -- add <username> owner` against the cloud database.
 export const fromThisPc = req => !inCloud() && isLoopback(req.socket?.remoteAddress) && !PROXY_HEADERS.some(h => req.headers?.[h] != null);

@@ -9,7 +9,7 @@
 // Every page answer is Cache-Control: no-store. Who is logged in comes from the server itself: GET /api/me with the
 // browser's cookie (200 = user.mustChange + can.officeApp, 401 = not logged in, { ended: true } when the session
 // had ended). Everything else (files, /api, /photos) passes on untouched.
-import { apiUrl, upstreamHeaders, notConfigured, NOT_CONFIGURED } from './_forward.js';
+import { apiUrl, upstreamHeaders, notConfigured, NOT_CONFIGURED, outsideError } from './_forward.js';
 
 const SECURITY = { 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'same-origin', 'X-Frame-Options': 'SAMEORIGIN' };
 
@@ -50,10 +50,13 @@ export async function onRequest({ request, env, next }) {
   if (login) return pageAnswer(await serve('/login'));
 
   if (notConfigured(env)) return text(500, NOT_CONFIGURED);
+  // The function unreachable, Supabase answering in its place (a 5xx without the app's x-fs-app marker, see
+  // _forward.js), the app's own error, or an answer that isn't a session check: one plain 503 page, whichever.
   let me = null, body = null;
   try {
     me = await fetch(apiUrl(env, '/api/me'), { method: 'GET', headers: upstreamHeaders(request, env), redirect: 'manual' });
-    if ([200, 401, 403].includes(me.status)) body = await me.json().catch(() => null);
+    if (outsideError(me)) me = null;
+    else if ([200, 401, 403].includes(me.status)) body = await me.json().catch(() => null);
   } catch { me = null; }
   if (!me || ![200, 401, 403].includes(me.status) || (me.status === 200 && !body?.user)) {
     return text(503, "Can't reach the Factory Stock server just now. Wait a minute and reload.");

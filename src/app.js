@@ -6,7 +6,10 @@
 // Cloudflare Pages, not from here; first-time setup and plan import are refused (410); GET /api/me says
 // cloud: true. It runs as a Supabase Edge Function (src/edge.js) that only Cloudflare Pages may call: every
 // request must carry x-pass-secret = PASS_SECRET (else 403), and only then are the visitor's address
-// (x-forwarded-for, first entry), the public host name (x-forwarded-host) and https (x-forwarded-proto) believed.
+// (x-fs-client-ip), the public host name (x-fs-host) and https (x-fs-proto) believed. Those are our own
+// headers, set by the pass-through (functions/_forward.js): the x-forwarded-* ones are never read online, as
+// Supabase's gateway in between may add to or replace them.
+// Every answer carries x-fs-app: 1, so the pass-through can tell the app's own errors from Supabase's.
 //
 // One writer at a time: every change (POST / PUT / PATCH / DELETE, through h()) runs inside one writeTx —
 // the global write lock, one transaction, one data_version bump — and the stock movements it made are
@@ -126,6 +129,7 @@ export function createApp({ cloud = false, passSecret = process.env.PASS_SECRET 
   app.set('trust proxy', process.env.TRUST_PROXY === '1' ? 'loopback' : false);
   app.disable('x-powered-by');
   app.use((req, res, next) => {
+    res.setHeader('x-fs-app', '1'); // (see the top)
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Referrer-Policy', 'same-origin');
     res.setHeader('X-Frame-Options', 'SAMEORIGIN');
@@ -145,9 +149,9 @@ export function createApp({ cloud = false, passSecret = process.env.PASS_SECRET 
         return res.status(403).json({ error: 'Please use the Factory Stock app' });
       }
       req.viaPages = {
-        ip: firstOf(req.headers['x-forwarded-for']),
-        host: firstOf(req.headers['x-forwarded-host']),
-        https: firstOf(req.headers['x-forwarded-proto']).toLowerCase() === 'https',
+        ip: firstOf(req.headers['x-fs-client-ip']),
+        host: firstOf(req.headers['x-fs-host']),
+        https: firstOf(req.headers['x-fs-proto']).toLowerCase() === 'https',
       };
       next();
     });

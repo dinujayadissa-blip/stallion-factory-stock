@@ -336,7 +336,7 @@ This part is for Claude or another helper. The owner can skip it.
 
 ### How it fits together
 
-Browser or app -> Cloudflare Pages `stallion-stock.pages.dev` (the screens, plus a pass-through that adds `x-pass-secret`, `x-forwarded-host`, `x-forwarded-for` and `x-forwarded-proto`) -> one Supabase Edge Function `api` (`supabase/functions/api`, which runs `src/app.js` with `CLOUD=1`) -> Postgres (Sydney) and the private Storage bucket `item-photos`. Locally the same code runs on PGlite.
+Browser or app -> Cloudflare Pages `stallion-stock.pages.dev` (the screens, plus a pass-through that adds `x-pass-secret` and our own `x-fs-host`, `x-fs-client-ip` and `x-fs-proto`; the function reads those only when the secret matches, never `x-forwarded-*`. A 5xx that is not marked `x-fs-app: 1` is Supabase's, not the app's, and the pass-through turns it into a plain 503 message) -> one Supabase Edge Function `api` (`supabase/functions/api`, which runs `src/app.js` with `CLOUD=1`) -> Postgres (Sydney) and the private Storage bucket `item-photos`. Locally the same code runs on PGlite.
 
 ### Secrets by name (none are stored in the repo)
 
@@ -376,9 +376,9 @@ powershell -ExecutionPolicy Bypass -File scripts\deploy-pages.ps1
 
 Variable changes in Cloudflare only take effect on the next deploy.
 
-### Check the client address survives the Supabase gateway
+### Check the client address reaches the app
 
-After the first deploy, log in from two phones on different networks and read the function logs (Supabase dashboard > Edge Functions > api > Logs). The line `Logged in: <username> (<role>) from <ip>` must show **two different, real public addresses**. If every login shows the same address (or a Cloudflare or Supabase one), the gateway is replacing or dropping `x-forwarded-for` / `x-forwarded-host` / `x-forwarded-proto`: the login throttle would lock everyone together, the host check would refuse changes and cookies would lack `Secure`. Fall back to custom headers (for example `x-fs-client-ip`, `x-fs-host`) set in `functions/_forward.js` and read in `src/app.js` (`clientIp`, `hostOf`, `secure`), with a test. Also check, logged out, that `/index.html`, `//index.html`, `/%69ndex.html` and `/floor.html` go to `/login`, and that a worker opening `/` lands on `/floor`.
+After the first deploy, log in from two phones on different networks and read the function logs (Supabase dashboard > Edge Functions > api > Logs). The line `Logged in: <username> (<role>) from <ip>` must show **two different, real public addresses**. If every login shows the same address (or a Cloudflare or Supabase one), something on the way is dropping or replacing the `x-fs-client-ip` / `x-fs-host` / `x-fs-proto` headers (set in `functions/_forward.js`, read in `src/app.js`: `clientIp`, `hostOf`, `secure`): the login throttle would lock everyone together, the host check would refuse changes and cookies would lack `Secure`. Stop and fix that before staff use it. Also check, logged out, that `/index.html`, `//index.html`, `/%69ndex.html` and `/floor.html` go to `/login`, and that a worker opening `/` lands on `/floor`.
 
 ### Cut-over commands (owner's PowerShell, values set as in step 2)
 
