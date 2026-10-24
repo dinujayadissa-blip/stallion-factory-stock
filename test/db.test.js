@@ -2,7 +2,10 @@
 import { test, beforeEach, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { freshDb } from './helpers.js';
-import { get, run, insert, tx, writeTx, inTx, dataVersion, closeDb } from '../src/db.js';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { get, all, run, insert, tx, writeTx, inTx, dataVersion, closeDb } from '../src/db.js';
 
 beforeEach(freshDb);
 after(closeDb);
@@ -146,4 +149,43 @@ test('migrate builds an empty database once, and leaves a built one alone', asyn
   assert.equal(await dataVersion(), '0');
   assert.equal(await count('items'), 0);
   assert.equal(await migrate(), false);
+});
+
+// C1: Supabase's Data API (PostgREST / GraphQL) answers as the roles anon / authenticated, which by default get
+// every right on every new table in public. 0002_lock_down.sql turns row level security on everywhere (no
+// policies: those roles see nothing; the postgres owner the app, the copy and the backup use is not affected)
+// and takes their rights away.
+test('every public table has row level security on (0002_lock_down)', async () => {
+  const off = await all(`SELECT c.relname AS t FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p') AND NOT c.relrowsecurity ORDER BY 1`);
+  assert.deepEqual(off.map(r => r.t), []);
+  assert.ok((await get(`SELECT COUNT(*) AS n FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public' AND c.relkind = 'r'`)).n >= 19, 'the tables are there');
+  // the app (the owner) still reads and writes
+  await newItem('RLS1');
+  assert.equal(await count('items'), 1);
+});
+
+test('with Supabase\'s roles present, anon / authenticated lose every right (0002_lock_down)', async () => {
+  const { openDb } = await import('../src/db.js');
+  await openDb({ pgliteDir: 'memory://' });
+  // as on a new Supabase project: the roles, and default rights on everything made in public
+  await run(`CREATE ROLE anon NOLOGIN; CREATE ROLE authenticated NOLOGIN;
+    GRANT USAGE ON SCHEMA public TO anon, authenticated;
+    ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO anon, authenticated;
+    ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO anon, authenticated;
+    ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON FUNCTIONS TO anon, authenticated;`);
+  const dir = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'supabase', 'migrations');
+  for (const f of fs.readdirSync(dir).filter(f => f.endsWith('.sql')).sort()) await run(fs.readFileSync(path.join(dir, f), 'utf8'));
+  for (const role of ['anon', 'authenticated']) {
+    const tables = await all(`SELECT table_name AS t FROM information_schema.role_table_grants
+      WHERE grantee = ? AND table_schema = 'public'`, role);
+    assert.deepEqual(tables, [], `${role} has no table rights`);
+    assert.equal((await get(`SELECT has_table_privilege(?, 'public.users', 'SELECT') AS ok`, role)).ok, false);
+    assert.equal((await get(`SELECT has_table_privilege(?, 'public.sessions', 'INSERT') AS ok`, role)).ok, false);
+    assert.equal((await get(`SELECT has_sequence_privilege(?, pg_get_serial_sequence('public.items', 'id'), 'USAGE') AS ok`, role)).ok, false);
+    // a table made by a later migration gets nothing either
+    await run(`CREATE TABLE IF NOT EXISTS later_one (id int)`);
+    assert.equal((await get(`SELECT has_table_privilege(?, 'public.later_one', 'SELECT') AS ok`, role)).ok, false);
+  }
 });

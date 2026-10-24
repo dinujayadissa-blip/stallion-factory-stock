@@ -364,6 +364,8 @@ curl.exe -i -H "x-pass-secret: <secret>" https://<ref>.supabase.co/functions/v1/
 curl.exe -i https://<ref>.supabase.co/functions/v1/api/api/me                                    # 403
 ```
 
+**Turn off Supabase's Data API (owner clicks, once).** Factory Stock never uses it, and `supabase/migrations/0002_lock_down.sql` already shuts every table to it (row level security on, no rights for `anon` / `authenticated`); this is the second lock. In the Supabase dashboard: **Project Settings**, then **Data API** (it may be called **API**, or sit under **Integrations**). Turn the Data API **off** (the switch may be labelled "Enable Data API"); if there is no such switch, empty the **Exposed schemas** list (remove `public`) and save. Supabase moves these screens now and then: look for "Data API" or "Exposed schemas". Check: `curl.exe -i https://<ref>.supabase.co/rest/v1/users -H "apikey: <the anon / publishable key>"` must not return any rows (an error or `[]` is right).
+
 The private `item-photos` bucket must exist before the copy uploads photos (`scripts/restore-photos.mjs` creates it if missing; check the migrations or create it in the dashboard, Storage, private).
 
 The screens: create the project once (`npx wrangler pages project create stallion-stock --production-branch main`), the owner saves `API_ORIGIN` and `PASS_SECRET` in Cloudflare, then:
