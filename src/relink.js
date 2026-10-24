@@ -5,7 +5,10 @@
 // ("Belair 3400", "2 x300 Amp Lithium"). This file holds the reviewed list of such matches and the
 // one routine that moves a line from a placeholder onto a real item — used by the start-up clean-up
 // (tidy.js), by future plan imports, and by the office's "Link to a real part" button.
-import { all, get, run, tx, logAlloc } from './db.js';
+//
+// Database access is async (Postgres). Everything that queries is an async function; the pure helpers
+// (constants, text matching, notes) stay synchronous. Any write starts with writeTx.
+import { all, get, run, insert, writeTx, logAlloc, dataVersion } from './db.js';
 
 // Reviewed table: a line on `fromSku` whose plan text matches `re` is really `toSku`.
 export const RELINKS = [
@@ -101,18 +104,20 @@ export function relinkTarget(fromSku, spec) {
 
 // Create the recurring parts that don't exist yet. Returns the SKUs created.
 export function ensureNewItems() {
-  const made = [];
-  for (const n of NEW_ITEMS) {
-    if (get('SELECT 1 FROM items WHERE sku = ?', n.sku)) continue;
-    const ph = get('SELECT * FROM items WHERE sku = ?', n.from);
-    const sameCol = ph?.plan_column
-      ? get(`SELECT trade FROM items WHERE plan_column = ? AND placeholder = 0 AND sku NOT LIKE 'PLAN-%' AND trade <> '' LIMIT 1`, ph.plan_column) : null;
-    run(`INSERT INTO items(sku, name, category, supplier, unit, kind, plan_column, trade, notes)
-         VALUES(?, ?, ?, ?, 'ea', ?, ?, ?, 'Added by the stock clean-up: comes up often on the production plan')`,
-        n.sku, n.name, n.category, n.supplier || '', n.kind || 'stock', ph?.plan_column || '', sameCol?.trade || ph?.trade || '');
-    made.push(n.sku);
-  }
-  return made;
+  return writeTx(async () => {
+    const made = [];
+    for (const n of NEW_ITEMS) {
+      if (await get('SELECT 1 FROM items WHERE sku = ?', n.sku)) continue;
+      const ph = await get('SELECT * FROM items WHERE sku = ?', n.from);
+      const sameCol = ph?.plan_column
+        ? await get(`SELECT trade FROM items WHERE plan_column = ? AND placeholder = 0 AND sku NOT ILIKE 'PLAN-%' AND trade <> '' LIMIT 1`, ph.plan_column) : null;
+      await run(`INSERT INTO items(sku, name, category, supplier, unit, kind, plan_column, trade, notes)
+           VALUES(?, ?, ?, ?, 'ea', ?, ?, ?, 'Added by the stock clean-up: comes up often on the production plan')`,
+          n.sku, n.name, n.category, n.supplier || '', n.kind || 'stock', ph?.plan_column || '', sameCol?.trade || ph?.trade || '');
+      made.push(n.sku);
+    }
+    return made;
+  });
 }
 
 const norm = s => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
@@ -189,37 +194,37 @@ const nothingMoves = (m, l) => Math.max(0, Math.min(m.want, Number(l.from_on_han
 //  4. Open PO lines for this van on the placeholder move to the real item.
 // Returns { result: 'linked' | 'merged' | 'duplicate' | 'skipped', into?, moved? }.
 export function linkLine(lineId, toItemId, { reason = 'link', worker = '', force = false, why = '' } = {}) {
-  return tx(() => {
-    const l = get(`SELECT l.*, i.sku AS from_sku, i.name AS from_name, i.on_hand AS from_on_hand, i.placeholder, v.chassis,
+  return writeTx(async () => {
+    const l = await get(`SELECT l.*, i.sku AS from_sku, i.name AS from_name, i.on_hand AS from_on_hand, i.placeholder, v.chassis,
                      i.plan_column AS from_col, i.category AS from_cat
                    FROM van_lines l JOIN items i ON i.id = l.item_id JOIN vans v ON v.id = l.van_id WHERE l.id = ?`, lineId);
     if (!l) throw Object.assign(new Error('That part line no longer exists — refresh'), { status: 404 });
     if (!l.placeholder && !isPlaceholderSku(l.from_sku)) return { result: 'skipped' };
-    const to = get('SELECT * FROM items WHERE id = ?', toItemId);
+    const to = await get('SELECT * FROM items WHERE id = ?', toItemId);
     if (!to) throw Object.assign(new Error('Pick a part from the list'), { status: 400 });
     if (to.id === l.item_id || to.placeholder || isPlaceholderSku(to.sku)) throw Object.assign(new Error('Pick a real part, not another "as per plan" one'), { status: 400 });
     const base = { van_id: l.van_id, item_id: l.item_id, line_id: l.id, worker };
 
     // 3. stock: only what is set aside on this line, never more than the placeholder has.
-    const moveStock = qty => {
+    const moveStock = async qty => {
       const q = Math.max(0, Math.min(qty, l.from_on_hand));
       if (q <= 0) return 0;
       const note = `Re-linked from ${l.from_sku}`;
-      run('UPDATE items SET on_hand = on_hand - ? WHERE id = ?', q, l.item_id);
-      run('UPDATE items SET on_hand = on_hand + ? WHERE id = ?', q, to.id);
-      run(`INSERT INTO movements(item_id, qty, type, van_id, ref, note, worker) VALUES(?, ?, 'adjust', ?, ?, ?, ?)`, l.item_id, -q, l.van_id, l.chassis, `${note} to ${to.sku}`, worker);
-      run(`INSERT INTO movements(item_id, qty, type, van_id, ref, note, worker) VALUES(?, ?, 'adjust', ?, ?, ?, ?)`, to.id, q, l.van_id, l.chassis, note, worker);
-      logAlloc(reason, { ...base, field: 'on_hand moved', before: `${l.from_sku} ${q}`, after: `${to.sku} +${q}` });
+      await run('UPDATE items SET on_hand = on_hand - ? WHERE id = ?', q, l.item_id);
+      await run('UPDATE items SET on_hand = on_hand + ? WHERE id = ?', q, to.id);
+      await run(`INSERT INTO movements(item_id, qty, type, van_id, ref, note, worker) VALUES(?, ?, 'adjust', ?, ?, ?, ?)`, l.item_id, -q, l.van_id, l.chassis, `${note} to ${to.sku}`, worker);
+      await run(`INSERT INTO movements(item_id, qty, type, van_id, ref, note, worker) VALUES(?, ?, 'adjust', ?, ?, ?, ?)`, to.id, q, l.van_id, l.chassis, note, worker);
+      await logAlloc(reason, { ...base, field: 'on_hand moved', before: `${l.from_sku} ${q}`, after: `${to.sku} +${q}` });
       return q;
     };
     // 4. open PO lines for this van
-    const movePOs = () => {
-      const n = run('UPDATE po_lines SET item_id = ? WHERE van_id = ? AND item_id = ?', to.id, l.van_id, l.item_id).changes;
-      if (n) logAlloc(reason, { ...base, field: 'po_lines', before: l.from_sku, after: to.sku, note: `${n} PO line(s) moved` });
+    const movePOs = async () => {
+      const n = (await run('UPDATE po_lines SET item_id = ? WHERE van_id = ? AND item_id = ?', to.id, l.van_id, l.item_id)).changes;
+      if (n) await logAlloc(reason, { ...base, field: 'po_lines', before: l.from_sku, after: to.sku, note: `${n} PO line(s) moved` });
     };
 
     // 1. double-demand check
-    const existing = get('SELECT * FROM van_lines WHERE van_id = ? AND item_id = ? AND id <> ? ORDER BY id LIMIT 1', l.van_id, to.id, l.id);
+    const existing = await get('SELECT * FROM van_lines WHERE van_id = ? AND item_id = ? AND id <> ? ORDER BY id LIMIT 1', l.van_id, to.id, l.id);
     if (existing) {
       const into = { id: existing.id, name: to.name, sku: to.sku, qty: existing.qty, spec: existing.spec, plan_column: existing.plan_column };
       // Round 4 (check-r3-1): both lines already had a delivery for this van → probably different parts:
@@ -228,8 +233,8 @@ export function linkLine(lineId, toItemId, { reason = 'link', worker = '', force
       if ((!sameNeed(existing, l) || different) && !force) {
         const flag = different ? diffFlag(to.name, existing) : dupFlag(to.name, existing);
         if (!String(l.note).includes(flag)) {
-          run('UPDATE van_lines SET note = ? WHERE id = ?', appendNote(l.note, flag), l.id);
-          logAlloc(reason, { ...base, field: 'flag', before: l.from_sku, after: to.sku, note: `${flag} (${to.sku}, ${existing.qty} needed there) – left as "to confirm"` });
+          await run('UPDATE van_lines SET note = ? WHERE id = ?', appendNote(l.note, flag), l.id);
+          await logAlloc(reason, { ...base, field: 'flag', before: l.from_sku, after: to.sku, note: `${flag} (${to.sku}, ${existing.qty} needed there) – left as "to confirm"` });
         }
         return { result: 'duplicate', into: existing.id, into_line: into, different: different ? 1 : 0 };
       }
@@ -243,12 +248,12 @@ export function linkLine(lineId, toItemId, { reason = 'link', worker = '', force
       // stays "to confirm" with one plain note, and the office is told why.
       if (nothingMoves(m, l)) {
         const flag = NOTHING_MOVED_NOTE(to.name, existing);
-        if (!String(l.note || '').includes(flag)) run('UPDATE van_lines SET note = ? WHERE id = ?', appendNote(l.note, flag), l.id);
-        logAlloc(reason, { ...base, field: 'flag', before: l.from_sku, after: to.sku,
+        if (!String(l.note || '').includes(flag)) await run('UPDATE van_lines SET note = ? WHERE id = ?', appendNote(l.note, flag), l.id);
+        await logAlloc(reason, { ...base, field: 'flag', before: l.from_sku, after: to.sku,
           note: `merge asked${why ? ` (${why})` : ''}: ${NOTHING_MOVED} – left as "to confirm"` });
         return { result: 'kept', into: existing.id, into_line: into, moved: 0, kept: l.reserved, message: NOTHING_MOVED };
       }
-      const moved = moveStock(m.want);
+      const moved = await moveStock(m.want);
       const firmMoved = Math.min(l.reserved_firm, moved);
       const { issued, qty } = m;
       const reserved = existing.reserved + moved;
@@ -262,39 +267,39 @@ export function linkLine(lineId, toItemId, { reason = 'link', worker = '', force
       // Round 4 (check-r3-3): the plan line's column is coloured from this line from now on.
       const ownCol = existing.plan_column || to.plan_column || to.category;
       const cols = withMergedCols(existing.merged_cols, ownCol, l.plan_column || l.from_col || l.from_cat, mergedCols(l.merged_cols));
-      run(`UPDATE van_lines SET qty = ?, issued = ?, reserved = ?, reserved_firm = MIN(?, reserved_firm + ?), note = ?,
-             po_ref = CASE WHEN po_ref = '' THEN ? WHEN ? = '' OR instr(po_ref, ?) > 0 THEN po_ref ELSE po_ref || ', ' || ? END,
-             urgent = MAX(urgent, ?), merged_cols = ? WHERE id = ?`,
+      await run(`UPDATE van_lines SET qty = ?, issued = ?, reserved = ?, reserved_firm = LEAST(?::double precision, reserved_firm + ?), note = ?,
+             po_ref = CASE WHEN po_ref = '' THEN ?::text WHEN ?::text = '' OR strpos(po_ref, ?::text) > 0 THEN po_ref ELSE po_ref || ', ' || ?::text END,
+             urgent = GREATEST(urgent, ?::integer), merged_cols = ? WHERE id = ?`,
           qty, issued, reserved, reserved, firmMoved, note, l.po_ref, l.po_ref, l.po_ref, l.po_ref, l.urgent || 0, cols, existing.id);
       const keptText = keep > 1e-9 ? `${fmt(keep)} ${keepFirm > 1e-9 ? 'received for this van' : 'set aside'} stays on the plan line – to check` : '';
-      logAlloc(reason, { ...base, line_id: existing.id, item_id: to.id, field: 'merged',
+      await logAlloc(reason, { ...base, line_id: existing.id, item_id: to.id, field: 'merged',
         before: `${fromText} on ${l.from_sku}: need ${l.qty}, set aside ${l.reserved}, fitted ${l.issued}`,
         after: `this van's ${to.name} line${existing.plan_column ? ` (for: ${existing.plan_column})` : ''}: need ${existing.qty} → ${qty}, set aside ${reserved}, fitted ${issued}`,
         note: [why, keptText].filter(Boolean).join(' · '),
         // when the plan line stays, its history stays with it: say here what this line gained
         ...(keep > 1e-9 ? { change: moved, firm_change: firmMoved } : {}) });
-      movePOs();
+      await movePOs();
       if (keep > 1e-9) {
         // Kept, holding what the van's line has no room for: not free stock, not handed to another van
         // (locked part stays locked), listed with the special parts to confirm until someone decides.
         const keepNote = appendNote(l.note, `to check: ${fmt(keep)} ${keepFirm > 1e-9 ? 'received for this van' : 'set aside'} stays on this line – merged with this van's "${to.name}" line, but probably a different part`);
-        run('UPDATE van_lines SET qty = ?, reserved = ?, reserved_firm = ?, issued = 0, note = ? WHERE id = ?', keep, keep, keepFirm, keepNote, l.id);
-        if (moved > 1e-9 || l.issued > 1e-9 || Math.abs(keep - l.qty) > 1e-9) logAlloc(reason, { ...base, field: 'reserved', before: l.reserved, after: keep, change: keep - l.reserved, firm_change: keepFirm - l.reserved_firm,
+        await run('UPDATE van_lines SET qty = ?, reserved = ?, reserved_firm = ?, issued = 0, note = ? WHERE id = ?', keep, keep, keepFirm, keepNote, l.id);
+        if (moved > 1e-9 || l.issued > 1e-9 || Math.abs(keep - l.qty) > 1e-9) await logAlloc(reason, { ...base, field: 'reserved', before: l.reserved, after: keep, change: keep - l.reserved, firm_change: keepFirm - l.reserved_firm,
           note: `need ${fmt(l.qty)} → ${fmt(keep)}, fitted ${fmt(l.issued)} → 0 (moved to this van's ${to.name} line); ${keptText}` });
         return { result: 'merged', into: existing.id, into_line: into, moved, kept: keep };
       }
-      run('UPDATE allocation_log SET line_id = ? WHERE line_id = ?', existing.id, l.id);
-      run('DELETE FROM van_lines WHERE id = ?', l.id);
+      await run('UPDATE allocation_log SET line_id = ? WHERE line_id = ?', existing.id, l.id);
+      await run('DELETE FROM van_lines WHERE id = ?', l.id);
       return { result: 'merged', into: existing.id, into_line: into, moved };
     }
 
     // 2. re-point the line
-    const moved = moveStock(l.reserved);
+    const moved = await moveStock(l.reserved);
     const reserved = Math.min(l.reserved, moved); // can't keep more set aside than actually moved
-    run(`UPDATE van_lines SET item_id = ?, reserved = ?, note = ? WHERE id = ?`, to.id, reserved, appendNote(l.note, `was ${l.from_sku}`), l.id);
-    logAlloc(reason, { ...base, field: 'item', before: `${l.from_sku}${l.spec ? ` (${l.spec})` : ''}`, after: `${to.sku} – ${to.name}`,
+    await run(`UPDATE van_lines SET item_id = ?, reserved = ?, note = ? WHERE id = ?`, to.id, reserved, appendNote(l.note, `was ${l.from_sku}`), l.id);
+    await logAlloc(reason, { ...base, field: 'item', before: `${l.from_sku}${l.spec ? ` (${l.spec})` : ''}`, after: `${to.sku} – ${to.name}`,
       note: `need ${l.qty}, set aside ${reserved}, fitted ${l.issued}${why ? ` · ${why}` : ''}` });
-    movePOs();
+    await movePOs();
     return { result: 'linked', moved };
   });
 }
@@ -304,32 +309,35 @@ export function linkLine(lineId, toItemId, { reason = 'link', worker = '', force
 // part with the same need: this line is folded into it — one part ordered, not two), 'duplicate' (the van
 // already has a line for that part with a different amount or text: left "to confirm" unless the office
 // says merge anyway) or 'skipped' (already a real part). `into` describes the van's existing line.
-export function linkPreview(lineIds, itemId) {
-  const to = get('SELECT id, sku, name, placeholder FROM items WHERE id = ?', itemId);
+export async function linkPreview(lineIds, itemId) {
+  const to = await get('SELECT id, sku, name, placeholder FROM items WHERE id = ?', itemId);
   if (!to) throw Object.assign(new Error('Pick a part from the list'), { status: 400 });
-  return lineIds.map(id => {
-    const l = get(`SELECT l.*, i.sku AS from_sku, i.name AS from_name, i.on_hand AS from_on_hand, i.placeholder, v.chassis
+  const results = [];
+  for (const id of lineIds) results.push(await previewLine(id, to));
+  return results;
+}
+async function previewLine(id, to) {
+  const l = await get(`SELECT l.*, i.sku AS from_sku, i.name AS from_name, i.on_hand AS from_on_hand, i.placeholder, v.chassis
                    FROM van_lines l JOIN items i ON i.id = l.item_id JOIN vans v ON v.id = l.van_id WHERE l.id = ?`, id);
-    if (!l) return { line_id: id, result: 'gone' };
-    const out = { line_id: l.id, van_id: l.van_id, chassis: l.chassis, plan_line: planLineName(l.plan_column, l.from_name), spec: l.spec, qty: l.qty };
-    if (!l.placeholder && !isPlaceholderSku(l.from_sku)) return { ...out, result: 'skipped' };
-    const e = get('SELECT * FROM van_lines WHERE van_id = ? AND item_id = ? AND id <> ? ORDER BY id LIMIT 1', l.van_id, to.id, l.id);
-    if (!e) return { ...out, result: 'link' };
-    // Same sums as linkLine (mergeSums): the van's line keeps the larger need (`qty_after`, round 4
-    // check-r3-2: "need 1 → need 3"); what it has room for moves across (`moved`); the rest stays on the
-    // plan line marked "to check" (`kept`, check-r3-1) — it never becomes free shelf stock of the part.
-    // `different`: both lines already had a delivery for this van — probably different parts.
-    const m = mergeSums(e, l);
-    const moved = Math.max(0, Math.min(m.want, l.from_on_hand));
-    const kept = Math.max(0, l.reserved - moved);
-    const different = bothReceived(l, e);
-    // nothing = 1: a merge would move nothing and keep the whole plan line (check-r4-1) — linkLine then
-    // leaves both lines as they are and says so.
-    return { ...out, result: sameNeed(e, l) && !different ? 'merge' : 'duplicate', different: different ? 1 : 0,
-      nothing: nothingMoves(m, l) ? 1 : 0, moved, kept, kept_firm: Math.min(kept, Math.max(0, l.reserved_firm - Math.min(l.reserved_firm, moved))), freed: 0, qty_after: m.qty,
-      into: { id: e.id, name: to.name, sku: to.sku, qty: e.qty, spec: e.spec, plan_column: e.plan_column, issued: e.issued, reserved: e.reserved,
-        reserved_firm: e.reserved_firm } };
-  });
+  if (!l) return { line_id: id, result: 'gone' };
+  const out = { line_id: l.id, van_id: l.van_id, chassis: l.chassis, plan_line: planLineName(l.plan_column, l.from_name), spec: l.spec, qty: l.qty };
+  if (!l.placeholder && !isPlaceholderSku(l.from_sku)) return { ...out, result: 'skipped' };
+  const e = await get('SELECT * FROM van_lines WHERE van_id = ? AND item_id = ? AND id <> ? ORDER BY id LIMIT 1', l.van_id, to.id, l.id);
+  if (!e) return { ...out, result: 'link' };
+  // Same sums as linkLine (mergeSums): the van's line keeps the larger need (`qty_after`, round 4
+  // check-r3-2: "need 1 → need 3"); what it has room for moves across (`moved`); the rest stays on the
+  // plan line marked "to check" (`kept`, check-r3-1) — it never becomes free shelf stock of the part.
+  // `different`: both lines already had a delivery for this van — probably different parts.
+  const m = mergeSums(e, l);
+  const moved = Math.max(0, Math.min(m.want, l.from_on_hand));
+  const kept = Math.max(0, l.reserved - moved);
+  const different = bothReceived(l, e);
+  // nothing = 1: a merge would move nothing and keep the whole plan line (check-r4-1) — linkLine then
+  // leaves both lines as they are and says so.
+  return { ...out, result: sameNeed(e, l) && !different ? 'merge' : 'duplicate', different: different ? 1 : 0,
+    nothing: nothingMoves(m, l) ? 1 : 0, moved, kept, kept_firm: Math.min(kept, Math.max(0, l.reserved_firm - Math.min(l.reserved_firm, moved))), freed: 0, qty_after: m.qty,
+    into: { id: e.id, name: to.name, sku: to.sku, qty: e.qty, spec: e.spec, plan_column: e.plan_column, issued: e.issued, reserved: e.reserved,
+      reserved_firm: e.reserved_firm } };
 }
 
 // ───────── suggestions for "Special parts to confirm" (round 2, user-r1-2) ─────────
@@ -364,12 +372,12 @@ const wordHit = (w, list) => list.some(x => x === w || (w.length >= 4 && x.lengt
 
 // Real parts a catch-all may be linked to (not catch-alls, not one-off parts made for one van).
 export const linkableItems = () => all(`SELECT id, sku, name, supplier, plan_column, category FROM items
-  WHERE active = 1 AND placeholder = 0 AND sku NOT LIKE 'PLAN-%' AND sku NOT LIKE 'ONEOFF-%'`);
+  WHERE active = 1 AND placeholder = 0 AND sku NOT ILIKE 'PLAN-%' AND sku NOT ILIKE 'ONEOFF-%'`);
 
 // What people linked before: catch-all + same text → one part (only when they always picked the same one).
-export function learnedLinks() {
+export async function learnedLinks() {
   const by = new Map();
-  for (const r of all(`SELECT a.before, a.after, v.chassis FROM allocation_log a LEFT JOIN vans v ON v.id = a.van_id
+  for (const r of await all(`SELECT a.before, a.after, v.chassis FROM allocation_log a LEFT JOIN vans v ON v.id = a.van_id
                        WHERE a.reason IN ('link', 'link many') AND a.field = 'item' ORDER BY a.id`)) {
     const m = /^(PLAN-[^\s(]+)(?: \((.*)\))?$/s.exec(String(r.before || ''));
     const to = /^(\S+) – /.exec(String(r.after || ''));
@@ -385,10 +393,10 @@ export function learnedLinks() {
 
 // Parts the same plan cell already became on this van (the import split "Roller Rocker + DO35" into the
 // DO35 hitch + a suspension catch-all): never suggested for the catch-all — it is the OTHER part.
-export function cellSiblings(lineIds) {
+export async function cellSiblings(lineIds) {
   const out = new Map();
   if (!lineIds.length) return out;
-  for (const r of all(`SELECT l.id, o.item_id FROM van_lines l JOIN van_lines o ON o.van_id = l.van_id AND o.id <> l.id
+  for (const r of await all(`SELECT l.id, o.item_id FROM van_lines l JOIN van_lines o ON o.van_id = l.van_id AND o.id <> l.id
                          AND o.plan_column = l.plan_column AND o.spec = l.spec
                        WHERE l.id IN (${lineIds.map(() => '?').join(',')})`, ...lineIds)) {
     if (!out.has(r.id)) out.set(r.id, new Set());
@@ -404,8 +412,11 @@ export function cellSiblings(lineIds) {
 // `exclude`: item ids the same plan cell already became on this van (cellSiblings).
 // `onVan`: the van's other real parts (vanParts) — a part the van already has is never suggested
 // (round 3, user-r2-3: it would be ordered twice); suggestFor() says "This van already has … – same thing?".
-export function suggestLink(line, items = linkableItems(), learned = learnedLinks(), exclude = line.id ? cellSiblings([line.id]).get(line.id) : null, onVan = null) {
-  return suggestFor(line, { items, learned, exclude, onVan }).suggest;
+export async function suggestLink(line, items, learned, exclude, onVan = null) {
+  items ??= await linkableItems();
+  learned ??= await learnedLinks();
+  if (exclude === undefined) exclude = line.id ? (await cellSiblings([line.id])).get(line.id) : null;
+  return (await suggestFor(line, { items, learned, exclude, onVan })).suggest;
 }
 
 // { suggest, already } for one catch-all line.
@@ -414,7 +425,14 @@ export function suggestLink(line, items = linkableItems(), learned = learnedLink
 //            rail + pelmet – same thing?" — when the best match is on the van already, or when nothing else
 //            fits and one of the van's own parts does (here a brand + the same kind of thing is enough:
 //            "Nikpol 13" in the Sliding Door Pelmet column vs the van's Nikpol "Sliding door rail + pelmet").
-export function suggestFor(line, { items = linkableItems(), learned = learnedLinks(), exclude = null, onVan = null } = {}) {
+export async function suggestFor(line, { items, learned, exclude = null, onVan = null } = {}) {
+  items ??= await linkableItems();
+  learned ??= await learnedLinks();
+  await loadSuppliers();
+  return suggestForNow(line, { items, learned, exclude, onVan });
+}
+// The same thing without touching the database (the supplier lists must already be loaded: loadSuppliers()).
+function suggestForNow(line, { items, learned, exclude = null, onVan = null }) {
   if (exclude?.size) items = items.filter(i => !exclude.has(i.id));
   const best = bestMatch(line, items, learned);
   const has = id => !!onVan?.has(id);
@@ -493,13 +511,13 @@ function scoreWords(line, items, { loose = false } = {}) {
 
 // The real parts already on these vans, per van: vanId → Map(itemId → { line_id, item_id, name, sku, qty, spec,
 // plan_column, reserved, reserved_firm, issued }) — the first line for each part (the one a merge goes into).
-export function vanParts(vanIds) {
+export async function vanParts(vanIds) {
   const out = new Map();
   const ids = [...new Set(vanIds)].filter(x => x != null);
   if (!ids.length) return out;
-  for (const r of all(`SELECT l.id AS line_id, l.van_id, l.item_id, l.qty, l.spec, l.plan_column, l.reserved, l.reserved_firm, l.issued, i.name, i.sku
+  for (const r of await all(`SELECT l.id AS line_id, l.van_id, l.item_id, l.qty, l.spec, l.plan_column, l.reserved, l.reserved_firm, l.issued, i.name, i.sku
                        FROM van_lines l JOIN items i ON i.id = l.item_id
-                       WHERE l.van_id IN (${ids.map(() => '?').join(',')}) AND i.placeholder = 0 AND i.sku NOT LIKE 'PLAN-%'
+                       WHERE l.van_id IN (${ids.map(() => '?').join(',')}) AND i.placeholder = 0 AND i.sku NOT ILIKE 'PLAN-%'
                        ORDER BY l.id`, ...ids)) {
     if (!out.has(r.van_id)) out.set(r.van_id, new Map());
     const m = out.get(r.van_id);
@@ -511,15 +529,18 @@ export function vanParts(vanIds) {
 // Suggestions for many catch-all lines at once ({id, van_id, sku, name, spec, plan_column}): Map lineId →
 // { suggest, already, clash }. On top of suggestFor: the same part is never suggested for two lines of one
 // van (round 3, user-r2-3) — both lose the suggestion and get `clash` (the part, and the other plan lines).
-export function suggestionsFor(lines, { items = linkableItems(), learned = learnedLinks() } = {}) {
-  const sib = cellSiblings(lines.map(l => l.id));
-  const parts = vanParts(lines.map(l => l.van_id));
+export async function suggestionsFor(lines, { items, learned } = {}) {
+  items ??= await linkableItems();
+  learned ??= await learnedLinks();
+  const sib = await cellSiblings(lines.map(l => l.id));
+  const parts = await vanParts(lines.map(l => l.van_id));
+  await loadSuppliers();
   const out = new Map();
   for (const l of lines) {
     const exclude = sib.get(l.id) || null;
     const mine = parts.get(l.van_id);
     const onVan = mine ? new Map([...mine].filter(([itemId]) => !exclude?.has(itemId))) : null;
-    out.set(l.id, { ...suggestFor(l, { items, learned, exclude, onVan }), clash: null });
+    out.set(l.id, { ...suggestForNow(l, { items, learned, exclude, onVan }), clash: null });
   }
   const byPart = new Map();
   for (const l of lines) {
@@ -556,29 +577,31 @@ function prepItem(i) {
   }
   return p;
 }
+// Compiled brand patterns (a pure function of the supplier name, so never out of date).
 const reCache = new Map();
 const brandRe = s => reCache.get(s) || reCache.set(s, new RegExp(`(?:^|[^a-z0-9])${s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s*')}(?![a-z0-9])`, 'i')).get(s);
-// Supplier names that are brands (4+ letters, not an ordinary word like "Gold"). Cached per second.
-let supCache = { at: 0, list: [] };
+// Supplier names that are brands (4+ letters, not an ordinary word like "Gold") and every word of every
+// supplier name ("nikpol", "coast", "camping"…: a match on these alone is not a match on the part, round 3).
+// Both come from one query, kept until the data version changes (any change saved by this or another server
+// instance bumps it), so a supplier change is seen on the next call. The matching code below is synchronous and
+// reads these lists; every exported entry point that matches calls loadSuppliers() first.
+let supCache = { ver: null, list: [] };
+let supWordCache = { ver: null, set: new Set() };
+async function loadSuppliers() {
+  const ver = await dataVersion();
+  if (supCache.ver === ver && supWordCache.ver === ver) return;
+  const rows = (await all(`SELECT DISTINCT trim(supplier) AS s FROM items WHERE trim(supplier) <> '' UNION SELECT name FROM suppliers`)).map(r => r.s);
+  const set = new Set();
+  for (const s of rows) for (const w of words(s)) set.add(w);
+  supCache = { ver, list: rows.filter(s => s && s.length >= 4 && !/^(gold|black|white|grey|silver|chrome|custom|plan|order)$/i.test(s)) };
+  supWordCache = { ver, set };
+}
 function supplierNames() {
-  if (Date.now() - supCache.at > 1000) {
-    supCache = { at: Date.now(), list: all(`SELECT DISTINCT trim(supplier) AS s FROM items WHERE trim(supplier) <> ''
-                                              UNION SELECT name FROM suppliers`).map(r => r.s)
-      .filter(s => s && s.length >= 4 && !/^(gold|black|white|grey|silver|chrome|custom|plan|order)$/i.test(s)) };
-  }
+  if (supCache.ver === null) throw new Error('relink: loadSuppliers() must run before matching');
   return supCache.list;
 }
-// Every word of every supplier name ("nikpol", "coast", "camping"…): a match on these alone is not a
-// match on the part (round 3). Cached per second like supplierNames().
-let supWordCache = { at: 0, set: new Set() };
 function supplierWords() {
-  if (Date.now() - supWordCache.at > 1000) {
-    const set = new Set();
-    for (const r of all(`SELECT DISTINCT trim(supplier) AS s FROM items WHERE trim(supplier) <> '' UNION SELECT name FROM suppliers`)) {
-      for (const w of words(r.s)) set.add(w);
-    }
-    supWordCache = { at: Date.now(), set };
-  }
+  if (supWordCache.ver === null) throw new Error('relink: loadSuppliers() must run before matching');
   return supWordCache.set;
 }
 
@@ -586,22 +609,22 @@ function supplierWords() {
 // (kind 'per-van', SKU ONEOFF-…), so it no longer counts as "to confirm" but can be ordered, received
 // and found on the floor like any other part. Stock and PO lines move with it (linkLine, logged).
 export function makeOneOff(lineId, { supplier = '', name = '', worker = '' } = {}) {
-  return tx(() => {
-    const l = get(`SELECT l.*, i.sku, i.name AS item_name, i.unit, i.trade, i.placeholder, v.chassis
+  return writeTx(async () => {
+    const l = await get(`SELECT l.*, i.sku, i.name AS item_name, i.unit, i.trade, i.placeholder, v.chassis
                    FROM van_lines l JOIN items i ON i.id = l.item_id JOIN vans v ON v.id = l.van_id WHERE l.id = ?`, lineId);
     if (!l) throw Object.assign(new Error('That part line no longer exists — refresh'), { status: 404 });
     if (!l.placeholder && !isPlaceholderSku(l.sku)) throw Object.assign(new Error('This line is already a real part'), { status: 400 });
     const base = String(name || '').trim()
       || `${String(l.item_name || l.plan_column || 'Special part').replace(/\s*\(as per plan\)\s*$/i, '')} – ${l.chassis} (one-off)`;
     let sku = `ONEOFF-${l.chassis}-${String(l.plan_column || l.sku).toUpperCase().replace(/^PLAN-/, '').replace(/[^A-Z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 20)}`;
-    for (let n = 2; get('SELECT 1 FROM items WHERE sku = ?', sku); n++) sku = `${sku.replace(/-\d+$/, '')}-${n}`;
-    const itemId = Number(run(`INSERT INTO items(sku, name, category, supplier, unit, kind, plan_column, trade, notes)
+    for (let n = 2; await get('SELECT 1 FROM items WHERE sku = ?', sku); n++) sku = `${sku.replace(/-\d+$/, '')}-${n}`;
+    const itemId = Number(await insert(`INSERT INTO items(sku, name, category, supplier, unit, kind, plan_column, trade, notes)
                                VALUES(?, ?, 'Special (one-off)', ?, ?, 'per-van', ?, ?, ?)`,
       sku, base.slice(0, 120), String(supplier || '').trim(), l.unit || 'ea', l.plan_column || '', l.trade || '',
-      `One-off special part for ${l.chassis}, from the plan text "${l.spec}"`).lastInsertRowid);
-    logAlloc('one-off', { van_id: l.van_id, item_id: itemId, line_id: l.id, field: 'new item', before: '', after: `${sku} – ${base}`, worker,
+      `One-off special part for ${l.chassis}, from the plan text "${l.spec}"`));
+    await logAlloc('one-off', { van_id: l.van_id, item_id: itemId, line_id: l.id, field: 'new item', before: '', after: `${sku} – ${base}`, worker,
       note: `kept as a one-off special part for ${l.chassis}${supplier ? ` (supplier ${supplier})` : ''}` });
-    const r = linkLine(l.id, itemId, { reason: 'one-off', worker });
+    const r = await linkLine(l.id, itemId, { reason: 'one-off', worker });
     return { ...r, item_id: itemId, sku };
   });
 }
@@ -678,17 +701,19 @@ export function textParts(spec) {
 // Per bit of a multi-part text: { text, suggest, on_van } — on_van = the van already has a line for the
 // part it most likely is (a part the same cell already became, or one added from here before), so it is
 // done; suggest = the real part it most likely is (needs a click to add). `onVan`: vanParts() for the van.
-export function partsFor(line, { items = linkableItems(), onVan = null } = {}) {
+export async function partsFor(line, { items, onVan = null } = {}) {
   const bits = textParts(line.spec);
   if (!bits.length) return null;
+  items ??= await linkableItems();
+  await loadSuppliers();
   const empty = new Map();
   // Bits added from here before (their line's note says "Part of the plan text: “…”"): done, whatever part was picked.
-  const added = line.id == null ? [] : all(`SELECT o.note, o.item_id, i.name, i.sku FROM van_lines o JOIN items i ON i.id = o.item_id
-      WHERE o.van_id = ? AND o.id <> ? AND o.plan_column = ? AND o.spec = ? AND o.note LIKE '%Part of the plan text:%'`,
+  const added = line.id == null ? [] : await all(`SELECT o.note, o.item_id, i.name, i.sku FROM van_lines o JOIN items i ON i.id = o.item_id
+      WHERE o.van_id = ? AND o.id <> ? AND o.plan_column = ? AND o.spec = ? AND o.note ILIKE '%Part of the plan text:%'`,
     line.van_id, line.id, line.plan_column || '', line.spec || '');
   const out = [];
   for (const text of bits) {
-    const r = suggestFor({ ...line, id: null, spec: text }, { items, learned: empty, exclude: null, onVan });
+    const r = suggestForNow({ ...line, id: null, spec: text }, { items, learned: empty, exclude: null, onVan });
     const prev = added.find(a => [...a.note.matchAll(/Part of the plan text: “([^”]*)”/g)].some(m => m[1].split(' + ').includes(text)));
     const on = prev || r.already || r.different;
     const p = { text, suggest: on ? null : (r.suggest || null), on_van: on ? { item_id: on.item_id, name: on.name, sku: on.sku } : null };
@@ -704,15 +729,16 @@ export function partsFor(line, { items = linkableItems(), onVan = null } = {}) {
 
 // A plan cell that only holds the dealer's name ("CHASSIS: Caravan Treading Center") is not a part.
 // `dealers`: every dealer name on the vans (both spellings are in the data). Returns the reason, or ''.
-export function dealerNames() {
+export async function dealerNames() {
   const set = new Set();
-  for (const r of all(`SELECT DISTINCT dealer FROM vans WHERE trim(dealer) <> ''`)) {
+  for (const r of await all(`SELECT DISTINCT dealer FROM vans WHERE trim(dealer) <> ''`)) {
     set.add(norm(r.dealer));
     set.add(norm(String(r.dealer).replace(/treading/ig, 'trading')));
   }
   return set;
 }
-export function notAPart(spec, dealers = dealerNames()) {
+// Pure: pass the set from `await dealerNames()` (fetched once, then used for every line).
+export function notAPart(spec, dealers) {
   const t = norm(spec);
   return t && dealers.has(t) ? "the dealer's name, not a part" : '';
 }
@@ -724,8 +750,8 @@ export function notAPart(spec, dealers = dealerNames()) {
 // (linkLine: its stock and van POs move with it) — otherwise it stays "to confirm" for the bits left.
 // Logged as 'add part' (not 'link', so "same text was linked to … before" never learns from a part of a text).
 export function addTextParts(lineId, parts, { worker = '' } = {}) {
-  return tx(() => {
-    const l = get(`SELECT l.*, i.sku, i.name AS item_name, i.placeholder, v.chassis FROM van_lines l JOIN items i ON i.id = l.item_id
+  return writeTx(async () => {
+    const l = await get(`SELECT l.*, i.sku, i.name AS item_name, i.placeholder, v.chassis FROM van_lines l JOIN items i ON i.id = l.item_id
                    JOIN vans v ON v.id = l.van_id WHERE l.id = ?`, lineId);
     if (!l) throw Object.assign(new Error('That part line no longer exists — refresh'), { status: 404 });
     if (!l.placeholder && !isPlaceholderSku(l.sku)) throw Object.assign(new Error('This line is already a real part'), { status: 400 });
@@ -734,29 +760,29 @@ export function addTextParts(lineId, parts, { worker = '' } = {}) {
     if (!list.length) throw Object.assign(new Error('Pick a part for at least one of them'), { status: 400 });
     const ids = list.map(p => p.item_id);
     if (new Set(ids).size !== ids.length) throw Object.assign(new Error('The same part is picked twice — pick a different part for each'), { status: 400 });
-    const have = vanParts([l.van_id]).get(l.van_id) || new Map();
+    const have = (await vanParts([l.van_id])).get(l.van_id) || new Map();
     for (const p of list) {
-      const it = get('SELECT * FROM items WHERE id = ?', p.item_id);
+      const it = await get('SELECT * FROM items WHERE id = ?', p.item_id);
       if (!it || it.placeholder || isPlaceholderSku(it.sku)) throw Object.assign(new Error('Pick a real part, not another "as per plan" one'), { status: 400 });
       if (have.has(it.id)) throw Object.assign(new Error(`${l.chassis} already has ${it.name} — use "Same thing?" / Link on the plan line instead`), { status: 409 });
       p.item = it;
     }
-    const bits = partsFor(l, { onVan: have }) || [];
+    const bits = (await partsFor(l, { onVan: have })) || [];
     const left = bits.filter(b => !b.on_van).length;
     const whole = left > 0 && list.length >= left; // every bit still open gets a part now
     const out = { added: 0, linked: 0, chassis: l.chassis, van_id: l.van_id, allocate: [] };
     const [first, ...rest] = whole ? list : [null, ...list];
     for (const p of rest) {
-      const id = Number(run(`INSERT INTO van_lines(van_id, item_id, qty, spec, note, source, plan_column) VALUES(?,?,?,?,?, 'manual', ?)`,
-        l.van_id, p.item_id, l.qty, l.spec, `Part of the plan text: “${p.text}”`, l.plan_column).lastInsertRowid);
-      logAlloc('add part', { van_id: l.van_id, item_id: p.item_id, line_id: id, field: 'new line', before: `${l.sku} (${l.spec})`,
+      const id = Number(await insert(`INSERT INTO van_lines(van_id, item_id, qty, spec, note, source, plan_column) VALUES(?,?,?,?,?, 'manual', ?)`,
+        l.van_id, p.item_id, l.qty, l.spec, `Part of the plan text: “${p.text}”`, l.plan_column));
+      await logAlloc('add part', { van_id: l.van_id, item_id: p.item_id, line_id: id, field: 'new line', before: `${l.sku} (${l.spec})`,
         after: `${p.item.sku} – ${p.item.name}`, worker, note: `“${p.text}” added as its own line from the ${planLineName(l.plan_column, l.item_name)} plan text` });
       out.allocate.push(p.item_id); // set aside by the caller (allocateItem lives in inventory.js)
       out.added++;
     }
     if (first) {
-      run('UPDATE van_lines SET note = ? WHERE id = ?', appendNote(l.note, `Part of the plan text: “${first.text}”`), l.id);
-      const r = linkLine(l.id, first.item_id, { reason: 'add part', worker, why: `“${first.text}” – the other parts of this plan text are their own lines` });
+      await run('UPDATE van_lines SET note = ? WHERE id = ?', appendNote(l.note, `Part of the plan text: “${first.text}”`), l.id);
+      const r = await linkLine(l.id, first.item_id, { reason: 'add part', worker, why: `“${first.text}” – the other parts of this plan text are their own lines` });
       out.linked = r.result === 'linked' || r.result === 'merged' ? 1 : 0;
       out.result = r.result;
       out.allocate.push(first.item_id);

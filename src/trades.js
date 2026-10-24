@@ -1,6 +1,6 @@
 // Trades on the floor, and which trade each part / reminder belongs to. The guesses below fill in
 // items that have no trade yet; the office can change any item's trade on the Stock page.
-import { all, run } from './db.js';
+import { all, run, writeTx } from './db.js';
 
 export const TRADES = {
   electrician: { label: 'Electrician', icon: '⚡' },
@@ -45,10 +45,12 @@ export function guessLineTrade(section, label, value) {
 }
 
 // Give every item without a trade its best guess (startup, after imports, new items).
-export function assignMissingTrades() {
-  const items = all(`SELECT id, sku, name, category, plan_column FROM items WHERE trade = ''`);
-  for (const i of items) run('UPDATE items SET trade = ? WHERE id = ?', guessItemTrade(i), i.id);
-  return items.length;
+export async function assignMissingTrades() {
+  return writeTx(async () => {
+    const items = await all(`SELECT id, sku, name, category, plan_column FROM items WHERE trade = ''`);
+    for (const i of items) await run('UPDATE items SET trade = ? WHERE id = ?', guessItemTrade(i), i.id);
+    return items.length;
+  });
 }
 
 export const isTrade = t => Object.hasOwn(TRADES, t);
