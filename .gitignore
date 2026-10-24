@@ -27,3 +27,7 @@ mobile/dist/
 supabase/.temp/
 supabase/.branches/
 .deploy-api/
+
+# Cloudflare Pages build output and wrangler cache
+dist-pages/
+.wrangler/

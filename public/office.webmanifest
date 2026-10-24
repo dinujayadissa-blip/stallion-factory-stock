@@ -1,0 +1,16 @@
+{
+  "name": "Stallion Stock",
+  "short_name": "Stallion Stock",
+  "description": "Dealer orders, parts lists and stock for the caravan factory.",
+  "id": "/",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#201e16",
+  "theme_color": "#201e16",
+  "icons": [
+    { "src": "/assets/app/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/assets/app/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "/assets/app/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
