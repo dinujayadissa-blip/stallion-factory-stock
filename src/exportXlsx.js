@@ -27,11 +27,11 @@ export async function exportWorkbook() {
   wb.creator = 'Factory Stock';
 
   // ── Production Plan (all vans, finished ones too, like the original sheet) ──
-  const grid = planGrid({ includeFinished: true });
+  const grid = await planGrid({ includeFinished: true });
   const ws = wb.addWorksheet('Production Plan', { views: [{ state: 'frozen', xSplit: 2, ySplit: 2 }] });
   // Van details, so the sheet can be edited and imported again without losing them: dealer, customer
   // requests, then any other information columns the imported plan had (VIN, ATM…), in plan order.
-  const vanInfo = new Map(all('SELECT id, dealer, notes FROM vans').map(v => [v.id, v]));
+  const vanInfo = new Map((await all('SELECT id, dealer, notes FROM vans')).map(v => [v.id, v]));
   const base = h => normHeader(h).replace(/ \(\d+\)$/, '');
   const infoOrder = [...INFO_COLUMNS];
   const own = ['CHASSIS #', 'VAN SIZE & TYPE', 'EXPECTED DELIVERY DATE', 'CUSTOMER NAME', 'DEALER', 'CUSTOMER REQUESTS', 'STATUS'];
@@ -76,7 +76,7 @@ export async function exportWorkbook() {
   });
 
   // ── Van Parts: every part line for active vans ──
-  const lines = all(`
+  const lines = await all(`
     SELECT l.*, i.sku, i.name, i.category, i.supplier, i.unit, v.chassis,
       COALESCE(NULLIF(l.plan_column, ''), NULLIF(i.plan_column, ''), i.category) AS col,
       COALESCE((SELECT SUM(${PO_OPEN}) FROM po_lines pl JOIN purchase_orders p ON p.id = pl.po_id
@@ -93,7 +93,7 @@ export async function exportWorkbook() {
   ], lines.map(l => ({ ...l, spec: [l.spec, l.note].filter(Boolean).join(' | '), status: LINE_STATUS_TEXT[lineStatus(l)] })));
 
   // ── To Order: what to order, most urgent first (same list as the Purchasing page) ──
-  const sh = shortages();
+  const sh = await shortages();
   const GROUP = { now: 'Order now', soon: 'Coming up', later: 'Later', nodate: 'No date – check' };
   const toOrderWs = addTable(wb, 'To Order', [
     ['When', 'when', 14], ['Order by', 'order_by', 11], ['Supplier', 'supplier', 22], ['SKU', 'sku', 16], ['Item', 'name', 36],
@@ -105,7 +105,7 @@ export async function exportWorkbook() {
     order_by: toDate(r.order_by && r.order_by < sh.today ? sh.today : r.order_by), needed_by: toDate(r.needed_by), lead: `${r.lead_days}${r.lead_confirmed ? '' : ' (assumed)'}` })));
 
   // ── Open purchase orders, with what exactly was ordered ──
-  const poLines = all(`SELECT p.po_no, p.supplier, p.ordered_at, COALESCE(NULLIF(pl.expected, ''), p.expected) AS expected,
+  const poLines = await all(`SELECT p.po_no, p.supplier, p.ordered_at, COALESCE(NULLIF(pl.expected, ''), p.expected) AS expected,
       i.sku, i.name, pl.spec, v.chassis, pl.qty, pl.received, pl.closed, ${PO_OPEN} AS open, i.unit
     FROM po_lines pl JOIN purchase_orders p ON p.id = pl.po_id JOIN items i ON i.id = pl.item_id LEFT JOIN vans v ON v.id = pl.van_id
     WHERE p.status = 'open' ORDER BY p.supplier, p.po_no, i.name`);
@@ -124,13 +124,13 @@ export async function exportWorkbook() {
   // Purchasing → To order. Blank for special ("as per plan") parts, and blank when nothing is short, as on screen.
   // It replaces the old "Suggested order" (short + reorder top-up − every PO for the part), which netted one van's
   // PO against another van's shortfall and so said to order less than the screen. Shelf top-ups are on "To Order".
-  const toOrder = stillToOrderByItem();
+  const toOrder = await stillToOrderByItem();
   const r2 = n => Math.round(n * 1000) / 1000;
   addTable(wb, 'Stock', [
     ['SKU', 'sku', 16], ['Item', 'name', 40], ['Category', 'category', 22], ['Supplier', 'supplier', 18], ['Type', 'kind', 9],
     ['Unit', 'unit', 7], ['On hand', 'on_hand', 9], ['Set aside', 'reserved', 9], ['Free', 'available', 8], ['On order', 'on_order', 9],
     ['Short for vans', 'short', 13], ['Still to order', 'still_to_order', 13], ['Reorder level', 'reorder_level', 12], ['Location', 'location', 12],
-  ], listItems().map(i => ({ ...i,
+  ], (await listItems()).map(i => ({ ...i,
     still_to_order: i.placeholder ? '' : toOrder[i.id] > 1e-9 ? r2(toOrder[i.id]) : i.short > 0 ? 0 : '' })));
 
   return Buffer.from(await wb.xlsx.writeBuffer());
