@@ -32,7 +32,7 @@ Check:
 
 ## 3. Build the installable APK
 
-    npx eas-cli login          # Expo account: uvindu13
+    npx eas-cli login          # your Expo account
     npx eas-cli build --profile preview --platform android
 
 The first time, EAS asks to create the project and a signing key; say yes (the key is kept by Expo, not in this repo).

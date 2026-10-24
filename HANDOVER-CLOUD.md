@@ -28,10 +28,10 @@ You will do three things once: make the database project at Supabase, sign in to
 
 ### 1A. Make the Supabase project
 
-You already have a Supabase account for Ausventure. Use the same one.
+You already have a Supabase account (the one for your other app). Use your existing Supabase account; there is no need for a new one.
 
-1. Open **supabase.com** and click **Dashboard** (top right). Sign in the same way you do for Ausventure.
-2. Click **New project**. If it asks which organisation, pick the one you use for Ausventure.
+1. Open **supabase.com** and click **Dashboard** (top right). Sign in to your existing Supabase account, the same way as for your other app.
+2. Click **New project**. If it asks which organisation, pick the one your other app is in.
 3. Fill in the form:
    - **Name:** `stallion-factory-stock`
    - **Database password:** click **Generate a password**, then click the copy icon and **save it in your password manager** straight away (call the entry "Supabase stallion-factory-stock database"). Supabase will not show it again later, only let you reset it.
@@ -191,13 +191,13 @@ It must be **Safari** (the blue compass). Chrome on an iPhone cannot add it to t
 2. Tap the **Share** button (a square with an arrow pointing up) at the bottom of the screen.
 3. Scroll down the list and tap **Add to Home Screen**.
 4. Leave the name as it is and tap **Add** (top right).
-5. Open the app from its new icon. The first time you take a photo, tap **Allow** when it asks for the camera.
+5. Open the app from its new icon and **log in again**: the home-screen app keeps its own login, separate from Safari, so the login from step 1 does not carry over. The first time you take a photo, tap **Allow** when it asks for the camera.
 
 Workers land on the factory-floor screen by themselves.
 
 ### Android (the owner)
 
-The Android app is a small program that shows the same site full-screen. It is installed from a file (an "APK"), not from the Play Store. You make it once on the home PC with your free Expo account (`uvindu13`), with Claude beside you.
+The Android app is a small program that shows the same site full-screen. It is installed from a file (an "APK"), not from the Play Store. You make it once on the home PC with your free Expo account, with Claude beside you.
 
 1. In the Factory Stock folder, open the terminal (step 1C). Type these, one at a time, pressing **Enter** after each:
 
@@ -240,6 +240,8 @@ There are no logins in the data that moves online, so at cut-over you make your 
    npm run users -- add owner-spare owner
    ```
 
+   If PowerShell says that running scripts is disabled on this system, type `npm.cmd` in place of `npm` (for example `npm.cmd run users -- list`). It is the same command.
+
 3. It asks for a name (press **Enter** to take the suggestion), then a password twice (nothing shows as you type), then "Must they choose their own password when they first log in?". Type **n**, because you are choosing it yourself.
 4. **Use a long password nobody could guess**, and save it in your password manager in an entry called "Stallion owner spare", or write it on paper and keep that somewhere safe. Never type it into a chat.
 5. Check that it works: open **https://stallion-stock.pages.dev** in a private window, log in as `owner-spare`, check you can see **Logins** in the menu, then log out.
@@ -250,6 +252,8 @@ Later, to see the logins or to fix a forgotten password (with the three values s
 npm run users -- list
 npm run users -- reset <username>
 ```
+
+(If PowerShell says that running scripts is disabled on this system, type `npm.cmd` in place of `npm` (for example `npm.cmd run users -- list`). It is the same command.)
 
 Or, if you can log in as one owner, use **Logins** in the menu: **Edit**, **Reset password**, **Turn off / Turn on**, **Unlock**.
 
@@ -279,13 +283,15 @@ Cut-over day is when the real data moves up and the online version becomes the o
 
 **B. (you, optional) Bring the production plan up to date in the original version.** The online version cannot read the production plan spreadsheet. ("Update from the production plan spreadsheet" and "Start again from the spreadsheet" are not there.) So do any plan update now, on the original version at the home PC, on a copy, exactly as before. Then stop it.
 
-**C. (Claude) Take a safe copy and load it.** Claude copies the data and photos to a new folder, leaving the originals untouched, and loads the copy into the online database. The last line must be **ALL CHECKS PASSED**. If anything fails, the online database is left as it was. As the first part of this, the old start-up stock clean-up (the same one the factory version was due for) runs on the *copy* first, so some stock figures change a little. Step G is for that.
+**C. (Claude) Take a safe copy and load it.** Claude copies the data and photos to a new folder, leaving the originals untouched, and loads the copy into the online database. The copy runs in **your own PowerShell window**, the one where you set the three values in step 2 ("Typing a secret into the terminal"), with those values still set: Claude tells you the command to type there, and the values never leave your PC or go into a file. If you closed that window, open a new one and set the three values again first. Before any photo is sent, the copy makes sure the photo store (the `item-photos` bucket) is there and private; it stops if it is public. The last line must be **ALL CHECKS PASSED**. If anything fails, the online database is left as it was. As the first part of this, the old start-up stock clean-up (the same one the factory version was due for) runs on the *copy* first, so some stock figures change a little. Step G is for that.
 
 **D. (you) Make the first owner login, then the spare.** The data you moved has no logins, so you make the first yourself. In PowerShell in the Factory Stock folder, set the three values (step 2), then:
 
 ```
 npm run users -- add <your-username> owner
 ```
+
+If PowerShell says that running scripts is disabled on this system, type `npm.cmd` in place of `npm` (for example `npm.cmd run users -- list`). It is the same command.
 
 Type your own password twice when asked (nothing shows). Do not say it aloud to anyone or type it into a chat. Type **n** to "must choose their own". Then make the second owner login (step 4).
 
@@ -307,14 +313,14 @@ If something is badly wrong in the first days, tell Claude. The old copy (as it 
 
 ## 7. Where the backups are, and how to get them back
 
-Every night at about 1 am, a robot on GitHub copies the whole database and every photo into a **private** repository: `dinujayadissa-blip/stallion-factory-backups`.
+Every night at about 1–2 am, a robot on GitHub copies the whole database and every photo into a **private** repository: `dinujayadissa-blip/stallion-factory-backups`.
 
 - `db/factory-YYYY-MM-DD.dump` is the whole database, one file per night. The last 30 are kept.
 - `photos/` has every item picture (kept even if someone later removes the photo in the app).
 
 Treat that repository like the live database: it holds your real data. Only add people you trust, and never make it public.
 
-**Checking it works (30 seconds, once a week).** On github.com open the repository and click **Actions**. The newest run should have a **green tick** and be from the last day or two. Click **Code**, then the folder `db`, and check there is a file with a recent date. GitHub also emails you if a run fails.
+**Checking it works (30 seconds, once a week).** On github.com open the repository and click **Actions**. The newest run should have a **green tick** and be from the last day or two. Click **Code**, then the folder `db`, and check there is a file with a recent date. GitHub also emails you if a run fails. While you are there, glance at the free-plan usage too: in the Supabase dashboard, your project, **Usage** (it may be under the gear icon or in the left menu; database size, egress and storage should be well under the Free plan limits it shows), and in Cloudflare, **Workers & Pages**, then the **Usage** or **Metrics** figures (requests per day, well under the free 100,000). If either is getting close, tell Claude.
 
 **Getting it back (if the online database is lost or wrongly changed).** The step-by-step is in **`docs/RESTORE.md`** in the Factory Stock folder. It has you pick the newest dump, restore it into a new Supabase project, put the photos back and check the numbers. A helper can do the technical steps; the sign-in steps are marked **(owner)**. Do one practice restore soon after the first night's backup, so you know it works, and delete the practice project afterwards (the free plan allows two).
 
@@ -399,8 +405,8 @@ Then the real test, once:
    node scripts/copy-to-cloud.js --from "<folder>\factory.db" --to $env:DATABASE_URL --photos "<folder>\photos" --wipe
    ```
 
-   Expect the start-up counts, `Stock clean-up: 20 of 20 step(s)` and `ALL CHECKS PASSED`. `--wipe` is needed when the database has any rows (a server boot seeds the catalogue). A failed check rolls everything back. Use the session address (5432): it needs `TRUNCATE ... RESTART IDENTITY` and an advisory lock.
-3. First logins (the data has none; first-time setup is off online): `npm run users -- add <username> owner`, then the spare. Never re-run the copy with `--wipe` after this: it removes the logins.
+   Expect the start-up counts, `Stock clean-up: 20 of 20 step(s)` and `ALL CHECKS PASSED`. `--wipe` is needed because the online database still holds the made-up trial data from the role tests before the day: it empties every table first, so only the real data is left. A failed check rolls everything back. Use the session address (5432): it needs `TRUNCATE ... RESTART IDENTITY` and an advisory lock.
+3. First logins (the data has none; first-time setup is off online): `npm run users -- add <username> owner` (`npm.cmd run users -- ...` if PowerShell says running scripts is disabled), then the spare. Never re-run the copy with `--wipe` after this: it removes the logins.
 4. Backups: `gh repo create dinujayadissa-blip/stallion-factory-backups --private --source "<path to the local stallion-factory-backups folder>" --remote origin --push`. The owner adds the three secrets on the GitHub page (or `gh secret set NAME -R dinujayadissa-blip/stallion-factory-backups`, each prompting for a paste). Run once: `gh workflow run nightly.yml -R dinujayadissa-blip/stallion-factory-backups`, then `gh run watch -R dinujayadissa-blip/stallion-factory-backups`. Expect green, one `db/factory-<date>.dump`, `photos/` filled. The restore rehearsal in `docs/RESTORE.md` is what proves the `pg_dump --schema=public` / `pg_restore` round trip.
 5. Android: `mobile/README.md` (optional Expo Go test with `npx expo start --tunnel`, then the EAS preview build). If the camera or the Excel download fails inside the WebView, a permission or download-handler fix is needed in `mobile/App.js`.
 6. Remind the owner that the clean-up changed some figures; the office glances over Stock checks and the Clean-up report.
