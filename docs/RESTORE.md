@@ -16,6 +16,9 @@ Never paste keys or passwords into chat, an email or any file in a repo.
 ## 0. What you need on the PC
 
 - **Git** and **Node 20+** (https://nodejs.org).
+- **GitHub CLI** `gh` (https://cli.github.com), signed in once with `gh auth login`, for step 1. Without it,
+  plain git works too: `git clone https://github.com/dinujayadissa-blip/stallion-factory-backups.git` (it asks
+  you to sign in to GitHub, as the repo is private).
 - **PostgreSQL 17 command-line tools** (`pg_restore`, `psql`). On Windows, install PostgreSQL 17 from
   https://www.postgresql.org/download/windows/ and tick only "Command Line Tools". Check:
   `pg_restore --version` shows 17 (or newer).
@@ -51,10 +54,24 @@ Call the database address `<url>` below. It looks like `postgres://...`.
 pg_restore --clean --if-exists --no-owner -d "<url>" db/factory-YYYY-MM-DD.dump
 ```
 
-Use the real file name. A few "already exists" or "does not exist, skipping" lines are normal on a
-brand-new database. Real problems say `error:` and stop with a message about a table or the file.
+Use the real file name. pg_restore carries on past errors and ends with a count:
+
+    pg_restore: warning: errors ignored on restore: N
+
+**Read that last line, and the `error:` lines above it.** Some noise is expected on a new Supabase
+project, because the schema `public` and Supabase's own extensions already exist and belong to Supabase:
+errors about `schema "public" already exists`, `must be owner of schema public` / `COMMENT ON SCHEMA`, or
+an `EXTENSION` (its comment or owner). Those are harmless. Any error that names one of the app's tables
+(`items`, `vans`, `van_lines`, `movements`, `users`, ...) or a `COPY`, or a missing file, is a real
+problem: stop and look at it before going on. "does not exist, skipping" lines are fine. (On a local
+Postgres there is no such noise: add `--exit-on-error` there and it stops at the first real error.)
 The nightly backup holds only the app's own tables (schema `public`), so this brings back items, vans,
 orders, movements, logins and settings.
+
+Then, on a Supabase project, lock the tables away from Supabase's Data API again (the restored tables can
+pick up the project's default rights): open the Supabase **SQL editor**, paste the whole of
+`supabase/migrations/0002_lock_down.sql` from the main repo and click **Run**. It is safe to run twice. Also
+turn the Data API off for that project, as in HANDOVER-CLOUD.md section 9.
 
 ## 4. Put the photos back
 
@@ -96,8 +113,10 @@ photo": each picture also has a small `-t.jpg` thumbnail.
 Only for a real recovery, not for a rehearsal. The app (the Supabase Edge Function behind
 `stallion-stock.pages.dev`) reads its database and photo store from secrets with these names:
 
-- `DATABASE_URL` - the restored project's connection string (the app's own deploy notes say which
-  Supabase pooler mode the app uses)
+- `DATABASE_URL` - the restored project's connection string. For the **app** (the Edge Function's
+  secret) it is the **Transaction pooler**, port **6543**. The **backups** (the backup repo's secret) and
+  this restore use the **Session pooler**, port **5432**. Same password, different port and mode: do not
+  mix them up.
 - `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` - the restored project's URL and `service_role` key
 
 Set them on the Edge Function of the restored project (`supabase secrets set NAME=value`, from the
