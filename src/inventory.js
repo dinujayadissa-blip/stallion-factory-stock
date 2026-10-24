@@ -74,7 +74,8 @@ export async function buildOrderInfo() {
 const isPlaceholder = i => !!(i && (i.placeholder || /^PLAN-/i.test(i.sku || '')));
 
 export async function ignoreList() {
-  try { return JSON.parse(await getSetting('ignore', '[]')); } catch { return []; }
+  const raw = await getSetting('ignore', '[]'); // (outside the try: a database error must not pass for bad JSON)
+  try { return JSON.parse(raw); } catch { return []; }
 }
 
 export async function activeRules() {
@@ -2051,7 +2052,8 @@ const RANK = { none: 0, ordered: 1, received: 2, done: 3 };
 // Received 58"). The cells' own colours (the spreadsheet's, also used by the Excel export) are unchanged.
 export async function planGrid({ includeFinished = false, parts = false } = {}) {
   let columns = [];
-  try { columns = JSON.parse(await getSetting('plan_columns', '[]')); } catch { /* none yet */ }
+  const rawColumns = await getSetting('plan_columns', '[]'); // (a database error is not "none yet")
+  try { columns = JSON.parse(rawColumns); } catch { /* none yet */ }
   const where = includeFinished ? '' : `WHERE ${ACTIVE_VAN}`;
   const vans = await all(`SELECT v.id, v.chassis, v.model, v.length, v.customer, v.eta, v.status FROM vans v ${where}
                     ORDER BY CASE v.status WHEN 'in_production' THEN 0 WHEN 'planned' THEN 1 ELSE 2 END, ${PRIORITY}`);
