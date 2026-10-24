@@ -1,18 +1,18 @@
-// Follow-up round 1, planner batch (planner-r3-4, planner-r3-5). Runs on a new, empty database in a temp
-// folder — never on the real data.   node --test test/
-import { test, after } from 'node:test';
+// Follow-up round 1, planner batch (planner-r3-4, planner-r3-5). Runs on a new, empty in-memory database
+// (PGlite) — never on the real data.   node --test test/
+import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
+import { freshDb } from './helpers.js';
+import { run, get, insert, closeDb } from '../src/db.js';
+import * as inv from '../src/inventory.js';
+import { textParts, skuNow, skuNames } from '../src/relink.js';
 
-const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fs-test-'));
-process.env.DATA_DIR = dir;
-const { db, run, get } = await import('../src/db.js');
-const inv = await import('../src/inventory.js');
-const { textParts, skuNow, skuNames } = await import('../src/relink.js');
-const { STEPS } = await import('../src/tidy.js');
-after(() => { try { db.close(); } catch { /* closed */ } fs.rmSync(dir, { recursive: true, force: true }); });
+before(freshDb);
+after(closeDb);
+
+// src/tidy.js (the one-off clean-up steps) stays on SQLite: it runs on the home PC copy before the move
+// (tag sqlite-final) and is never ported to Postgres, so its step tests can't run here.
+const TIDY_SQLITE_ONLY = 'src/tidy.js is SQLite-only (sqlite-final tag), not ported to Postgres';
 
 test('planner-r3-5: two model numbers with no separator are two parts, even when one is stuck to a word', () => {
   assert.deepEqual(textParts('kitchen pr7350 vanitypr7155'), ['kitchen pr7350', 'vanity pr7155']);
@@ -27,31 +27,46 @@ test('planner-r3-5: two model numbers with no separator are two parts, even when
     assert.deepEqual(textParts(t), [], t);
 });
 
-test('planner-r3-4: PLAN-ROOF-BAW becomes PLAN-ROOF-BOW, keeps its lines, and the old code still finds it', () => {
+test('planner-r3-4: PLAN-ROOF-BAW becomes PLAN-ROOF-BOW, keeps its lines, and the old code still finds it', { skip: TIDY_SQLITE_ONLY }, async () => {
+  const { STEPS } = await import('../src/tidy.js');
   assert.equal(skuNow('plan-roof-baw'), 'PLAN-ROOF-BOW');
   assert.equal(skuNow('PLAN-FRIDGE'), 'PLAN-FRIDGE');
   assert.deepEqual(skuNames('PLAN-ROOF-BOW'), ['PLAN-ROOF-BOW', 'PLAN-ROOF-BAW']);
-  const id = Number(run(`INSERT INTO items(sku, name, category, kind, plan_column, placeholder, notes) VALUES('PLAN-ROOF-BAW', 'Roof Baw (as per plan)', 'As per plan', 'per-van', 'Roof Baw', 1, 'Created by the import')`).lastInsertRowid);
-  const vanId = Number(run(`INSERT INTO vans(chassis, status) VALUES('ST9001', 'planned')`).lastInsertRowid);
-  const ln = Number(run(`INSERT INTO van_lines(van_id, item_id, qty, spec, source, plan_column) VALUES(?, ?, 4, 'Nce 121', 'plan', 'Roof Baw')`, vanId, id).lastInsertRowid);
+  const id = await insert(`INSERT INTO items(sku, name, category, kind, plan_column, placeholder, notes) VALUES('PLAN-ROOF-BAW', 'Roof Baw (as per plan)', 'As per plan', 'per-van', 'Roof Baw', 1, 'Created by the import')`);
+  const vanId = await insert(`INSERT INTO vans(chassis, status) VALUES('ST9001', 'planned')`);
+  const ln = await insert(`INSERT INTO van_lines(van_id, item_id, qty, spec, source, plan_column) VALUES(?, ?, 4, 'Nce 121', 'plan', 'Roof Baw')`, vanId, id);
   const step = STEPS.find(s => s.key === 'sku_fix');
-  assert.equal(step.run(), 1);
-  const it = get('SELECT * FROM items WHERE id = ?', id);
+  assert.equal(await step.run(), 1);
+  const it = await get('SELECT * FROM items WHERE id = ?', id);
   assert.equal(it.sku, 'PLAN-ROOF-BOW');
   assert.equal(it.name, 'Roof Bow (as per plan)');
   assert.match(it.notes, /^Created by the import · part code was PLAN-ROOF-BAW \(typo fixed\)$/);
-  assert.equal(get('SELECT item_id FROM van_lines WHERE id = ?', ln).item_id, id);
-  assert.ok(get(`SELECT 1 FROM allocation_log WHERE reason = 'tidy:sku_fix' AND before = 'PLAN-ROOF-BAW' AND after = 'PLAN-ROOF-BOW'`));
-  assert.equal(step.run(), 0, 'safe to run twice');
+  assert.equal((await get('SELECT item_id FROM van_lines WHERE id = ?', ln)).item_id, id);
+  assert.ok(await get(`SELECT 1 FROM allocation_log WHERE reason = 'tidy:sku_fix' AND before = 'PLAN-ROOF-BAW' AND after = 'PLAN-ROOF-BOW'`));
+  assert.equal(await step.run(), 0, 'safe to run twice');
   // a stock count sheet with the old code still finds the part
-  assert.deepEqual(inv.stocktake([{ sku: 'plan-roof-baw', qty: 0 }]), { updated: 1, unknown: [] });
+  assert.deepEqual(await inv.stocktake([{ sku: 'plan-roof-baw', qty: 0 }]), { updated: 1, unknown: [] });
 });
 
-test('planner-r3-4: when the new code is already taken, nothing is renamed and the report says so', () => {
-  run(`UPDATE items SET sku = 'PLAN-ROOF-BAW' WHERE sku = 'PLAN-ROOF-BOW'`);
-  const other = Number(run(`INSERT INTO items(sku, name, category, kind, placeholder) VALUES('PLAN-ROOF-BOW', 'Someone else', 'As per plan', 'per-van', 1)`).lastInsertRowid);
-  assert.equal(STEPS.find(s => s.key === 'sku_fix').run(), 0);
-  assert.ok(get(`SELECT 1 FROM items WHERE sku = 'PLAN-ROOF-BAW'`));
-  assert.equal(get('SELECT name FROM items WHERE id = ?', other).name, 'Someone else');
-  assert.ok(get(`SELECT 1 FROM allocation_log WHERE reason = 'tidy:sku_fix' AND field = 'flag'`));
+// The part of planner-r3-4 that is the stock logic's own (inventory.js), without the SQLite-only tidy step:
+// the part already has its new code, and a count sheet with the OLD code still finds it.
+test('planner-r3-4: a stock count sheet with the old code PLAN-ROOF-BAW still finds PLAN-ROOF-BOW', async () => {
+  assert.equal(skuNow('plan-roof-baw'), 'PLAN-ROOF-BOW');
+  assert.equal(skuNow('PLAN-FRIDGE'), 'PLAN-FRIDGE');
+  assert.deepEqual(skuNames('PLAN-ROOF-BOW'), ['PLAN-ROOF-BOW', 'PLAN-ROOF-BAW']);
+  const id = await insert(`INSERT INTO items(sku, name, category, kind, plan_column, placeholder) VALUES('PLAN-ROOF-BOW', 'Roof Bow (as per plan)', 'As per plan', 'per-van', 'Roof Bow', 1)`);
+  await run(`UPDATE items SET on_hand = 2 WHERE id = ?`, id);
+  assert.deepEqual(await inv.stocktake([{ sku: 'plan-roof-baw', qty: 0 }]), { updated: 1, unknown: [] });
+  assert.equal((await get('SELECT on_hand FROM items WHERE id = ?', id)).on_hand, 0);
+  assert.deepEqual(await inv.stocktake([{ sku: 'NO-SUCH-PART', qty: 1 }]), { updated: 0, unknown: ['NO-SUCH-PART'] });
+});
+
+test('planner-r3-4: when the new code is already taken, nothing is renamed and the report says so', { skip: TIDY_SQLITE_ONLY }, async () => {
+  const { STEPS } = await import('../src/tidy.js');
+  await run(`UPDATE items SET sku = 'PLAN-ROOF-BAW' WHERE sku = 'PLAN-ROOF-BOW'`);
+  const other = await insert(`INSERT INTO items(sku, name, category, kind, placeholder) VALUES('PLAN-ROOF-BOW', 'Someone else', 'As per plan', 'per-van', 1)`);
+  assert.equal(await STEPS.find(s => s.key === 'sku_fix').run(), 0);
+  assert.ok(await get(`SELECT 1 FROM items WHERE sku = 'PLAN-ROOF-BAW'`));
+  assert.equal((await get('SELECT name FROM items WHERE id = ?', other)).name, 'Someone else');
+  assert.ok(await get(`SELECT 1 FROM allocation_log WHERE reason = 'tidy:sku_fix' AND field = 'flag'`));
 });

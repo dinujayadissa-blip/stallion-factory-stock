@@ -1,15 +1,27 @@
-// Stock, allocation and purchasing logic. All quantities live in SQLite; every function that
-// changes stock runs inside a transaction so the numbers can't drift apart.
-import { db, all, get, run, tx, getSetting, setSetting, logAlloc, syncSuppliers } from './db.js';
+// Stock, allocation and purchasing logic. All quantities live in Postgres (src/db.js); every function that
+// changes stock runs inside writeTx (one writer at a time, all or nothing) so the numbers can't drift apart.
+// Every function that reads or writes the database is async (returns a Promise); the pure helpers
+// (lineStatus, qtyCheckFor, coverText, orderNowCount, orderNowText, orderGroupOf, httpError …) are not.
+import { all, get, run, insert, writeTx, inTx, dataVersion, getSetting, setSetting, logAlloc, syncSuppliers } from './db.js';
 import { buildPartsList } from './rules.js';
 import { capFor, leadInfo } from './planMap.js';
 import { detectState, dotsCheck, STATES, REMINDER_STATES, STATE_LABEL, PO_OPEN, PO_IS_OPEN, OPEN_PO_BY_VAN, UNANSWERED, UNANSWERED_CORR,
   COUNTS_SHORT, COUNTS_SHORT_CORR, ALLOCATABLE, STILL_MISSING, SPECIAL_ITEM, today, addDays, validDate, specForPo, givenTo, customerSays } from './lineState.js';
 import { suggestionsFor, sameTextKey, linkableItems, learnedLinks, mergedCols, textParts, partsFor, vanParts, dealerNames, notAPart, skuNow } from './relink.js';
 
+// Melbourne's date 'YYYY-MM-DD', whatever time zone the server runs in (lineState.js).
+export { today };
+
 // ───────────────────────── helpers ─────────────────────────
 
 const ACTIVE_VAN = `v.status IN ('planned','in_production')`;
+// Melbourne's clock in SQL, whatever time zone the database server runs in (Supabase runs in UTC):
+// the same text forms SQLite's date('now','localtime') / datetime('now','localtime') gave on the factory PC.
+const MELB = `(now() AT TIME ZONE 'Australia/Melbourne')`;
+const TODAY_SQL = `to_char(${MELB}, 'YYYY-MM-DD')`;
+const NOW_SQL = `to_char(${MELB}, 'YYYY-MM-DD HH24:MI:SS')`;
+// Seconds since a Melbourne wall-clock time stored as text ('YYYY-MM-DD HH:MM:SS', e.g. movements.at).
+const AGE_SECS = col => `EXTRACT(EPOCH FROM now() - ((${col})::timestamp AT TIME ZONE 'Australia/Melbourne'))`;
 // Build order — which van gets stock first (round 2, user-r1-4: the latest / most overdue van first).
 //   1. vans in production:
 //        a. a Build order number the office gave (1, 2, 3…) — lets the office put the bays in its own order
@@ -24,24 +36,24 @@ const ACTIVE_VAN = `v.status IN ('planned','in_production')`;
 // floor, trimming after a count — which takes from the END of this order — the receive dialog, the
 // unassigned list). buildOrderInfo() says in words why each van is where it is.
 const BAY_POS = `(SELECT first_number(fa.name) * 100000 + fa.id FROM floor_areas fa WHERE fa.id = v.area_id AND fa.kind = 'bay')`;
-const DATED = `(v.eta <> '' AND (v.status <> 'planned' OR v.eta >= date('now','localtime')))`;
+const DATED = `(v.eta <> '' AND (v.status <> 'planned' OR v.eta >= ${TODAY_SQL}))`;
 export const PRIORITY = `CASE WHEN v.status = 'in_production' THEN 0 WHEN v.build_order IS NOT NULL THEN 1 WHEN ${DATED} THEN 2 ELSE 3 END,
   v.build_order IS NULL, v.build_order,
   CASE WHEN ${DATED} THEN v.eta ELSE '9999' END,
   ${BAY_POS} IS NOT NULL, ${BAY_POS} DESC, v.id`;
 
 // Position of every active van in the build order (0 = first call on stock).
-export function vanRanks() {
-  return new Map(all(`SELECT v.id FROM vans v WHERE ${ACTIVE_VAN} ORDER BY ${PRIORITY}`).map((r, i) => [r.id, i]));
+export async function vanRanks() {
+  return new Map((await all(`SELECT v.id FROM vans v WHERE ${ACTIVE_VAN} ORDER BY ${PRIORITY}`)).map((r, i) => [r.id, i]));
 }
 
 // Every active van's place in the build order (1 = first call on stock) and why, in plain words:
 // "In production · build order 1 · Bay 3", "In production · due 18/9 – 26 days late · Bay 3",
 // "Planned · due 3/11", "Planned · no due date". Map vanId → { pos, why }.
 const dm = s => (s ? `${Number(s.slice(8, 10))}/${Number(s.slice(5, 7))}` : '');
-export function buildOrderInfo() {
+export async function buildOrderInfo() {
   const t = today();
-  const rows = all(`SELECT v.id, v.status, v.eta, v.build_order, fa.name AS area_name, fa.kind AS area_kind
+  const rows = await all(`SELECT v.id, v.status, v.eta, v.build_order, fa.name AS area_name, fa.kind AS area_kind
                     FROM vans v LEFT JOIN floor_areas fa ON fa.id = v.area_id WHERE ${ACTIVE_VAN} ORDER BY ${PRIORITY}`);
   const out = new Map();
   rows.forEach((v, i) => {
@@ -61,52 +73,55 @@ export function buildOrderInfo() {
 
 const isPlaceholder = i => !!(i && (i.placeholder || /^PLAN-/i.test(i.sku || '')));
 
-export function ignoreList() {
-  try { return JSON.parse(getSetting('ignore', '[]')); } catch { return []; }
+export async function ignoreList() {
+  try { return JSON.parse(await getSetting('ignore', '[]')); } catch { return []; }
 }
 
-export function activeRules() {
+export async function activeRules() {
   return all('SELECT r.* FROM rules r JOIN items i ON i.id = r.item_id WHERE r.active = 1 AND i.active = 1 ORDER BY r.sort, r.id');
 }
 
 // Vans whose shortages count as "short" / "waiting on parts" now: in production, or due within the
 // "coming up" weeks (short_weeks, C6). A planned van whose date has passed is on "dates to check" instead.
-export function nearVanSql(v = 'v') {
-  const days = 7 * purchasingSettings().short_weeks;
-  return `(${v}.status = 'in_production' OR (${v}.status = 'planned' AND ${v}.eta <> '' AND ${v}.eta >= date('now','localtime')
-           AND ${v}.eta <= date('now','localtime', '+${Math.round(days)} days')))`;
+export async function nearVanSql(v = 'v') {
+  const days = 7 * (await purchasingSettings()).short_weeks;
+  return `(${v}.status = 'in_production' OR (${v}.status = 'planned' AND ${v}.eta <> '' AND ${v}.eta >= ${TODAY_SQL}
+           AND ${v}.eta <= to_char(${MELB} + interval '${Math.round(days)} days', 'YYYY-MM-DD')))`;
 }
 
 // One pass of aggregated GROUP BY queries (no per-item sub-queries). "short" counts only vans in
 // production or due within short_weeks, and leaves out the lines waiting on an answer (customer
 // supplies, to be decided, unanswered "check: already ordered?"). on_order_shelf = open PO quantity
 // not for a particular van.
-const itemStockSql = () => `
+async function itemStockSql() {
+  const near = await nearVanSql('v');
+  return `
   WITH op AS (${OPEN_PO_BY_VAN}),
   ln AS (SELECT l.item_id, SUM(l.reserved) AS reserved,
-           SUM(CASE WHEN l.qty > l.reserved + l.issued AND ${COUNTS_SHORT('l', 'op')} AND ${nearVanSql('v')} THEN l.qty - l.reserved - l.issued ELSE 0 END) AS short
+           SUM(CASE WHEN l.qty > l.reserved + l.issued AND ${COUNTS_SHORT('l', 'op')} AND ${near} THEN l.qty - l.reserved - l.issued ELSE 0 END) AS short
          FROM van_lines l JOIN vans v ON v.id = l.van_id LEFT JOIN op ON op.item_id = l.item_id AND op.van_id = l.van_id
          WHERE ${ACTIVE_VAN} GROUP BY l.item_id),
   oo AS (SELECT item_id, SUM(q) AS q, SUM(CASE WHEN van_id IS NULL THEN q ELSE 0 END) AS qs FROM op GROUP BY item_id)
   SELECT i.*, COALESCE(ln.reserved, 0) AS reserved, COALESCE(ln.short, 0) AS short, COALESCE(oo.q, 0) AS on_order,
     COALESCE(oo.qs, 0) AS on_order_shelf, (SELECT name FROM floor_areas fa WHERE fa.id = i.area_id) AS area_name
   FROM items i LEFT JOIN ln ON ln.item_id = i.id LEFT JOIN oo ON oo.item_id = i.id`;
+}
 
-export function listItems({ includeInactive = false } = {}) {
-  const rows = all(`${itemStockSql()} ${includeInactive ? '' : 'WHERE i.active = 1'} ORDER BY i.category, i.name`);
-  const ctx = { counted: firstCountDone() };
+export async function listItems({ includeInactive = false } = {}) {
+  const rows = await all(`${await itemStockSql()} ${includeInactive ? '' : 'WHERE i.active = 1'} ORDER BY i.category, i.name`);
+  const ctx = { counted: await firstCountDone() };
   return rows.map(r => withAvailable(r, ctx));
 }
 
-export function getItem(id) {
-  const row = get(`${itemStockSql()} WHERE i.id = ?`, id);
-  return row && withAvailable(row, { counted: firstCountDone() });
+export async function getItem(id) {
+  const row = await get(`${await itemStockSql()} WHERE i.id = ?`, id);
+  return row && withAvailable(row, { counted: await firstCountDone() });
 }
 
 // Shelf items in counts (C3): every one of them has been counted at least once = go-live step (e) done.
-const COUNTABLE_ITEM = `i.active = 1 AND i.kind = 'stock' AND i.placeholder = 0 AND i.sku NOT LIKE 'PLAN-%'`;
-export function firstCountDone() {
-  return !get(`SELECT 1 FROM items i WHERE ${COUNTABLE_ITEM} AND i.last_counted = '' LIMIT 1`);
+const COUNTABLE_ITEM = `i.active = 1 AND i.kind = 'stock' AND i.placeholder = 0 AND i.sku NOT ILIKE 'PLAN-%'`;
+export async function firstCountDone() {
+  return !await get(`SELECT 1 FROM items i WHERE ${COUNTABLE_ITEM} AND i.last_counted = '' LIMIT 1`);
 }
 
 // `ctx.counted`: the first full rack count is done (until then low-stock warnings are hidden for items
@@ -155,28 +170,33 @@ export const LINE_STATUS_TEXT = { issued: 'Fitted', customer: 'Customer supplies
 // names that order (plan "Coast Order 137") is filled first, so a van with the part on two lines (one on
 // order, one still to order) gets it on the line that was ordered and never comes back in "Check: already
 // ordered?". Only the order of that one van's lines changes; other vans are never touched by it.
-export function allocateItem(itemId, preferVan = null, { firm = 0, reason = 'allocate', worker = '', poRef = '' } = {}) {
-  const item = get('SELECT on_hand, kind FROM items WHERE id = ?', itemId);
+export async function allocateItem(itemId, preferVan = null, opts = {}) {
+  return writeTx(() => allocate(itemId, preferVan, opts));
+}
+async function allocate(itemId, preferVan = null, { firm = 0, reason = 'allocate', worker = '', poRef = '' } = {}) {
+  const item = await get('SELECT on_hand, kind FROM items WHERE id = ?', itemId);
   if (!item) return;
   let firmLeft = preferVan != null ? Math.max(0, firm) : 0;
   const ref = String(poRef ?? '').trim();
-  const log = (l, field, before, after, extra = {}) => reason && logAlloc(reason, { van_id: l.van_id, item_id: itemId, line_id: l.id, field, before, after, worker, ...extra });
+  const log = async (l, field, before, after, extra = {}) => {
+    if (reason) await logAlloc(reason, { van_id: l.van_id, item_id: itemId, line_id: l.id, field, before, after, worker, ...extra });
+  };
   if (firmLeft > 0) {
-    for (const l of all(`SELECT * FROM van_lines l WHERE van_id = ? AND item_id = ? AND reserved > reserved_firm AND ${ALLOCATABLE('l')}
+    for (const l of await all(`SELECT * FROM van_lines l WHERE van_id = ? AND item_id = ? AND reserved > reserved_firm AND ${ALLOCATABLE('l')}
                          ORDER BY CASE WHEN ? <> '' AND lower(trim(l.po_ref)) = lower(?) THEN 0 ELSE 1 END, id`, preferVan, itemId, ref, ref)) {
       if (firmLeft <= 0) break;
       const lock = Math.min(firmLeft, l.reserved - l.reserved_firm);
-      run('UPDATE van_lines SET reserved_firm = reserved_firm + ? WHERE id = ?', lock, l.id);
-      log(l, 'reserved_firm', l.reserved_firm, l.reserved_firm + lock, { change: 0, firm_change: lock });
+      await run('UPDATE van_lines SET reserved_firm = reserved_firm + ? WHERE id = ?', lock, l.id);
+      await log(l, 'reserved_firm', l.reserved_firm, l.reserved_firm + lock, { change: 0, firm_change: lock });
       firmLeft -= lock;
     }
   }
   if (item.kind === 'per-van' && preferVan == null) return;
-  const reserved = get(`SELECT COALESCE(SUM(l.reserved),0) AS r FROM van_lines l JOIN vans v ON v.id = l.van_id
-                        WHERE l.item_id = ? AND ${ACTIVE_VAN}`, itemId).r;
+  const reserved = (await get(`SELECT COALESCE(SUM(l.reserved),0) AS r FROM van_lines l JOIN vans v ON v.id = l.van_id
+                        WHERE l.item_id = ? AND ${ACTIVE_VAN}`, itemId)).r;
   let free = item.on_hand - reserved;
   if (free <= 0) return;
-  const lines = all(`SELECT l.* FROM van_lines l JOIN vans v ON v.id = l.van_id
+  const lines = await all(`SELECT l.* FROM van_lines l JOIN vans v ON v.id = l.van_id
                      WHERE l.item_id = ? AND ${ACTIVE_VAN} AND l.qty > l.reserved + l.issued AND ${ALLOCATABLE('l')}
                        AND (? = 'stock' OR v.id = ?)
                      ORDER BY CASE WHEN v.id = ? THEN 0 ELSE 1 END,
@@ -186,55 +206,55 @@ export function allocateItem(itemId, preferVan = null, { firm = 0, reason = 'all
     if (free <= 0) break;
     const take = Math.min(free, l.qty - l.reserved - l.issued);
     const lock = l.van_id === preferVan ? Math.min(firmLeft, take) : 0;
-    run('UPDATE van_lines SET reserved = reserved + ?, reserved_firm = reserved_firm + ? WHERE id = ?', take, lock, l.id);
-    log(l, lock ? 'reserved (locked)' : 'reserved', l.reserved, l.reserved + take, { change: take, firm_change: lock });
+    await run('UPDATE van_lines SET reserved = reserved + ?, reserved_firm = reserved_firm + ? WHERE id = ?', take, lock, l.id);
+    await log(l, lock ? 'reserved (locked)' : 'reserved', l.reserved, l.reserved + take, { change: take, firm_change: lock });
     firmLeft -= lock;
     free -= take;
   }
 }
 
 // Set-aside stock that may move: what was held from the shelf, not what was received for the van.
-const FLEX = 'MAX(0, l.reserved - l.reserved_firm)';
+const FLEX = 'GREATEST(0, l.reserved - l.reserved_firm)';
 
 // If a count shows less on the shelf than is set aside, take the flexible part back from the vans
 // built last. Parts received for a van (locked) are never taken here — the count screen asks about
 // those. Returns how much is still over (locked stock the shelf doesn't have).
-function trimReservations(itemId, { reason = 'trim', worker = '' } = {}) {
-  const item = get('SELECT on_hand FROM items WHERE id = ?', itemId);
-  let over = get(`SELECT COALESCE(SUM(l.reserved),0) AS r FROM van_lines l JOIN vans v ON v.id = l.van_id
-                  WHERE l.item_id = ? AND ${ACTIVE_VAN}`, itemId).r - Math.max(0, item.on_hand);
+async function trimReservations(itemId, { reason = 'trim', worker = '' } = {}) {
+  const item = await get('SELECT on_hand FROM items WHERE id = ?', itemId);
+  let over = (await get(`SELECT COALESCE(SUM(l.reserved),0) AS r FROM van_lines l JOIN vans v ON v.id = l.van_id
+                  WHERE l.item_id = ? AND ${ACTIVE_VAN}`, itemId)).r - Math.max(0, item.on_hand);
   if (over <= 0) return 0;
-  const ranks = vanRanks();
-  const lines = all(`SELECT l.*, ${FLEX} AS flex FROM van_lines l JOIN vans v ON v.id = l.van_id
-                     WHERE l.item_id = ? AND ${ACTIVE_VAN} AND l.reserved > l.reserved_firm`, itemId)
+  const ranks = await vanRanks();
+  const lines = (await all(`SELECT l.*, ${FLEX} AS flex FROM van_lines l JOIN vans v ON v.id = l.van_id
+                     WHERE l.item_id = ? AND ${ACTIVE_VAN} AND l.reserved > l.reserved_firm`, itemId))
     .sort((a, b) => (ranks.get(b.van_id) ?? 0) - (ranks.get(a.van_id) ?? 0) || b.id - a.id);
   for (const l of lines) {
     if (over <= 0) break;
     const give = Math.min(over, l.flex);
-    run('UPDATE van_lines SET reserved = reserved - ? WHERE id = ?', give, l.id);
-    logAlloc(reason, { van_id: l.van_id, item_id: itemId, line_id: l.id, field: 'reserved', before: l.reserved, after: l.reserved - give, worker });
+    await run('UPDATE van_lines SET reserved = reserved - ? WHERE id = ?', give, l.id);
+    await logAlloc(reason, { van_id: l.van_id, item_id: itemId, line_id: l.id, field: 'reserved', before: l.reserved, after: l.reserved - give, worker });
     over -= give;
   }
   return Math.max(0, over);
 }
 
 // Every active line's set-aside amount: Map lineId → {van_id, item_id, reserved}.
-function reservedSnapshot() {
-  return new Map(all(`SELECT l.id, l.van_id, l.item_id, l.reserved FROM van_lines l JOIN vans v ON v.id = l.van_id WHERE ${ACTIVE_VAN}`)
+async function reservedSnapshot() {
+  return new Map((await all(`SELECT l.id, l.van_id, l.item_id, l.reserved FROM van_lines l JOIN vans v ON v.id = l.van_id WHERE ${ACTIVE_VAN} ORDER BY l.id`))
     .map(r => [r.id, r]));
 }
 
 // Hand the flexible shelf stock out again in build order. Only reserved - reserved_firm moves:
 // parts received for a van stay with it, and per-van parts are never moved to another van.
-function runReprioritise() {
-  run(`UPDATE van_lines SET reserved = reserved_firm
+async function runReprioritise() {
+  await run(`UPDATE van_lines SET reserved = reserved_firm
        WHERE reserved > reserved_firm AND van_id IN (SELECT id FROM vans v WHERE ${ACTIVE_VAN})
          AND item_id IN (SELECT id FROM items WHERE kind = 'stock')`);
-  for (const { id } of all(`SELECT id FROM items WHERE kind = 'stock'`)) allocateItem(id, null, { reason: '' });
+  for (const { id } of await all(`SELECT id FROM items WHERE kind = 'stock' ORDER BY id`)) await allocateItem(id, null, { reason: '' });
 }
 
 // Per van: the parts it would gain and lose (net, per item).
-function reprioritiseDiff(before, after) {
+async function reprioritiseDiff(before, after) {
   const net = new Map(); // `${van}|${item}` → delta
   for (const [id, b] of before) {
     const d = (after.get(id)?.reserved ?? 0) - b.reserved;
@@ -243,9 +263,9 @@ function reprioritiseDiff(before, after) {
     net.set(k, (net.get(k) || 0) + d);
   }
   const vans = new Map();
-  const names = new Map(all('SELECT id, sku, name, unit FROM items').map(i => [i.id, i]));
-  const chassis = new Map(all('SELECT id, chassis FROM vans').map(v => [v.id, v.chassis]));
-  const ranks = vanRanks();
+  const names = new Map((await all('SELECT id, sku, name, unit FROM items')).map(i => [i.id, i]));
+  const chassis = new Map((await all('SELECT id, chassis FROM vans')).map(v => [v.id, v.chassis]));
+  const ranks = await vanRanks();
   for (const [k, d] of net) {
     if (Math.abs(d) < 1e-9) continue;
     const [vanId, itemId] = k.split('|').map(Number);
@@ -256,27 +276,33 @@ function reprioritiseDiff(before, after) {
   return [...vans.values()].sort((a, b) => (ranks.get(a.van_id) ?? 0) - (ranks.get(b.van_id) ?? 0));
 }
 
-// What "Re-prioritise" would do, without doing it.
-export function reprioritisePreview() {
-  if (db.isTransaction) throw httpError(409, 'Busy — try again');
-  const before = reservedSnapshot();
-  db.exec('BEGIN');
+// What "Re-prioritise" would do, without doing it: done inside a write transaction (so nobody changes the
+// stock meanwhile) that is then rolled back — nothing is kept and data_version is not bumped.
+const ROLLBACK = Symbol('roll back the preview');
+export async function reprioritisePreview() {
+  if (inTx()) throw httpError(409, 'Busy — try again');
+  let diff;
   try {
-    runReprioritise();
-    return reprioritiseDiff(before, reservedSnapshot());
-  } finally {
-    db.exec('ROLLBACK');
+    await writeTx(async () => {
+      const before = await reservedSnapshot();
+      await runReprioritise();
+      diff = await reprioritiseDiff(before, await reservedSnapshot());
+      throw ROLLBACK;
+    });
+  } catch (e) {
+    if (e !== ROLLBACK) throw e;
   }
+  return diff;
 }
 
-export function reprioritiseAll({ by = '' } = {}) {
-  return tx(() => {
-    const before = reservedSnapshot();
-    runReprioritise();
-    const after = reservedSnapshot();
+export async function reprioritiseAll({ by = '' } = {}) {
+  return writeTx(async () => {
+    const before = await reservedSnapshot();
+    await runReprioritise();
+    const after = await reservedSnapshot();
     for (const [id, b] of before) {
       const a = after.get(id)?.reserved ?? 0;
-      if (Math.abs(a - b.reserved) > 1e-9) logAlloc('reprioritise', { van_id: b.van_id, item_id: b.item_id, line_id: id, field: 'reserved', before: b.reserved, after: a, worker: by });
+      if (Math.abs(a - b.reserved) > 1e-9) await logAlloc('reprioritise', { van_id: b.van_id, item_id: b.item_id, line_id: id, field: 'reserved', before: b.reserved, after: a, worker: by });
     }
     return reprioritiseDiff(before, after);
   });
@@ -286,11 +312,11 @@ export function reprioritiseAll({ by = '' } = {}) {
 
 // `chassis`: when re-loading an order for a van already in the system, count the stock that's
 // already set aside for that van as available to it.
-export function previewOrder(fields, chassis = '') {
-  const { lines, review, errors } = buildPartsList(fields, activeRules(), ignoreList());
-  const stock = new Map(listItems({ includeInactive: true }).map(i => [i.id, i]));
-  const own = new Map(all(`SELECT l.item_id, SUM(l.reserved + l.issued) AS q FROM van_lines l JOIN vans v ON v.id = l.van_id
-                           WHERE v.chassis = ? GROUP BY l.item_id`, chassis).map(r => [r.item_id, r.q]));
+export async function previewOrder(fields, chassis = '') {
+  const { lines, review, errors } = buildPartsList(fields, await activeRules(), await ignoreList());
+  const stock = new Map((await listItems({ includeInactive: true })).map(i => [i.id, i]));
+  const own = new Map((await all(`SELECT l.item_id, SUM(l.reserved + l.issued) AS q FROM van_lines l JOIN vans v ON v.id = l.van_id
+                           WHERE v.chassis = ? GROUP BY l.item_id`, chassis)).map(r => [r.item_id, r.q]));
   return {
     lines: lines.map(l => {
       const it = stock.get(l.item_id);
@@ -307,28 +333,28 @@ export function previewOrder(fields, chassis = '') {
 // customer_items / normal_items (user-r4-9): the office's answers on the New dealer order screen — parts the
 // customer supplies (accepted suggestions), and parts the order's wording would have made "Customer supplies"
 // that the office says are ours to supply.
-export function createVan({ header, fields, dealer = '', customer_items = [], normal_items = [], by = '' }, { replace = false } = {}) {
+export async function createVan({ header, fields, dealer = '', customer_items = [], normal_items = [], by = '' }, { replace = false } = {}) {
   const chassis = String(header.chassis || '').trim().toUpperCase();
   if (!chassis) throw httpError(400, 'Chassis number is missing');
-  return tx(() => {
-    const existing = get('SELECT * FROM vans WHERE chassis = ?', chassis);
+  return writeTx(async () => {
+    const existing = await get('SELECT * FROM vans WHERE chassis = ?', chassis);
     if (existing && !replace) throw httpError(409, `${chassis} is already in the system`);
     let vanId;
     const vals = [header.customer || '', dealer || '', header.model || '', header.length || '', header.floorPlan || '',
                   header.colour || '', header.atm || '', header.quoteNo || '', header.orderDate || '', header.eta || ''];
     if (existing) {
       vanId = existing.id;
-      run(`UPDATE vans SET customer=?, dealer=?, model=?, length=?, floor_plan=?, colour=?, atm=?, quote_no=?, order_date=?, eta=?, reviewed=0
+      await run(`UPDATE vans SET customer=?, dealer=?, model=?, length=?, floor_plan=?, colour=?, atm=?, quote_no=?, order_date=?, eta=?, reviewed=0
            WHERE id=?`, ...vals, vanId);
-      run(`DELETE FROM order_fields WHERE van_id = ? AND section <> 'PRODUCTION PLAN'`, vanId);
+      await run(`DELETE FROM order_fields WHERE van_id = ? AND section <> 'PRODUCTION PLAN'`, vanId);
     } else {
-      vanId = Number(run(`INSERT INTO vans(chassis, customer, dealer, model, length, floor_plan, colour, atm, quote_no, order_date, eta)
-                          VALUES(?,?,?,?,?,?,?,?,?,?,?)`, chassis, ...vals).lastInsertRowid);
+      vanId = await insert(`INSERT INTO vans(chassis, customer, dealer, model, length, floor_plan, colour, atm, quote_no, order_date, eta)
+                          VALUES(?,?,?,?,?,?,?,?,?,?,?)`, chassis, ...vals);
     }
     const ins = 'INSERT INTO order_fields(van_id, section, label, value, note, sort) VALUES(?,?,?,?,?,?)';
-    fields.forEach((f, i) => run(ins, vanId, f.section || '', f.label, f.value || '', f.note || '', i));
+    for (const [i, f] of fields.entries()) await run(ins, vanId, f.section || '', f.label, f.value || '', f.note || '', i);
     const ids = a => new Set((Array.isArray(a) ? a : []).map(Number).filter(Boolean));
-    applyRules(vanId, { customer: ids(customer_items), normal: ids(normal_items), by });
+    await applyRules(vanId, { customer: ids(customer_items), normal: ids(normal_items), by });
     return vanId;
   });
 }
@@ -339,15 +365,18 @@ export function createVan({ header, fields, dealer = '', customer_items = [], no
 // rules aren't run over them (that would add every part a second time). Returns false then.
 // `answers`: { customer: Set of item ids the office marked "Customer supplies", normal: Set it said are not,
 // by } — from the New dealer order screen (user-r4-9). Without them the order's own wording decides, as before.
-export function applyRules(vanId, answers = {}) {
+export async function applyRules(vanId, answers = {}) {
+  return writeTx(() => applyRulesNow(vanId, answers));
+}
+async function applyRulesNow(vanId, answers) {
   const yes = answers.customer || new Set(), no = answers.normal || new Set();
-  const answerLog = (lineId, itemId, before, after, spec) => logAlloc('dealer order', { van_id: vanId, item_id: itemId, line_id: lineId, field: 'state',
+  const answerLog = async (lineId, itemId, before, after, spec) => logAlloc('dealer order', { van_id: vanId, item_id: itemId, line_id: lineId, field: 'state',
     before, after, worker: answers.by || 'Office',
     note: after === 'customer' ? `Customer supplies – accepted on the dealer order ("${spec}")` : `Not customer supplies – the office said so on the dealer order ("${spec}")` });
-  if (get(`SELECT 1 FROM van_lines WHERE van_id = ? AND source = 'plan' LIMIT 1`, vanId)) return false;
-  const fields = all(`SELECT * FROM order_fields WHERE van_id = ? AND section <> 'PRODUCTION PLAN' ORDER BY sort`, vanId);
-  const { lines } = buildPartsList(fields, activeRules(), ignoreList());
-  const old = all(`SELECT * FROM van_lines WHERE van_id = ? AND source = 'rule'`, vanId);
+  if (await get(`SELECT 1 FROM van_lines WHERE van_id = ? AND source = 'plan' LIMIT 1`, vanId)) return false;
+  const fields = await all(`SELECT * FROM order_fields WHERE van_id = ? AND section <> 'PRODUCTION PLAN' ORDER BY sort`, vanId);
+  const { lines } = buildPartsList(fields, await activeRules(), await ignoreList());
+  const old = await all(`SELECT * FROM van_lines WHERE van_id = ? AND source = 'rule' ORDER BY id`, vanId);
   const touched = new Set(old.map(l => l.item_id));
 
   const oldByItem = new Map(old.map(l => [l.item_id, l]));
@@ -365,32 +394,32 @@ export function applyRules(vanId, answers = {}) {
       // An answer given on the dealer order screen just now counts as someone's answer too (user-r4-9).
       const state = yes.has(l.item_id) && !prev.state && prev.issued === 0 ? 'customer'
         : !prev.state && prev.issued === 0 && said
-        && !get(`SELECT 1 FROM allocation_log WHERE line_id = ? AND field = 'state'`, prev.id) ? said : prev.state; // never undo someone's answer
-      if (yes.has(l.item_id) && state === 'customer' && prev.state !== 'customer') answerLog(prev.id, l.item_id, prev.state, 'customer', l.spec);
-      else if (no.has(l.item_id) && auto === 'customer' && !prev.state && !get(`SELECT 1 FROM allocation_log WHERE line_id = ? AND field = 'state'`, prev.id))
-        answerLog(prev.id, l.item_id, 'customer', '', l.spec);
+        && !await get(`SELECT 1 FROM allocation_log WHERE line_id = ? AND field = 'state'`, prev.id) ? said : prev.state; // never undo someone's answer
+      if (yes.has(l.item_id) && state === 'customer' && prev.state !== 'customer') await answerLog(prev.id, l.item_id, prev.state, 'customer', l.spec);
+      else if (no.has(l.item_id) && auto === 'customer' && !prev.state && !await get(`SELECT 1 FROM allocation_log WHERE line_id = ? AND field = 'state'`, prev.id))
+        await answerLog(prev.id, l.item_id, 'customer', '', l.spec);
       if (state !== prev.state && REMINDER_STATES.includes(state)) {
         const keep = Math.min(reserved, prev.reserved_firm);
-        if (reserved > keep) logAlloc('state', { van_id: vanId, item_id: l.item_id, line_id: prev.id, field: 'reserved', before: reserved, after: keep, note: `${STATE_LABEL[state]} (order says "${l.spec}") – shelf stock released` });
+        if (reserved > keep) await logAlloc('state', { van_id: vanId, item_id: l.item_id, line_id: prev.id, field: 'reserved', before: reserved, after: keep, note: `${STATE_LABEL[state]} (order says "${l.spec}") – shelf stock released` });
         reserved = keep;
       }
-      run('UPDATE van_lines SET qty = ?, reserved = ?, spec = ?, rule_id = ?, state = ? WHERE id = ?',
+      await run('UPDATE van_lines SET qty = ?, reserved = ?, spec = ?, rule_id = ?, state = ? WHERE id = ?',
           Math.max(l.qty, prev.issued), reserved, l.spec, l.rule_id, state, prev.id);
       oldByItem.delete(l.item_id);
     } else {
-      const lineId = Number(run(`INSERT INTO van_lines(van_id, item_id, qty, spec, source, rule_id, state) VALUES(?,?,?,?, 'rule', ?, ?)`,
-          vanId, l.item_id, l.qty, l.spec, l.rule_id, said).lastInsertRowid);
+      const lineId = await insert(`INSERT INTO van_lines(van_id, item_id, qty, spec, source, rule_id, state) VALUES(?,?,?,?, 'rule', ?, ?)`,
+          vanId, l.item_id, l.qty, l.spec, l.rule_id, said);
       // Logged, so a later re-run of the rules never undoes the office's answer.
-      if (yes.has(l.item_id)) answerLog(lineId, l.item_id, '', 'customer', l.spec);
-      else if (no.has(l.item_id) && auto === 'customer') answerLog(lineId, l.item_id, 'customer', '', l.spec);
+      if (yes.has(l.item_id)) await answerLog(lineId, l.item_id, '', 'customer', l.spec);
+      else if (no.has(l.item_id) && auto === 'customer') await answerLog(lineId, l.item_id, 'customer', '', l.spec);
     }
   }
   // Rule lines that no longer apply: delete, unless stock was already issued for them.
   for (const prev of oldByItem.values()) {
-    if (prev.issued > 0) run('UPDATE van_lines SET qty = issued, reserved = 0 WHERE id = ?', prev.id);
-    else run('DELETE FROM van_lines WHERE id = ?', prev.id);
+    if (prev.issued > 0) await run('UPDATE van_lines SET qty = issued, reserved = 0 WHERE id = ?', prev.id);
+    else await run('DELETE FROM van_lines WHERE id = ?', prev.id);
   }
-  for (const itemId of touched) allocateItem(itemId);
+  for (const itemId of touched) await allocateItem(itemId);
   return true;
 }
 
@@ -402,9 +431,9 @@ export function applyRules(vanId, answers = {}) {
 // order / check by their status (Small fixes & phone round 2, sp-r1-2: they used to be a third group, so a special
 // line with an order number was "special" in the split but "check" on the van page's tile).
 // trade = only that trade's parts; vanId = one van.
-export function stillMissingByVan({ trade = '', vanId = null } = {}) {
+export async function stillMissingByVan({ trade = '', vanId = null } = {}) {
   const args = [trade, vanId].filter(Boolean);
-  const rows = all(`SELECT l.van_id, COUNT(*) AS missing,
+  const rows = await all(`SELECT l.van_id, COUNT(*) AS missing,
       SUM(CASE WHEN ${SPECIAL_ITEM('i')} THEN 1 ELSE 0 END) AS special,
       SUM(CASE WHEN ${UNANSWERED_CORR('l')} THEN 1 ELSE 0 END) AS chk,
       SUM(CASE WHEN ${SPECIAL_ITEM('i')} AND ${UNANSWERED_CORR('l')} THEN 1 ELSE 0 END) AS special_chk
@@ -420,19 +449,19 @@ export const NO_MISSING = Object.freeze({ missing: 0, order: 0, check: 0, specia
 // (on_order) / still to order (to_order) / to check (check). Same rule as getVan and the plan's "By van" (planGrid
 // `ps`): lineStatus with the van's own and the shelf's open PO lines, and a line fully covered by a shelf PO or
 // another van's spare PO line counts as on order. Map vanId → { on_order, to_order, check }.
-export function missingSplitByVan(vanIds) {
+export async function missingSplitByVan(vanIds) {
   const ids = [...new Set(vanIds)].filter(x => x != null);
   const out = new Map(ids.map(id => [id, { on_order: 0, to_order: 0, check: 0 }]));
   if (!ids.length) return out;
   const ph = ids.map(() => '?').join(',');
   const vanQ = new Map(), shelfQ = new Map();
-  for (const r of all(`SELECT pl.item_id, pl.van_id, ${PO_OPEN} AS q FROM po_lines pl JOIN purchase_orders p ON p.id = pl.po_id
+  for (const r of await all(`SELECT pl.item_id, pl.van_id, ${PO_OPEN} AS q FROM po_lines pl JOIN purchase_orders p ON p.id = pl.po_id
                        WHERE ${PO_IS_OPEN} AND (pl.van_id IS NULL OR pl.van_id IN (${ph}))`, ...ids)) {
     if (r.van_id == null) shelfQ.set(r.item_id, (shelfQ.get(r.item_id) || 0) + r.q);
     else { const k = `${r.van_id}|${r.item_id}`; vanQ.set(k, (vanQ.get(k) || 0) + r.q); }
   }
-  const cov = lineCover();
-  for (const l of all(`SELECT l.id, l.van_id, l.item_id, l.qty, l.reserved, l.issued, l.state, l.urgent, l.po_ref
+  const cov = await lineCover();
+  for (const l of await all(`SELECT l.id, l.van_id, l.item_id, l.qty, l.reserved, l.issued, l.state, l.urgent, l.po_ref
                        FROM van_lines l WHERE l.van_id IN (${ph}) AND ${STILL_MISSING('l')}`, ...ids)) {
     const mine = vanQ.get(`${l.van_id}|${l.item_id}`) || 0;
     let st = lineStatus({ ...l, on_order_van: mine, on_order: mine + (shelfQ.get(l.item_id) || 0) });
@@ -444,16 +473,16 @@ export function missingSplitByVan(vanIds) {
   return out;
 }
 
-export function listVans({ status } = {}) {
+export async function listVans({ status } = {}) {
   const where = status === 'active' ? `WHERE ${ACTIVE_VAN}` : status ? 'WHERE v.status = ?' : '';
   const args = status && status !== 'active' ? [status] : [];
-  const order = buildOrderInfo();
-  const still = stillMissingByVan();
+  const order = await buildOrderInfo();
+  const still = await stillMissingByVan();
   // owner-r3-2: "18 waiting on PO · 29 still to order · 10 to check" for vans still to build
-  const split = missingSplitByVan(all(`SELECT v.id FROM vans v WHERE ${ACTIVE_VAN}`).map(r => r.id));
+  const split = await missingSplitByVan((await all(`SELECT v.id FROM vans v WHERE ${ACTIVE_VAN}`)).map(r => r.id));
   const withOrder = v => ({ ...v, build_pos: order.get(v.id)?.pos ?? null, build_why: order.get(v.id)?.why ?? '', still: still.get(v.id) || NO_MISSING,
     ...(split.has(v.id) ? { split: split.get(v.id) } : {}) });
-  return all(`
+  return (await all(`
     SELECT v.*,
       (SELECT COUNT(*) FROM van_lines l WHERE l.van_id = v.id AND (${ALLOCATABLE('l')} OR l.issued >= l.qty)) AS line_count,
       (SELECT COUNT(*) FROM van_lines l WHERE l.van_id = v.id AND (${ALLOCATABLE('l')} OR l.issued >= l.qty) AND l.reserved + l.issued >= l.qty) AS ready_count,
@@ -461,29 +490,29 @@ export function listVans({ status } = {}) {
       -- really waiting on parts (not counting lines waiting on an answer)
       -- (and not "as per plan" catch-alls: those are on "special parts to confirm")
       (SELECT COUNT(*) FROM van_lines l JOIN items i ON i.id = l.item_id WHERE l.van_id = v.id AND l.qty > l.reserved + l.issued
-         AND ${COUNTS_SHORT_CORR('l')} AND i.placeholder = 0 AND i.sku NOT LIKE 'PLAN-%') AS waiting_count,
+         AND ${COUNTS_SHORT_CORR('l')} AND i.placeholder = 0 AND i.sku NOT ILIKE 'PLAN-%') AS waiting_count,
       -- in production or due within the "coming up" weeks: only these count as "waiting on parts"
-      CASE WHEN ${nearVanSql('v')} THEN 1 ELSE 0 END AS near,
+      CASE WHEN ${await nearVanSql('v')} THEN 1 ELSE 0 END AS near,
       (SELECT COUNT(*) FROM van_lines l WHERE l.van_id = v.id AND l.issued < l.qty AND l.state IN ('customer','tbd')) AS decision_count
     FROM vans v ${where}
-    ORDER BY CASE v.status WHEN 'in_production' THEN 0 WHEN 'planned' THEN 1 ELSE 2 END, ${PRIORITY}`, ...args).map(withOrder);
+    ORDER BY CASE v.status WHEN 'in_production' THEN 0 WHEN 'planned' THEN 1 ELSE 2 END, ${PRIORITY}`, ...args)).map(withOrder);
 }
 
-export function getVan(id) {
-  const van = get('SELECT * FROM vans WHERE id = ?', id);
+export async function getVan(id) {
+  const van = await get('SELECT * FROM vans WHERE id = ?', id);
   if (!van) throw httpError(404, 'Van not found');
-  const fields = all('SELECT * FROM order_fields WHERE van_id = ? ORDER BY sort', id);
+  const fields = await all('SELECT * FROM order_fields WHERE van_id = ? ORDER BY sort', id);
   // Open PO lines for this van (with supplier and arrival date) and for the shelf.
-  const poRows = all(`SELECT pl.item_id, pl.van_id, ${PO_OPEN} AS q, p.id AS po_id, p.po_no, p.supplier,
+  const poRows = await all(`SELECT pl.item_id, pl.van_id, ${PO_OPEN} AS q, p.id AS po_id, p.po_no, p.supplier,
                         COALESCE(NULLIF(pl.expected, ''), p.expected) AS expected
                       FROM po_lines pl JOIN purchase_orders p ON p.id = pl.po_id
                       WHERE ${PO_IS_OPEN} AND (pl.van_id IS NULL OR pl.van_id = ?) ORDER BY pl.id`, id);
-  const neededBy = vanNeededBy(van);
-  const lines = all(`SELECT l.*, i.sku, i.name, i.category, i.unit, i.kind, i.supplier, i.location, i.photo, r.name AS rule_name,
+  const neededBy = await vanNeededBy(van);
+  const lines = (await all(`SELECT l.*, i.sku, i.name, i.category, i.unit, i.kind, i.supplier, i.location, i.photo, r.name AS rule_name,
                        i.plan_column AS item_plan_column, i.placeholder, i.trade, i.unit_size,
                        (SELECT COUNT(*) FROM allocation_log a WHERE a.line_id = l.id) AS log_count
                      FROM van_lines l JOIN items i ON i.id = l.item_id LEFT JOIN rules r ON r.id = l.rule_id
-                     WHERE l.van_id = ? ORDER BY i.category, i.name`, id)
+                     WHERE l.van_id = ? ORDER BY i.category, i.name`, id))
     .map(l => {
       const mine = poRows.filter(p => p.item_id === l.item_id && p.van_id === l.van_id);
       const shelf = poRows.filter(p => p.item_id === l.item_id && p.van_id == null);
@@ -497,11 +526,11 @@ export function getVan(id) {
         expected, needed_by: lineNeed || '', late: !!(expected && lineNeed && expected > lineNeed) };
       return { ...withPo, status: lineStatus(withPo) };
     });
-  const usual = itemMedians(lines.map(l => l.item_id));
+  const usual = await itemMedians(lines.map(l => l.item_id));
   for (const l of lines) l.qty_check = qtyCheckFor(l, usual.get(l.item_id));
   // Covered by another van's spare PO (or a shelf PO), as Purchasing → To order counts it (check-r4-3): say
   // which PO, so a line that dropped off To order is not shown as "Not ordered" with nothing to explain why.
-  const cov = lineCover({ vanId: van.id });
+  const cov = await lineCover({ vanId: van.id });
   for (const l of lines) {
     const c = cov.get(l.id);
     if (!c || !['to_order', 'on_order', 'check'].includes(l.status)) continue;
@@ -518,17 +547,17 @@ export function getVan(id) {
   // From the production plan only the customer requests / extras need checking by hand; the
   // rest of its columns are already parts.
   const reviewFields = fields.filter(f => f.section !== 'PRODUCTION PLAN' || /REQUESTS|EXTRA$/i.test(f.label));
-  const { review } = buildPartsList(reviewFields, activeRules(), ignoreList());
-  const bo = buildOrderInfo().get(van.id);
-  return { van: { ...van, build_pos: bo?.pos ?? null, build_why: bo?.why ?? '', still: stillMissingByVan({ vanId: van.id }).get(van.id) || NO_MISSING }, fields, lines, review, fromPlan: lines.some(l => l.source === 'plan') };
+  const { review } = buildPartsList(reviewFields, await activeRules(), await ignoreList());
+  const bo = (await buildOrderInfo()).get(van.id);
+  return { van: { ...van, build_pos: bo?.pos ?? null, build_why: bo?.why ?? '', still: (await stillMissingByVan({ vanId: van.id })).get(van.id) || NO_MISSING }, fields, lines, review, fromPlan: lines.some(l => l.source === 'plan') };
 }
 
 // Median quantity per van for each item (all vans, finished ones too): "what a van normally needs".
-export function itemMedians(itemIds) {
+export async function itemMedians(itemIds) {
   const ids = [...new Set(itemIds)].filter(Boolean);
   const by = new Map();
   if (!ids.length) return by;
-  for (const r of all(`SELECT item_id, qty FROM van_lines WHERE item_id IN (${ids.map(() => '?').join(',')})`, ...ids)) {
+  for (const r of await all(`SELECT item_id, qty FROM van_lines WHERE item_id IN (${ids.map(() => '?').join(',')})`, ...ids)) {
     if (!by.has(r.item_id)) by.set(r.item_id, []);
     by.get(r.item_id).push(r.qty);
   }
@@ -556,7 +585,7 @@ export function qtyCheckFor(l, usual = 0) {
   return leadInfo(l.spec || '', 1).check || dotsCheck(l.spec);
 }
 
-export function updateVan(id, patch) {
+export async function updateVan(id, patch) {
   const allowed = ['customer', 'dealer', 'model', 'length', 'floor_plan', 'colour', 'atm', 'quote_no', 'order_date', 'eta', 'notes', 'reviewed', 'status', 'build_order'];
   const keys = Object.keys(patch).filter(k => allowed.includes(k));
   if (!keys.length) return;
@@ -566,135 +595,138 @@ export function updateVan(id, patch) {
     patch = { ...patch, build_order: n };
   }
   if ('status' in patch && !['planned', 'in_production', 'completed', 'cancelled'].includes(patch.status)) throw httpError(400, 'Pick a status');
-  tx(() => {
-    const before = get('SELECT * FROM vans WHERE id = ?', id);
-    run(`UPDATE vans SET ${keys.map(k => `${k} = ?`).join(', ')} WHERE id = ?`, ...keys.map(k => patch[k]), id);
+  await writeTx(async () => {
+    const before = await get('SELECT * FROM vans WHERE id = ?', id);
+    await run(`UPDATE vans SET ${keys.map(k => `${k} = ?`).join(', ')} WHERE id = ?`, ...keys.map(k => patch[k]), id);
     // Follow-up round 1 (chk-r3-2): a status the office sets by hand is written to the history, so undoing a
     // floor take never puts back a status the office chose ('van status' rows are the office's).
     if (before && 'status' in patch && patch.status !== before.status) {
       const word = s => String(s || '').replace(/_/g, ' ');
-      logAlloc('van status', { van_id: id, field: 'van status', before: word(before.status), after: word(patch.status), note: 'status set by the office' });
+      await logAlloc('van status', { van_id: id, field: 'van status', before: word(before.status), after: word(patch.status), note: 'status set by the office' });
     }
     // Finishing a van uses up what it still had set aside (it left inside the van); cancelling frees it.
     if (patch.status === 'completed' && before.status !== 'completed') {
-      useUpVan(id);
-      run('UPDATE vans SET area_id = NULL WHERE id = ?', id); // a finished van frees its bay
+      await useUpVan(id);
+      await run('UPDATE vans SET area_id = NULL WHERE id = ?', id); // a finished van frees its bay
     }
-    if (patch.status === 'cancelled' && before.status !== 'cancelled') releaseVan(id);
+    if (patch.status === 'cancelled' && before.status !== 'cancelled') await releaseVan(id);
     if (patch.status && ['planned', 'in_production'].includes(patch.status) && ['completed', 'cancelled'].includes(before.status)) {
-      for (const { item_id } of all('SELECT DISTINCT item_id FROM van_lines WHERE van_id = ?', id)) allocateItem(item_id, id);
+      for (const { item_id } of await all('SELECT DISTINCT item_id FROM van_lines WHERE van_id = ?', id)) await allocateItem(item_id, id);
     }
   });
 }
 
-function releaseVan(id) {
-  const items = all('SELECT DISTINCT item_id FROM van_lines WHERE van_id = ? AND reserved > 0', id);
-  for (const l of all('SELECT * FROM van_lines WHERE van_id = ? AND reserved > 0', id)) {
-    logAlloc('van finished', { van_id: id, item_id: l.item_id, line_id: l.id, field: 'reserved', before: l.reserved, after: 0,
+async function releaseVan(id) {
+  const items = await all('SELECT DISTINCT item_id FROM van_lines WHERE van_id = ? AND reserved > 0', id);
+  for (const l of await all('SELECT * FROM van_lines WHERE van_id = ? AND reserved > 0 ORDER BY id', id)) {
+    await logAlloc('van finished', { van_id: id, item_id: l.item_id, line_id: l.id, field: 'reserved', before: l.reserved, after: 0,
       firm_change: -l.reserved_firm, note: 'van cancelled – set-aside back to the shelf' });
   }
-  run('UPDATE van_lines SET reserved = 0, reserved_firm = 0 WHERE van_id = ?', id);
-  run('UPDATE vans SET area_id = NULL WHERE id = ?', id); // a finished van frees its bay
-  for (const { item_id } of items) allocateItem(item_id);
+  await run('UPDATE van_lines SET reserved = 0, reserved_firm = 0 WHERE van_id = ?', id);
+  await run('UPDATE vans SET area_id = NULL WHERE id = ?', id); // a finished van frees its bay
+  for (const { item_id } of items) await allocateItem(item_id);
 }
 
 // A finished van went out with the parts still set aside for it, so they're counted as used
 // (Return puts back anything that came back to the shelf). Lines that are still short aren't
 // used up: what little they had set aside goes back to the other vans, as before.
-// Call inside a transaction.
-export function useUpVan(vanId) {
-  const van = get('SELECT chassis FROM vans WHERE id = ?', vanId);
+// (Joins the caller's write transaction, or runs in its own.)
+export async function useUpVan(vanId) {
+  return writeTx(() => useUpVanNow(vanId));
+}
+async function useUpVanNow(vanId) {
+  const van = await get('SELECT chassis FROM vans WHERE id = ?', vanId);
   if (!van) return;
   const freed = new Set();
-  for (const l of all('SELECT * FROM van_lines WHERE van_id = ? AND reserved > 0', vanId)) {
+  for (const l of await all('SELECT * FROM van_lines WHERE van_id = ? AND reserved > 0 ORDER BY id', vanId)) {
     if (l.qty > l.reserved + l.issued) {
-      run('UPDATE van_lines SET reserved = 0, reserved_firm = 0 WHERE id = ?', l.id);
-      logAlloc('van finished', { van_id: vanId, item_id: l.item_id, line_id: l.id, field: 'reserved', before: l.reserved, after: 0,
+      await run('UPDATE van_lines SET reserved = 0, reserved_firm = 0 WHERE id = ?', l.id);
+      await logAlloc('van finished', { van_id: vanId, item_id: l.item_id, line_id: l.id, field: 'reserved', before: l.reserved, after: 0,
         firm_change: -l.reserved_firm, note: `${van.chassis} finished while still short – set-aside back to the shelf` });
       freed.add(l.item_id);
       continue;
     }
-    run('UPDATE items SET on_hand = on_hand - ? WHERE id = ?', l.reserved, l.item_id);
-    run('UPDATE van_lines SET issued = issued + reserved, reserved = 0, reserved_firm = 0 WHERE id = ?', l.id);
-    logAlloc('van finished', { van_id: vanId, item_id: l.item_id, line_id: l.id, field: 'reserved', before: l.reserved, after: 0,
+    await run('UPDATE items SET on_hand = on_hand - ? WHERE id = ?', l.reserved, l.item_id);
+    await run('UPDATE van_lines SET issued = issued + reserved, reserved = 0, reserved_firm = 0 WHERE id = ?', l.id);
+    await logAlloc('van finished', { van_id: vanId, item_id: l.item_id, line_id: l.id, field: 'reserved', before: l.reserved, after: 0,
       firm_change: -l.reserved_firm, note: `${van.chassis} finished – set-aside counted as used` });
-    run(`INSERT INTO movements(item_id, qty, type, van_id, ref, note) VALUES(?, ?, 'issue', ?, ?, 'Used — van finished')`,
+    await run(`INSERT INTO movements(item_id, qty, type, van_id, ref, note) VALUES(?, ?, 'issue', ?, ?, 'Used — van finished')`,
         l.item_id, -l.reserved, vanId, van.chassis);
   }
-  for (const itemId of freed) allocateItem(itemId);
+  for (const itemId of freed) await allocateItem(itemId);
 }
 
-export function deleteVan(id) {
-  tx(() => {
-    const items = all('SELECT DISTINCT item_id FROM van_lines WHERE van_id = ?', id);
-    run('DELETE FROM vans WHERE id = ?', id);
-    for (const { item_id } of items) allocateItem(item_id);
+export async function deleteVan(id) {
+  await writeTx(async () => {
+    const items = await all('SELECT DISTINCT item_id FROM van_lines WHERE van_id = ?', id);
+    await run('DELETE FROM vans WHERE id = ?', id);
+    for (const { item_id } of items) await allocateItem(item_id);
   });
 }
 
-export function addLine(vanId, { item_id, qty, spec = '', note = '' }) {
+export async function addLine(vanId, { item_id, qty, spec = '', note = '' }) {
   if (!(qty > 0)) throw httpError(400, 'Quantity must be more than 0');
-  return tx(() => {
-    if (!get('SELECT 1 FROM vans WHERE id = ?', vanId)) throw httpError(404, 'That van no longer exists — refresh');
-    const id = Number(run(`INSERT INTO van_lines(van_id, item_id, qty, spec, note, source) VALUES(?,?,?,?,?, 'manual')`, vanId, item_id, qty, spec, note).lastInsertRowid);
-    allocateItem(item_id, vanId);
+  return writeTx(async () => {
+    if (!await get('SELECT 1 FROM vans WHERE id = ?', vanId)) throw httpError(404, 'That van no longer exists — refresh');
+    const id = await insert(`INSERT INTO van_lines(van_id, item_id, qty, spec, note, source) VALUES(?,?,?,?,?, 'manual')`, vanId, item_id, qty, spec, note);
+    await allocateItem(item_id, vanId);
     return { id };
   });
 }
 
-export function updateLine(lineId, { qty, spec, note }) {
-  tx(() => {
-    const l = get('SELECT * FROM van_lines WHERE id = ?', lineId);
+export async function updateLine(lineId, { qty, spec, note }) {
+  await writeTx(async () => {
+    const l = await get('SELECT * FROM van_lines WHERE id = ?', lineId);
     if (!l) throw httpError(404, 'Line not found');
     const newQty = qty ?? l.qty;
     if (newQty < l.issued) throw httpError(400, `${l.issued} already issued — can't go below that`);
     // Editing a rule line by hand turns it into a manual line so a rebuild won't overwrite it.
-    run(`UPDATE van_lines SET qty = ?, reserved = MIN(reserved, ? - issued), spec = ?, note = ?, source = 'manual' WHERE id = ?`,
+    await run(`UPDATE van_lines SET qty = ?, reserved = LEAST(reserved, ?::double precision - issued), spec = ?, note = ?, source = 'manual' WHERE id = ?`,
         newQty, newQty, spec ?? l.spec, note ?? l.note, lineId);
-    allocateItem(l.item_id, l.van_id);
+    await allocateItem(l.item_id, l.van_id);
   });
 }
 
-export function deleteLine(lineId) {
-  tx(() => {
-    const l = get('SELECT * FROM van_lines WHERE id = ?', lineId);
+export async function deleteLine(lineId) {
+  await writeTx(async () => {
+    const l = await get('SELECT * FROM van_lines WHERE id = ?', lineId);
     if (!l) return;
     if (l.issued > 0) throw httpError(400, 'Stock was already issued for this line — return it first');
-    run('DELETE FROM van_lines WHERE id = ?', lineId);
-    allocateItem(l.item_id);
+    await run('DELETE FROM van_lines WHERE id = ?', lineId);
+    await allocateItem(l.item_id);
   });
 }
 
 // Hand reserved stock to the production floor (it leaves the shelf).
-export function issue(vanId, lineIds = null) {
-  return tx(() => issueLines(vanId, lineIds));
+export async function issue(vanId, lineIds = null) {
+  return writeTx(async () => issueLines(vanId, lineIds));
 }
 
-function issueLines(vanId, lineIds = null) {
-  const van = get('SELECT * FROM vans WHERE id = ?', vanId);
-  const lines = all('SELECT * FROM van_lines WHERE van_id = ? AND reserved > 0', vanId)
+async function issueLines(vanId, lineIds = null) {
+  const van = await get('SELECT * FROM vans WHERE id = ?', vanId);
+  const lines = (await all('SELECT * FROM van_lines WHERE van_id = ? AND reserved > 0 ORDER BY id', vanId))
     .filter(l => !lineIds || lineIds.includes(l.id));
   for (const l of lines) {
-    run('UPDATE items SET on_hand = on_hand - ? WHERE id = ?', l.reserved, l.item_id);
-    run('UPDATE van_lines SET issued = issued + reserved, reserved = 0 WHERE id = ?', l.id);
-    run(`INSERT INTO movements(item_id, qty, type, van_id, ref) VALUES(?, ?, 'issue', ?, ?)`, l.item_id, -l.reserved, vanId, van.chassis);
+    await run('UPDATE items SET on_hand = on_hand - ? WHERE id = ?', l.reserved, l.item_id);
+    await run('UPDATE van_lines SET issued = issued + reserved, reserved = 0 WHERE id = ?', l.id);
+    await run(`INSERT INTO movements(item_id, qty, type, van_id, ref) VALUES(?, ?, 'issue', ?, ?)`, l.item_id, -l.reserved, vanId, van.chassis);
   }
-  if (lines.length && van.status === 'planned') run(`UPDATE vans SET status = 'in_production' WHERE id = ?`, vanId);
+  if (lines.length && van.status === 'planned') await run(`UPDATE vans SET status = 'in_production' WHERE id = ?`, vanId);
   return lines.length;
 }
 
 // Put issued stock back on the shelf (wrong part, van changed…).
-export function returnLine(lineId, qty) {
-  tx(() => {
-    const l = get('SELECT l.*, v.chassis FROM van_lines l JOIN vans v ON v.id = l.van_id WHERE l.id = ?', lineId);
+export async function returnLine(lineId, qty) {
+  await writeTx(async () => {
+    const l = await get('SELECT l.*, v.chassis FROM van_lines l JOIN vans v ON v.id = l.van_id WHERE l.id = ?', lineId);
     if (!l) throw httpError(404, 'That part line no longer exists — refresh');
     const q = Math.min(qty ?? l.issued, l.issued);
     if (!(q > 0)) throw httpError(400, 'Nothing issued to return');
-    run('UPDATE items SET on_hand = on_hand + ? WHERE id = ?', q, l.item_id);
-    run('UPDATE van_lines SET issued = issued - ? WHERE id = ?', q, lineId);
-    run(`INSERT INTO movements(item_id, qty, type, van_id, ref) VALUES(?, ?, 'return', ?, ?)`, l.item_id, q, l.van_id, l.chassis);
+    await run('UPDATE items SET on_hand = on_hand + ? WHERE id = ?', q, l.item_id);
+    await run('UPDATE van_lines SET issued = issued - ? WHERE id = ?', q, lineId);
+    await run(`INSERT INTO movements(item_id, qty, type, van_id, ref) VALUES(?, ?, 'return', ?, ?)`, l.item_id, q, l.van_id, l.chassis);
     // Back to its own van first (a per-van part is never handed to another van automatically).
-    allocateItem(l.item_id, l.van_id);
+    await allocateItem(l.item_id, l.van_id);
   });
 }
 
@@ -703,33 +735,35 @@ export function returnLine(lineId, qty) {
 // Stock in. Received for a particular van (a PO line for that van, a delivery booked for it): it is
 // locked to that van, so re-prioritising never moves it.
 // `poRef`: the order number it came on (the van's line naming that order is filled first — see allocateItem).
-export function receive(itemId, qty, { ref = '', note = '', vanId = null, by = '', poRef = '' } = {}) {
+export async function receive(itemId, qty, { ref = '', note = '', vanId = null, by = '', poRef = '' } = {}) {
   if (!(qty > 0)) throw httpError(400, 'Quantity must be more than 0');
-  const mv = run(`INSERT INTO movements(item_id, qty, type, ref, note, van_id, worker) VALUES(?, ?, 'receive', ?, ?, ?, ?)`, itemId, qty, ref, note, vanId, by);
-  stockIn(itemId, qty, vanId, by, poRef);
-  return Number(mv.lastInsertRowid); // the movement, so a delivery booked on the floor can be undone
+  return writeTx(async () => {
+    const mv = await insert(`INSERT INTO movements(item_id, qty, type, ref, note, van_id, worker) VALUES(?, ?, 'receive', ?, ?, ?, ?)`, itemId, qty, ref, note, vanId, by);
+    await stockIn(itemId, qty, vanId, by, poRef);
+    return mv; // the movement, so a delivery booked on the floor can be undone
+  });
 }
 // Put stock on the shelf and hand it out: received for `vanId` → set aside and locked for that van first.
-function stockIn(itemId, qty, vanId, by = '', poRef = '') {
-  run('UPDATE items SET on_hand = on_hand + ? WHERE id = ?', qty, itemId);
-  allocateItem(itemId, vanId, { firm: vanId ? qty : 0, reason: 'receive', worker: by, poRef });
+async function stockIn(itemId, qty, vanId, by = '', poRef = '') {
+  await run('UPDATE items SET on_hand = on_hand + ? WHERE id = ?', qty, itemId);
+  await allocateItem(itemId, vanId, { firm: vanId ? qty : 0, reason: 'receive', worker: by, poRef });
 }
 // How much of a part a van still needs locked for it (customer supplies / to be decided / fitted lines need nothing).
-function vanNeedLocked(vanId, itemId) {
-  return get(`SELECT COALESCE(SUM(MAX(0, l.qty - l.issued - l.reserved_firm)), 0) AS n FROM van_lines l
-              WHERE l.van_id = ? AND l.item_id = ? AND ${ALLOCATABLE('l')}`, vanId, itemId).n;
+async function vanNeedLocked(vanId, itemId) {
+  return (await get(`SELECT COALESCE(SUM(GREATEST(0, l.qty - l.issued - l.reserved_firm)), 0) AS n FROM van_lines l
+              WHERE l.van_id = ? AND l.item_id = ? AND ${ALLOCATABLE('l')}`, vanId, itemId)).n;
 }
 
 // Tick some quantity off an open PO line; the PO closes once everything on it has arrived.
 // Returns true if this closed the PO.
-function bookPoLine(pl, q) {
-  run('UPDATE po_lines SET received = received + ? WHERE id = ?', q, pl.id);
+async function bookPoLine(pl, q) {
+  await run('UPDATE po_lines SET received = received + ? WHERE id = ?', q, pl.id);
   return closePoIfDone(pl.po_id);
 }
 // A PO is finished once every line has arrived or had its balance cancelled. Returns true if it closed now.
-function closePoIfDone(poId) {
-  if (get('SELECT COUNT(*) AS c FROM po_lines WHERE po_id = ? AND received + closed < qty - 1e-9', poId).c) return false;
-  return run(`UPDATE purchase_orders SET status = 'closed' WHERE id = ? AND status = 'open'`, poId).changes > 0;
+async function closePoIfDone(poId) {
+  if ((await get('SELECT COUNT(*) AS c FROM po_lines WHERE po_id = ? AND received + closed < qty - 1e-9', poId)).c) return false;
+  return (await run(`UPDATE purchase_orders SET status = 'closed' WHERE id = ? AND status = 'open'`, poId)).changes > 0;
 }
 
 // A delivery booked in on the floor or the item page (not from the PO screen). It's ticked off the
@@ -738,12 +772,12 @@ function closePoIfDone(poId) {
 // those in build order (the shared PRIORITY: the van with first call on stock is ticked off first,
 // lines for finished vans last), the PO / line number only as the tie-break. Follow-up round 1
 // (chk-r3-1): in line-number order a delivery of 2 went to vans #2 and #4 while #1 and #3 waited.
-export function receiveDelivery(itemId, qty, { ref = '', note = '', vanId = null, by = '' } = {}) {
+export async function receiveDelivery(itemId, qty, { ref = '', note = '', vanId = null, by = '' } = {}) {
   if (!(qty > 0)) throw httpError(400, 'Quantity must be more than 0');
-  return tx(() => {
-    const item = get('SELECT kind FROM items WHERE id = ?', itemId);
+  return writeTx(async () => {
+    const item = await get('SELECT kind FROM items WHERE id = ?', itemId);
     if (!item) throw httpError(404, 'Item not found');
-    const lines = all(`SELECT pl.*, p.po_no FROM po_lines pl JOIN purchase_orders p ON p.id = pl.po_id
+    const lines = await all(`SELECT pl.*, p.po_no FROM po_lines pl JOIN purchase_orders p ON p.id = pl.po_id
                        LEFT JOIN vans v ON v.id = pl.van_id
                        WHERE ${PO_IS_OPEN} AND pl.item_id = ?
                          AND (pl.van_id = ? OR pl.van_id IS NULL OR ? = 'stock')
@@ -754,13 +788,13 @@ export function receiveDelivery(itemId, qty, { ref = '', note = '', vanId = null
     const pos = [];
     // What this booking changes, so Undo (phone round 1, C11) can put every bit of it back.
     const rec = { kind: 'receive', po: [], reopen: [], alloc: [] };
-    const held = () => new Map(all('SELECT id, reserved, reserved_firm FROM van_lines WHERE item_id = ?', itemId).map(r => [r.id, r]));
-    const before = held();
+    const held = async () => new Map((await all('SELECT id, reserved, reserved_firm FROM van_lines WHERE item_id = ? ORDER BY id', itemId)).map(r => [r.id, r]));
+    const before = await held();
     const forVan = new Map(); // van → how much of this delivery was ticked off that van's PO lines
     for (const pl of lines) {
       if (left <= 0) break;
       const q = Math.min(left, pl.qty - pl.received - pl.closed);
-      if (bookPoLine(pl, q)) rec.reopen.push(pl.po_id);
+      if (await bookPoLine(pl, q)) rec.reopen.push(pl.po_id);
       rec.po.push([pl.id, q]);
       left -= q;
       if (!pos.includes(pl.po_no)) pos.push(pl.po_no);
@@ -779,39 +813,41 @@ export function receiveDelivery(itemId, qty, { ref = '', note = '', vanId = null
     // goes to the van the worker picked, or out in build order. One movement, so Undo still covers it all.
     const vanTxt = [];
     let rest = qty;
-    const chassisOf = id => get('SELECT chassis FROM vans WHERE id = ?', id)?.chassis || '';
+    const chassisOf = async id => (await get('SELECT chassis FROM vans WHERE id = ?', id))?.chassis || '';
     for (const [v, parts] of forVan) {
       let got = 0;
       for (const { po, n } of parts) {
-        const toVan = Math.min(n, vanNeedLocked(v, itemId));
-        if (toVan > 1e-9) { stockIn(itemId, toVan, v, by, po); rest -= toVan; got += toVan; }
+        const toVan = Math.min(n, await vanNeedLocked(v, itemId));
+        if (toVan > 1e-9) { await stockIn(itemId, toVan, v, by, po); rest -= toVan; got += toVan; }
       }
-      if (got > 1e-9) vanTxt.push(`${chassisOf(v)}${forVan.size > 1 || got !== qty ? ` (${q(got)})` : ''}`);
+      if (got > 1e-9) vanTxt.push(`${await chassisOf(v)}${forVan.size > 1 || got !== qty ? ` (${q(got)})` : ''}`);
     }
-    if (rest > 1e-9) stockIn(itemId, rest, vanId, by);
+    if (rest > 1e-9) await stockIn(itemId, rest, vanId, by);
     const forNote = vanTxt.length && !(forVan.size === 1 && forVan.has(vanId)) ? `For ${vanTxt.join(', ')}` : '';
-    const mv = run(`INSERT INTO movements(item_id, qty, type, ref, note, van_id, worker) VALUES(?, ?, 'receive', ?, ?, ?, ?)`, itemId, qty,
+    const mv = await insert(`INSERT INTO movements(item_id, qty, type, ref, note, van_id, worker) VALUES(?, ?, 'receive', ?, ?, ?, ?)`, itemId, qty,
       [ref, pos.length ? `PO ${pos.join(', ')}` : ''].filter(Boolean).join(' — '), [note, forNote].filter(Boolean).join(' — '), vanId, by);
-    const movementId = Number(mv.lastInsertRowid);
-    for (const [id, r] of held()) {
+    const movementId = mv;
+    for (const [id, r] of await held()) {
       const b = before.get(id) || { reserved: 0, reserved_firm: 0 };
       const d = r.reserved - b.reserved, df = r.reserved_firm - b.reserved_firm;
       if (Math.abs(d) > 1e-9 || Math.abs(df) > 1e-9) rec.alloc.push([id, d, df]);
     }
-    run('UPDATE movements SET undo = ? WHERE id = ?', JSON.stringify(rec), movementId);
+    await run('UPDATE movements SET undo = ? WHERE id = ?', JSON.stringify(rec), movementId);
     // Follow-up round 1 (worker-r3-4): which van(s) THIS delivery went to and how many each — what was newly set
     // aside per van (net, so stock that only changed hands between vans is not counted) — and how many stay on
     // the shelf for no van. The worker's pop-up names only these ("1 → ST0380"), not every van holding the part.
     const perVan = new Map();
     for (const [lineId, d] of rec.alloc) {
-      const vId = get('SELECT van_id FROM van_lines WHERE id = ?', lineId)?.van_id;
+      const vId = (await get('SELECT van_id FROM van_lines WHERE id = ?', lineId))?.van_id;
       if (vId != null) perVan.set(vId, (perVan.get(vId) || 0) + d);
     }
     const got = [...perVan].filter(([, n]) => n > 1e-9);
-    const rank = got.length > 1 ? new Map(all(`SELECT v.id FROM vans v WHERE v.id IN (${got.map(() => '?').join(',')}) ORDER BY ${PRIORITY}`,
-      ...got.map(([v]) => v)).map((r, i) => [r.id, i])) : new Map();
-    const to = got.sort(([a], [b]) => (rank.get(a) ?? 0) - (rank.get(b) ?? 0)) // in build order
-      .map(([v, n]) => ({ van_id: v, chassis: chassisOf(v), qty: Math.min(n, qty) }));
+    const rank = got.length > 1 ? new Map((await all(`SELECT v.id FROM vans v WHERE v.id IN (${got.map(() => '?').join(',')}) ORDER BY ${PRIORITY}`,
+      ...got.map(([v]) => v))).map((r, i) => [r.id, i])) : new Map();
+    const to = [];
+    for (const [v, n] of got.sort(([a], [b]) => (rank.get(a) ?? 0) - (rank.get(b) ?? 0))) { // in build order
+      to.push({ van_id: v, chassis: await chassisOf(v), qty: Math.min(n, qty) });
+    }
     const shelf = Math.max(0, qty - to.reduce((s, x) => s + x.qty, 0));
     return { pos, movement_id: movementId, to, shelf: shelf > 1e-9 ? shelf : 0 };
   });
@@ -820,53 +856,55 @@ export function receiveDelivery(itemId, qty, { ref = '', note = '', vanId = null
 // mode 'set' = a count of the shelf: written as movement type 'count' (and the item's "last counted"
 // date is set), even when the count matches. mode 'add' = a correction (type 'adjust').
 // `type: 'adjust'` forces an adjustment even for 'set' (e.g. "set shelf stock to zero").
-export function adjust(itemId, { mode = 'set', qty, note = '', type, by = '' }) {
-  tx(() => {
-    const item = get('SELECT * FROM items WHERE id = ?', itemId);
+export async function adjust(itemId, { mode = 'set', qty, note = '', type, by = '' }) {
+  await writeTx(async () => {
+    const item = await get('SELECT * FROM items WHERE id = ?', itemId);
     if (!item) throw httpError(404, 'Item not found');
     if (!Number.isFinite(Number(qty))) throw httpError(400, 'Type a quantity');
     const kind = type || (mode === 'set' ? 'count' : 'adjust');
     const delta = mode === 'set' ? qty - item.on_hand : qty;
     if (!Number.isFinite(delta) || (delta === 0 && kind !== 'count')) return;
-    run('UPDATE items SET on_hand = on_hand + ? WHERE id = ?', delta, itemId);
-    run(`INSERT INTO movements(item_id, qty, type, note, worker) VALUES(?, ?, ?, ?, ?)`, itemId, delta, kind,
+    await run('UPDATE items SET on_hand = on_hand + ? WHERE id = ?', delta, itemId);
+    await run(`INSERT INTO movements(item_id, qty, type, note, worker) VALUES(?, ?, ?, ?, ?)`, itemId, delta, kind,
         note || (kind === 'count' ? (delta ? 'Stocktake' : 'Counted — matches') : 'Adjustment'), by);
-    if (kind === 'count') run(`UPDATE items SET last_counted = datetime('now','localtime') WHERE id = ?`, itemId);
-    if (delta < 0) trimReservations(itemId, { reason: kind, worker: by }); else if (delta > 0) allocateItem(itemId, null, { reason: kind, worker: by });
+    if (kind === 'count') await run(`UPDATE items SET last_counted = ${NOW_SQL} WHERE id = ?`, itemId);
+    if (delta < 0) await trimReservations(itemId, { reason: kind, worker: by }); else if (delta > 0) await allocateItem(itemId, null, { reason: kind, worker: by });
   });
 }
 
 // rows: [{sku, qty}] — sets the on-hand count for each SKU found.
-export function stocktake(rows, note = 'Stocktake', by = '') {
+export async function stocktake(rows, note = 'Stocktake', by = '') {
   const result = { updated: 0, unknown: [] };
-  for (const r of rows) {
-    const item = get('SELECT id FROM items WHERE sku = ?', skuNow(String(r.sku).trim().toUpperCase()));
-    if (!item) { result.unknown.push(r.sku); continue; }
-    adjust(item.id, { mode: 'set', qty: Number(r.qty), note, by });
+  // One write transaction per row, as before (one row's error doesn't undo the rows before it); the part is
+  // looked up inside it, so nobody renames it in between.
+  for (const r of rows) await writeTx(async () => {
+    const item = await get('SELECT id FROM items WHERE sku = ?', skuNow(String(r.sku).trim().toUpperCase()));
+    if (!item) { result.unknown.push(r.sku); return; }
+    await adjust(item.id, { mode: 'set', qty: Number(r.qty), note, by });
     result.updated++;
-  }
+  });
   return result;
 }
 
-export function itemDetail(id) {
-  const item = getItem(id);
+export async function itemDetail(id) {
+  const item = await getItem(id);
   if (!item) throw httpError(404, 'Item not found');
-  item.area_name = item.area_id ? get('SELECT name FROM floor_areas WHERE id = ?', item.area_id)?.name || '' : '';
-  const movements = all(`SELECT m.*, v.chassis FROM movements m LEFT JOIN vans v ON v.id = m.van_id
+  item.area_name = item.area_id ? (await get('SELECT name FROM floor_areas WHERE id = ?', item.area_id))?.name || '' : '';
+  const movements = await all(`SELECT m.*, v.chassis FROM movements m LEFT JOIN vans v ON v.id = m.van_id
                          WHERE m.item_id = ? ORDER BY m.id DESC LIMIT 200`, id);
-  const usage = all(`SELECT l.*, v.chassis, v.eta, v.status AS van_status FROM van_lines l JOIN vans v ON v.id = l.van_id
+  const usage = await all(`SELECT l.*, v.chassis, v.eta, v.status AS van_status FROM van_lines l JOIN vans v ON v.id = l.van_id
                      WHERE l.item_id = ? AND ${ACTIVE_VAN} ORDER BY ${PRIORITY}`, id);
-  const pos = all(`SELECT pl.*, p.po_no, p.supplier, p.status AS po_status, p.created_at, v.chassis, v.status AS van_status
+  const pos = await all(`SELECT pl.*, p.po_no, p.supplier, p.status AS po_status, p.created_at, v.chassis, v.status AS van_status
                    FROM po_lines pl JOIN purchase_orders p ON p.id = pl.po_id LEFT JOIN vans v ON v.id = pl.van_id
                    WHERE pl.item_id = ? ORDER BY p.id DESC LIMIT 50`, id);
-  const rules = all('SELECT id, name, conditions, qty FROM rules WHERE item_id = ? ORDER BY sort, id', id);
+  const rules = await all('SELECT id, name, conditions, qty FROM rules WHERE item_id = ? ORDER BY sort, id', id);
   // Set-aside history (C11) and the suggested reorder level (C10, never applied by itself).
-  const history = itemHistory(id);
-  const reorder = item.kind === 'stock' && !item.placeholder ? reorderSuggestions([Number(id)]).get(Number(id)) || null : null;
+  const history = await itemHistory(id);
+  const reorder = item.kind === 'stock' && !item.placeholder ? (await reorderSuggestions([Number(id)])).get(Number(id)) || null : null;
   const unassigned = item.kind === 'per-van' ? Math.max(0, item.available) : 0;
   // check-r4-3: which van lines are covered by another van's spare PO (or a shelf PO), and which PO lines are spare.
-  const sh = shortagesCached();
-  const cov = lineCover({ itemId: Number(id) }, sh);
+  const sh = await shortagesCached();
+  const cov = await lineCover({ itemId: Number(id) }, sh);
   for (const u of usage) { const c = cov.get(u.id); if (c) u.cover = c; }
   const spareFor = new Map(); // "po_id|van_id" → vans it covers
   for (const c of sh.cover) if (c.item_id === Number(id)) for (const x of c.from) if (x.spare) {
@@ -879,7 +917,7 @@ export function itemDetail(id) {
     if (spareFor.has(k)) p.covers = spareFor.get(k);
     if (p.van_id != null && p.po_status === 'open' && p.qty - p.received - p.closed > 1e-9 && !['planned', 'in_production'].includes(p.van_status)) p.van_gone = 1;
   }
-  return { item, movements, usage, pos, rules, history, reorder, unassigned, spare: unassigned ? spareAck(Number(id)) : 0 };
+  return { item, movements, usage, pos, rules, history, reorder, unassigned, spare: unassigned ? await spareAck(Number(id)) : 0 };
 }
 
 // ───────────────────────── purchasing ─────────────────────────
@@ -888,46 +926,51 @@ export function itemDetail(id) {
 
 // Settings: how long a van takes to build (parts must be here by due date − build weeks) and how far
 // ahead "Coming up" looks.
-export function purchasingSettings() {
-  const n = (k, d) => { const s = getSetting(k, ''); const v = Number(s); return s !== '' && Number.isFinite(v) && v >= 0 ? v : d; };
-  return { build_weeks: n('build_weeks', 3), short_weeks: n('short_weeks', 4) };
+export async function purchasingSettings() {
+  const n = (s, d) => { const v = Number(s); return s !== '' && Number.isFinite(v) && v >= 0 ? v : d; };
+  return { build_weeks: n(await getSetting('build_weeks', ''), 3), short_weeks: n(await getSetting('short_weeks', ''), 4) };
 }
-export function savePurchasingSettings({ build_weeks, short_weeks } = {}) {
+export async function savePurchasingSettings({ build_weeks, short_weeks } = {}) {
   for (const [k, v, max] of [['build_weeks', build_weeks, 52], ['short_weeks', short_weeks, 52]]) {
     if (v === undefined || v === '') continue;
     const n = Math.round(Number(v));
     if (!(n >= 0 && n <= max)) throw httpError(400, 'Type a number of weeks (0–52)');
-    setSetting(k, String(n));
+    await writeTx(() => setSetting(k, String(n))); // each one saved on its own, as before
   }
 }
 // When a van needs its parts: in production → today; otherwise due date − build weeks.
 // '' = no date (blank, or a planned van whose date has passed: "No date – check").
-export function vanNeededBy(v, buildWeeks = purchasingSettings().build_weeks) {
+// (`buildWeeks` left out: the setting.)
+export async function vanNeededBy(v, buildWeeks) {
+  if (buildWeeks === undefined) buildWeeks = (await purchasingSettings()).build_weeks;
+  return neededByFor(v, buildWeeks);
+}
+function neededByFor(v, buildWeeks) {
   const t = today();
   if (v.status === 'in_production') return t;
   if (!v.eta || (v.status === 'planned' && v.eta < t)) return '';
   return addDays(v.eta, -7 * buildWeeks);
 }
-export function listSuppliers() {
-  syncSuppliers();
+export async function listSuppliers() {
+  await syncSuppliers();
   return all(`SELECT s.*, (SELECT COUNT(*) FROM items i WHERE i.active = 1 AND trim(i.supplier) = s.name) AS items
-              FROM suppliers s ORDER BY s.name COLLATE NOCASE`);
+              FROM suppliers s ORDER BY lower(s.name), s.name`);
 }
-export function setSupplierLead(name, days) {
+export async function setSupplierLead(name, days) {
   const s = String(name || '').trim();
   if (!s) throw httpError(400, 'Which supplier?');
   // An emptied box (round 4, user-r3-2) = "not known": back to the 14-day default, not confirmed — never 0 days.
   // A text value is trimmed first, so a box holding only spaces counts as empty too (round 1 fixes, check-r4-4).
   if (typeof days === 'string') days = days.trim();
   if (days === '' || days == null) {
-    run(`INSERT INTO suppliers(name, lead_days, lead_confirmed) VALUES(?, 14, 0)
-         ON CONFLICT(name) DO UPDATE SET lead_days = 14, lead_confirmed = 0`, s);
+    await writeTx(() => run(`INSERT INTO suppliers(name, lead_days, lead_confirmed) VALUES(?, 14, 0)
+         ON CONFLICT(name) DO UPDATE SET lead_days = 14, lead_confirmed = 0`, s));
     return;
   }
   const n = Math.round(Number(days));
   if (!(n >= 0 && n <= 365)) throw httpError(400, 'Lead time is a number of days (0–365)');
-  run(`INSERT INTO suppliers(name, lead_days, lead_confirmed) VALUES(?, ?, 1)
-       ON CONFLICT(name) DO UPDATE SET lead_days = excluded.lead_days, lead_confirmed = 1`, s, n);
+  await writeTx(() => run(`INSERT INTO suppliers(name, lead_days, lead_confirmed) VALUES(?, ?, 1)
+       ON CONFLICT(name) DO UPDATE SET lead_days = excluded.lead_days, lead_confirmed = 1`, s, n));
 }
 
 // ── what to order: "Order now / Coming up / Later / No date" ──
@@ -946,21 +989,21 @@ export function setSupplierLead(name, days) {
 // due date − build weeks; '' = no date. order_by = needed_by − supplier lead days.
 // group: 'now' (order_by within 7 days, van in production, or urgent), 'soon' (within short_weeks),
 // 'later', 'nodate'. build_pos = the van's place in the build order (#1 = first call on stock).
-export function shortages() {
-  syncSuppliers();
-  const set = purchasingSettings();
+export async function shortages() {
+  await syncSuppliers();
+  const set = await purchasingSettings();
   const t = today();
   const nowBy = addDays(t, 7), soonBy = addDays(t, 7 * set.short_weeks);
-  const lead = new Map(all('SELECT * FROM suppliers').map(s => [s.name, s]));
+  const lead = new Map((await all('SELECT * FROM suppliers')).map(s => [s.name, s]));
   const leadOf = sup => lead.get(String(sup || '').trim()) || { lead_days: 14, lead_confirmed: 0 };
-  const items = new Map(listItems().filter(i => !i.placeholder).map(i => [i.id, i]));
-  const ranks = vanRanks();
-  const supOf = supplierMatcher();
+  const items = new Map((await listItems()).filter(i => !i.placeholder).map(i => [i.id, i]));
+  const ranks = await vanRanks();
+  const supOf = await supplierMatcher();
   // Open PO quantity per item for each van / for the shelf (same sums as OPEN_PO_BY_VAN), and each open PO line,
   // earliest delivery first, so what covers a line can be named (check-r4-3).
   const opVan = new Map(), opShelf = new Map();
   const poLinesVan = new Map(), poLinesShelf = new Map();
-  for (const r of all(`SELECT pl.id, pl.po_id, p.po_no, p.supplier, pl.item_id, pl.van_id, ${PO_OPEN} AS q, ${LINE_EXPECTED} AS expected,
+  for (const r of await all(`SELECT pl.id, pl.po_id, p.po_no, p.supplier, pl.item_id, pl.van_id, ${PO_OPEN} AS q, ${LINE_EXPECTED} AS expected,
                            v.chassis, v.status AS van_status
                          FROM po_lines pl JOIN purchase_orders p ON p.id = pl.po_id LEFT JOIN vans v ON v.id = pl.van_id
                          WHERE ${PO_IS_OPEN} ORDER BY COALESCE(NULLIF(${LINE_EXPECTED}, ''), '9999'), pl.id`)) {
@@ -979,13 +1022,13 @@ export function shortages() {
   // marked check = 1 ("plan says ordered – check"), so nothing urgent is hidden while the office finds
   // out (round 2, user-r1-1). They are netted AFTER the real shortages (they never take free stock or
   // shelf POs from them), are not ticked to order, and are not in the "order now" count.
-  const lines = all(`
+  const lines = (await all(`
     WITH op AS (${OPEN_PO_BY_VAN})
     SELECT l.id, l.item_id, l.van_id, l.qty - l.reserved - l.issued AS short, l.urgent, l.spec, l.po_ref, l.state, l.plan_column,
       v.chassis, v.eta, v.status AS van_status, CASE WHEN ${UNANSWERED('l', 'op')} THEN 1 ELSE 0 END AS unanswered
     FROM van_lines l JOIN vans v ON v.id = l.van_id LEFT JOIN op ON op.item_id = l.item_id AND op.van_id = l.van_id
     WHERE ${ACTIVE_VAN} AND l.qty > l.reserved + l.issued + 1e-9 AND l.state NOT IN ('customer','tbd')
-    ORDER BY l.id`).filter(l => items.has(l.item_id));
+    ORDER BY l.id`)).filter(l => items.has(l.item_id));
   lines.sort((a, b) => a.unanswered - b.unanswered || (ranks.get(a.van_id) ?? 1e9) - (ranks.get(b.van_id) ?? 1e9) || a.id - b.id);
   const byItem = new Map();
   for (const l of lines) { if (!byItem.has(l.item_id)) byItem.set(l.item_id, []); byItem.get(l.item_id).push(l); }
@@ -1061,7 +1104,7 @@ export function shortages() {
       const coveredBy = fromShelfPo > 1e-9 ? takePool(fromShelfPo, l.id) : [];
       if (need <= 1e-9) continue;
       const forced = l.van_status === 'in_production' || !!l.urgent;
-      const neededBy = l.urgent ? t : vanNeededBy({ status: l.van_status, eta: l.eta }, set.build_weeks);
+      const neededBy = l.urgent ? t : neededByFor({ status: l.van_status, eta: l.eta }, set.build_weeks);
       const orderBy = neededBy ? addDays(neededBy, -ld.lead_days) : '';
       rows.push({ ...base, line_id: l.id, van_id: l.van_id, chassis: l.chassis, eta: l.eta, van_status: l.van_status, urgent: l.urgent ? 1 : 0,
         check: l.unanswered ? 1 : 0, po_ref: l.unanswered ? String(l.po_ref).trim() : '',
@@ -1102,7 +1145,7 @@ export function shortages() {
       const l = lines.find(x => x.id === line_id);
       return { line_id, van_id: l?.van_id, chassis: l?.chassis, item_id: l?.item_id, check: l?.unanswered ? 1 : 0, from };
     }),
-    suppliers: listSuppliers().map(s => ({ name: s.name, lead_days: s.lead_days, lead_confirmed: s.lead_confirmed })) };
+    suppliers: (await listSuppliers()).map(s => ({ name: s.name, lead_days: s.lead_days, lead_confirmed: s.lead_confirmed })) };
 }
 
 // What covers a van line from another van's spare PO or a shelf PO, in words (check-r4-3):
@@ -1113,18 +1156,28 @@ export function coverText(x) {
   const gone = x.inactive ? ` (van ${x.van_status === 'cancelled' ? 'cancelled' : 'finished'})` : '';
   return `${po} – ${x.chassis}'s${gone}, spare`;
 }
-// shortages() for read-only screens (van page, item page): worked out again only when something in the database
-// changed since the last time (SQLite's total_changes() on this one connection) or the day changed.
+// shortages() for read-only screens (van page, item page): worked out again only when the data changed since the
+// last time (settings.data_version, bumped by every write transaction — on any server instance) or the day
+// changed (Melbourne's date). Callers asking at the same moment share one working-out.
+// Inside a transaction it is always worked out afresh and never remembered: the transaction may have changed
+// things that data_version (bumped only when it commits) doesn't show yet, and may still roll back.
 let shortMemo = null;
-export function shortagesCached() {
-  syncSuppliers();
-  const key = `${get('SELECT total_changes() AS c').c}|${today()}`;
-  if (shortMemo?.key !== key) shortMemo = { key, value: shortages() };
+export async function shortagesCached() {
+  if (inTx()) return shortages();
+  await syncSuppliers();
+  const key = `${await dataVersion()}|${today()}`;
+  if (shortMemo?.key !== key) {
+    const memo = { key, value: shortages() };
+    shortMemo = memo;
+    memo.value.catch(() => { if (shortMemo === memo) shortMemo = null; }); // a failed working-out isn't kept
+  }
   return shortMemo.value;
 }
 // Per van line, what covers it (check-r4-3) — the same netting as Purchasing → To order. `vanId` / `itemId`
 // narrow it. Returns Map line_id → { from: [...], text, spare (1 = another van's PO), qty }.
-export function lineCover({ vanId = null, itemId = null } = {}, sh = shortagesCached()) {
+// `sh`: a shortages() result already at hand (default: shortagesCached()).
+export async function lineCover({ vanId = null, itemId = null } = {}, sh) {
+  if (sh === undefined) sh = await shortagesCached();
   const out = new Map();
   for (const c of sh.cover) {
     if (vanId != null && c.van_id !== vanId) continue;
@@ -1154,7 +1207,8 @@ export function orderNowText(c) {
 }
 
 // Different parts in "Order now" (kept for older callers; same as orderNowCount().parts).
-export function orderNowItems(sh = shortages()) {
+export async function orderNowItems(sh) {
+  if (sh === undefined) sh = await shortages();
   return sh.orderNow ? sh.orderNow.parts : orderNowCount(sh.rows).parts;
 }
 
@@ -1168,7 +1222,9 @@ export function orderNowItems(sh = shortages()) {
 // (plan column, else part name): "Double Axel 141" (wheel box) and "Grey telescopic 141" (table leg) are
 // not lumped together just because they share a number.
 // `l` needs po_ref, spec, plan_column, name and the part's supplier (`item_supplier` or `supplier`).
-export function orderGroupOf(l, supOf = supplierMatcher()) {
+// `supOf`: the matcher from `await supplierMatcher()` — required now (making one reads the database).
+export function orderGroupOf(l, supOf) {
+  if (typeof supOf !== 'function') throw new TypeError('orderGroupOf(l, supOf): pass await supplierMatcher()');
   const ref = String(l.po_ref || '').trim();
   const own = String(l.item_supplier ?? l.supplier ?? '').trim();
   const named = supOf(l.spec);
@@ -1191,26 +1247,26 @@ export function orderGroupOf(l, supOf = supplierMatcher()) {
 // (earliest needed by first), the rest are "later vans". `target` says which PO a "Yes" adds to:
 // the open PO with that number for that supplier, or a new one.
 // Display only: nothing is changed until someone answers.
-export function checkOrdered() {
-  const rows = all(`
+export async function checkOrdered() {
+  const rows = await all(`
     WITH op AS (${OPEN_PO_BY_VAN})
     SELECT l.id, l.van_id, l.item_id, trim(l.po_ref) AS po_ref, l.qty - l.reserved - l.issued AS short, l.spec, l.plan_column,
       v.chassis, v.eta, v.status AS van_status, i.sku, i.name, i.unit, trim(i.supplier) AS supplier, i.trade,
-      CASE WHEN ${nearVanSql('v')} THEN 1 ELSE 0 END AS near
+      CASE WHEN ${await nearVanSql('v')} THEN 1 ELSE 0 END AS near
     FROM van_lines l JOIN vans v ON v.id = l.van_id JOIN items i ON i.id = l.item_id
       LEFT JOIN op ON op.item_id = l.item_id AND op.van_id = l.van_id
     WHERE ${ACTIVE_VAN} AND ${UNANSWERED('l', 'op')}
     ORDER BY l.id`);
-  const ranks = vanRanks();
-  const set = purchasingSettings();
-  const supOf = supplierMatcher();
+  const ranks = await vanRanks();
+  const set = await purchasingSettings();
+  const supOf = await supplierMatcher();
   const groups = new Map();
   for (const r of rows) {
     const og = orderGroupOf(r, supOf);
     if (!groups.has(og.key)) groups.set(og.key, { key: og.key, po_ref: og.po_ref, supplier: og.supplier, label: og.label, part: og.part || '',
       lines: [], near: 0, needed_by: '', from_text: 0 });
     const g = groups.get(og.key);
-    const neededBy = vanNeededBy({ status: r.van_status, eta: r.eta }, set.build_weeks);
+    const neededBy = neededByFor({ status: r.van_status, eta: r.eta }, set.build_weeks);
     g.lines.push({ ...r, needed_by: neededBy, placeholder: isPlaceholder(r) ? 1 : 0, from_text: og.from_text });
     if (og.from_text) g.from_text = 1;
     if (r.near) g.near = 1;
@@ -1223,7 +1279,7 @@ export function checkOrdered() {
     // says its FIRST van ("#1 ST0367 – 26 days late") and the groups are sorted by that van.
     for (const l of g.lines) {
       l.build_pos = ranks.has(l.van_id) ? ranks.get(l.van_id) + 1 : null;
-      Object.assign(l, vanTiming({ status: l.van_status, eta: l.eta }, t, set.build_weeks));
+      Object.assign(l, timingFor({ status: l.van_status, eta: l.eta }, t, set.build_weeks));
     }
     const f = g.lines[0];
     g.first = { van_id: f.van_id, chassis: f.chassis, build_pos: f.build_pos, van_status: f.van_status, eta: f.eta,
@@ -1231,11 +1287,11 @@ export function checkOrdered() {
       label: `${f.build_pos ? `#${f.build_pos} ` : ''}${f.chassis} – ${f.when}` };
     g.suppliers = [g.supplier]; // older screens read this
     // Which PO a "Yes" adds to.
-    const po = g.supplier ? get(`SELECT id, po_no, supplier, ordered_at, expected FROM purchase_orders WHERE status = 'open' AND lower(trim(po_no)) = lower(?)
+    const po = g.supplier ? await get(`SELECT id, po_no, supplier, ordered_at, expected FROM purchase_orders WHERE status = 'open' AND lower(trim(po_no)) = lower(?)
                                  AND lower(trim(supplier)) = lower(?) ORDER BY id LIMIT 1`, g.po_ref, g.supplier) : null;
     g.target = po ? { po_id: po.id, po_no: po.po_no, supplier: po.supplier, exists: 1, ordered_at: po.ordered_at || '', expected: po.expected || '' } : { po_id: null, po_no: g.po_ref, supplier: g.supplier, exists: 0 };
     // Other open POs with this number (another supplier, or none): shown so nobody is surprised.
-    g.open_pos = all(`SELECT id, po_no, supplier FROM purchase_orders WHERE status = 'open' AND lower(trim(po_no)) = lower(?)`, g.po_ref);
+    g.open_pos = await all(`SELECT id, po_no, supplier FROM purchase_orders WHERE status = 'open' AND lower(trim(po_no)) = lower(?) ORDER BY id`, g.po_ref);
   }
   // Vans due soon first, then by the first van's place in the build order (#1 first), then the most parts.
   return [...groups.values()].sort((a, b) => b.near - a.near || (a.first.build_pos ?? 1e9) - (b.first.build_pos ?? 1e9)
@@ -1247,7 +1303,12 @@ export function checkOrdered() {
 // production); needed_now = its parts are needed now (in production, or a planned van due within the build
 // weeks). when: "26 days late" / "in production, due 19/11" / "in production, no due date" /
 // "due 3/11 – parts needed now" / "due 3/12" / "date passed (8/2) – check" / "no due date".
-export function vanTiming(v, t = today(), buildWeeks = purchasingSettings().build_weeks) {
+// (`buildWeeks` left out: the setting.)
+export async function vanTiming(v, t = today(), buildWeeks) {
+  if (buildWeeks === undefined) buildWeeks = (await purchasingSettings()).build_weeks;
+  return timingFor(v, t, buildWeeks);
+}
+function timingFor(v, t, buildWeeks) {
   const days = (a, b) => Math.round((Date.parse(a) - Date.parse(b)) / 864e5);
   if (v.status === 'in_production') {
     if (v.eta && v.eta < t) { const n = days(t, v.eta); return { late_days: n, needed_now: 1, when: `${n} day${n === 1 ? '' : 's'} late` }; }
@@ -1259,9 +1320,9 @@ export function vanTiming(v, t = today(), buildWeeks = purchasingSettings().buil
   return { late_days: 0, needed_now: now ? 1 : 0, when: `due ${dm(v.eta)}${now ? ' – parts needed now' : ''}` };
 }
 
-export function checkOrderedCount() {
-  return get(`WITH op AS (${OPEN_PO_BY_VAN}) SELECT COUNT(*) AS c FROM van_lines l JOIN vans v ON v.id = l.van_id
-              LEFT JOIN op ON op.item_id = l.item_id AND op.van_id = l.van_id WHERE ${ACTIVE_VAN} AND ${UNANSWERED('l', 'op')}`).c;
+export async function checkOrderedCount() {
+  return (await get(`WITH op AS (${OPEN_PO_BY_VAN}) SELECT COUNT(*) AS c FROM van_lines l JOIN vans v ON v.id = l.van_id
+              LEFT JOIN op ON op.item_id = l.item_id AND op.van_id = l.van_id WHERE ${ACTIVE_VAN} AND ${UNANSWERED('l', 'op')}`)).c;
 }
 
 // Answer for one order number. answer 'yes': it is on order — creates or joins the open PO with that
@@ -1279,18 +1340,18 @@ export function checkOrderedCount() {
 // `stillOpen`: line ids that were waiting for an answer when a "Yes, all on order" batch started — still answered
 // here although an earlier order number in the same batch already put that van's part on order (one van with
 // two service doors on Coast to Coast 137 and 143 used to stop the whole batch with "Nothing left to answer").
-export function answerOrdered(poRef, answer, { lineIds = null, supplier = '', group, key, by = '', dates = null, stillOpen = null } = {}) {
+export async function answerOrdered(poRef, answer, { lineIds = null, supplier = '', group, key, by = '', dates = null, stillOpen = null } = {}) {
   const ref = String(poRef || '').trim();
   if (!ref) throw httpError(400, 'Which order number?');
   if (!['yes', 'no'].includes(answer)) throw httpError(400, 'Answer "Yes, on order" or "No, still to order"');
-  return tx(() => {
-    const supOf = supplierMatcher();
-    let lines = all(`
+  return writeTx(async () => {
+    const supOf = await supplierMatcher();
+    let lines = (await all(`
       WITH op AS (${OPEN_PO_BY_VAN})
       SELECT l.*, v.chassis, i.supplier AS item_supplier, i.sku, i.name FROM van_lines l JOIN vans v ON v.id = l.van_id JOIN items i ON i.id = l.item_id
         LEFT JOIN op ON op.item_id = l.item_id AND op.van_id = l.van_id
       WHERE ${ACTIVE_VAN} AND trim(l.po_ref) = ? AND (${UNANSWERED('l', 'op')}${stillOpen?.size ? ` OR (l.state = '' AND l.qty > l.reserved + l.issued + 1e-9
-        AND l.id IN (${[...stillOpen].map(Number).filter(Number.isFinite).join(',')}))` : ''}) ORDER BY l.id`, ref)
+        AND l.id IN (${[...stillOpen].map(Number).filter(Number.isFinite).join(',')}))` : ''}) ORDER BY l.id`, ref))
       .map(l => ({ ...l, og: orderGroupOf(l, supOf) }));
     if (typeof key === 'string' && key) lines = lines.filter(l => l.og.key === key);
     else if (typeof group === 'string') lines = lines.filter(l => l.og.supplier.toLowerCase() === group.trim().toLowerCase());
@@ -1299,8 +1360,8 @@ export function answerOrdered(poRef, answer, { lineIds = null, supplier = '', gr
     const sup = String(supplier || '').trim();
     if (answer === 'no') {
       for (const l of lines) {
-        run(`UPDATE van_lines SET state = 'not_ordered' WHERE id = ?`, l.id);
-        logAlloc('check ordered', { van_id: l.van_id, item_id: l.item_id, line_id: l.id, field: 'state', before: '', after: 'not_ordered', worker: by, note: `Plan said order ${ref}: still to order` });
+        await run(`UPDATE van_lines SET state = 'not_ordered' WHERE id = ?`, l.id);
+        await logAlloc('check ordered', { van_id: l.van_id, item_id: l.item_id, line_id: l.id, field: 'state', before: '', after: 'not_ordered', worker: by, note: `Plan said order ${ref}: still to order` });
       }
       return { lines: lines.length, pos: [] };
     }
@@ -1312,22 +1373,22 @@ export function answerOrdered(poRef, answer, { lineIds = null, supplier = '', gr
     const pos = new Map();
     const made = [];
     const joined = new Map(); // existing PO id → what this answer did to its dates
-    const poFor = s => {
+    const poFor = async s => {
       if (pos.has(s)) return pos.get(s);
-      let po = get(`SELECT id, ordered_at, expected, notes, needs_check FROM purchase_orders WHERE status = 'open' AND lower(trim(po_no)) = lower(?) AND lower(trim(supplier)) = lower(?) ORDER BY id LIMIT 1`, ref, s);
+      let po = await get(`SELECT id, ordered_at, expected, notes, needs_check FROM purchase_orders WHERE status = 'open' AND lower(trim(po_no)) = lower(?) AND lower(trim(supplier)) = lower(?) ORDER BY id LIMIT 1`, ref, s);
       if (po && dates) {
         // Already in the system: fill only what is blank, never overwrite a date already there.
         const ordered = validDate(dates.ordered_at), expected = validDate(dates.expected);
         const setOrd = !!(ordered && !String(po.ordered_at || '').trim()), setExp = !!(expected && !String(po.expected || '').trim());
-        if (setOrd) run('UPDATE purchase_orders SET ordered_at = ? WHERE id = ?', ordered, po.id);
-        if (setExp) run('UPDATE purchase_orders SET expected = ? WHERE id = ?', expected, po.id);
+        if (setOrd) await run('UPDATE purchase_orders SET ordered_at = ? WHERE id = ?', ordered, po.id);
+        if (setExp) await run('UPDATE purchase_orders SET expected = ? WHERE id = ?', expected, po.id);
         const hasExp = setExp || !!String(po.expected || '').trim();
         // No delivery date after "Yes, all on order": on "POs to check" as "no delivery date" (poProblems needs the mark).
         let flagged = false;
         if (dates.yesAll && !hasExp) {
           const stamp = `Parts added from the production plan${by ? ` by ${by}` : ''} on ${today()} (${YES_ALL_MARK})`;
           if (!String(po.notes || '').includes(`(${YES_ALL_MARK})`) || !po.needs_check) {
-            run(`UPDATE purchase_orders SET notes = trim(COALESCE(notes, '') || char(10) || ?, char(10) || ' '), needs_check = 1 WHERE id = ?`, stamp, po.id);
+            await run(`UPDATE purchase_orders SET notes = btrim(COALESCE(notes, '') || chr(10) || ?::text, chr(10) || ' '), needs_check = 1 WHERE id = ?`, stamp, po.id);
           }
           flagged = true;
         }
@@ -1338,9 +1399,9 @@ export function answerOrdered(poRef, answer, { lineIds = null, supplier = '', gr
         // The plan's order numbers are per supplier ("White Vision 11", "Onex 08"), so the same number
         // for another supplier is normal here and not flagged. Ordered date unknown (set it on the PO).
         const ordered = validDate(dates?.ordered_at), expected = validDate(dates?.expected);
-        po = { id: Number(run(`INSERT INTO purchase_orders(po_no, supplier, notes, ordered_at, expected, needs_check) VALUES(?,?,?,?,?,?)`, ref, s,
+        po = { id: await insert(`INSERT INTO purchase_orders(po_no, supplier, notes, ordered_at, expected, needs_check) VALUES(?,?,?,?,?,?)`, ref, s,
           `Order number from the production plan, confirmed on order${by ? ` by ${by}` : ''}${dates?.yesAll ? ` (${YES_ALL_MARK})` : ''}`,
-          ordered, expected, !s || (dates?.yesAll && !expected) ? 1 : 0).lastInsertRowid) };
+          ordered, expected, !s || (dates?.yesAll && !expected) ? 1 : 0) };
         made.push(po.id);
       }
       pos.set(s, po.id);
@@ -1348,12 +1409,12 @@ export function answerOrdered(poRef, answer, { lineIds = null, supplier = '', gr
     };
     for (const l of lines) {
       const s = l.og.supplier || sup;
-      const poId = poFor(s);
+      const poId = await poFor(s);
       const short = Math.max(0, l.qty - l.reserved - l.issued);
-      run('INSERT INTO po_lines(po_id, item_id, qty, van_id, spec) VALUES(?,?,?,?,?)', poId, l.item_id, short, l.van_id, specForPo(l.spec, l.po_ref));
-      logAlloc('check ordered', { van_id: l.van_id, item_id: l.item_id, line_id: l.id, field: 'po_lines', before: '', after: `PO ${ref} (${s || 'no supplier'}) +${q(short)}`, worker: by, note: `Plan said order ${ref}: on order` });
+      await run('INSERT INTO po_lines(po_id, item_id, qty, van_id, spec) VALUES(?,?,?,?,?)', poId, l.item_id, short, l.van_id, specForPo(l.spec, l.po_ref));
+      await logAlloc('check ordered', { van_id: l.van_id, item_id: l.item_id, line_id: l.id, field: 'po_lines', before: '', after: `PO ${ref} (${s || 'no supplier'}) +${q(short)}`, worker: by, note: `Plan said order ${ref}: on order` });
     }
-    syncSuppliers();
+    await syncSuppliers();
     return { lines: lines.length, pos: [...pos.values()],
       po_list: [...pos.entries()].map(([s, id]) => ({ id, po_no: ref, supplier: s, new: made.includes(id) ? 1 : 0, ...(joined.get(id) || {}) })) };
   });
@@ -1366,7 +1427,7 @@ export function answerOrdered(poRef, answer, { lineIds = null, supplier = '', gr
 // lands on that supplier's PO with its own number, logged as before.
 // `ordered_at` / `expected` (check-r4-2): one "ordered on" and "expected by" date for every PO it creates
 // ('' = not known; a PO with no expected date goes on "POs to check" as "no delivery date").
-export function answerOrderedMany(groups, { supplier = '', by = '', ordered_at = '', expected = '' } = {}) {
+export async function answerOrderedMany(groups, { supplier = '', by = '', ordered_at = '', expected = '' } = {}) {
   const sup = String(supplier || '').trim();
   for (const d of [ordered_at, expected]) if (d && !validDate(d)) throw httpError(400, 'Pick a date, or tick "not known"');
   if (!sup) throw httpError(400, 'Pick one supplier first');
@@ -1376,13 +1437,13 @@ export function answerOrderedMany(groups, { supplier = '', by = '', ordered_at =
     const k = String(g?.key || '');
     if (!k || k.slice(0, k.indexOf('|')) !== want) throw httpError(400, `Order ${g?.po_ref || '?'} is not ${sup}'s — refresh`);
   }
-  return tx(() => {
+  return writeTx(async () => {
     const out = { lines: 0, groups: 0, po_list: [] };
     // Every line waiting for an answer right now (before this batch puts anything on order).
-    const stillOpen = new Set(all(`WITH op AS (${OPEN_PO_BY_VAN}) SELECT l.id FROM van_lines l JOIN vans v ON v.id = l.van_id
-      LEFT JOIN op ON op.item_id = l.item_id AND op.van_id = l.van_id WHERE ${ACTIVE_VAN} AND ${UNANSWERED('l', 'op')}`).map(r => r.id));
+    const stillOpen = new Set((await all(`WITH op AS (${OPEN_PO_BY_VAN}) SELECT l.id FROM van_lines l JOIN vans v ON v.id = l.van_id
+      LEFT JOIN op ON op.item_id = l.item_id AND op.van_id = l.van_id WHERE ${ACTIVE_VAN} AND ${UNANSWERED('l', 'op')}`)).map(r => r.id));
     for (const g of groups) {
-      const r = answerOrdered(g.po_ref, 'yes', { key: String(g.key), lineIds: Array.isArray(g.line_ids) ? g.line_ids : null, by,
+      const r = await answerOrdered(g.po_ref, 'yes', { key: String(g.key), lineIds: Array.isArray(g.line_ids) ? g.line_ids : null, by,
         dates: { ordered_at: validDate(ordered_at), expected: validDate(expected), yesAll: true }, stillOpen });
       out.lines += r.lines; out.groups++;
       out.po_list.push(...(r.po_list || []));
@@ -1396,10 +1457,10 @@ export function answerOrderedMany(groups, { supplier = '', by = '', ordered_at =
 // Set or clear a line's status by hand. Setting Customer supplies / To be decided releases the shelf
 // stock held for it; stock received for this van (locked) needs an answer: stock 'keep' (stays with the
 // van) or 'shelf' (goes back to free stock). Without one the reply asks (409 with confirm).
-export function setLineState(lineId, state, { stock = '', by = '' } = {}) {
+export async function setLineState(lineId, state, { stock = '', by = '' } = {}) {
   if (!STATES.includes(state)) throw httpError(400, 'Pick Customer supplies, To be decided or normal');
-  return tx(() => {
-    const l = get('SELECT l.*, v.chassis FROM van_lines l JOIN vans v ON v.id = l.van_id WHERE l.id = ?', lineId);
+  return writeTx(async () => {
+    const l = await get('SELECT l.*, v.chassis FROM van_lines l JOIN vans v ON v.id = l.van_id WHERE l.id = ?', lineId);
     if (!l) throw httpError(404, 'That part line no longer exists — refresh');
     if (l.state === state) return { ok: true };
     const reminder = REMINDER_STATES.includes(state);
@@ -1408,29 +1469,29 @@ export function setLineState(lineId, state, { stock = '', by = '' } = {}) {
       throw Object.assign(httpError(409, `${q(l.reserved_firm)} received for ${l.chassis} are on the shelf for this line`), {
         confirm: { stock: true, qty: l.reserved_firm, message: `${q(l.reserved_firm)} of this part were received for ${l.chassis}. Keep them for the van, or put them on the shelf?` } });
     }
-    run('UPDATE van_lines SET state = ? WHERE id = ?', state, lineId);
-    logAlloc('state', { van_id: l.van_id, item_id: l.item_id, line_id: l.id, field: 'state', before: STATE_LABEL[l.state] || l.state, after: STATE_LABEL[state] || state, worker: by });
+    await run('UPDATE van_lines SET state = ? WHERE id = ?', state, lineId);
+    await logAlloc('state', { van_id: l.van_id, item_id: l.item_id, line_id: l.id, field: 'state', before: STATE_LABEL[l.state] || l.state, after: STATE_LABEL[state] || state, worker: by });
     if (reminder) {
       const keep = stock === 'keep' ? Math.min(l.reserved, l.reserved_firm) : 0;
       if (l.reserved > keep + 1e-9) {
-        run('UPDATE van_lines SET reserved = ?, reserved_firm = MIN(reserved_firm, ?) WHERE id = ?', keep, keep, lineId);
-        logAlloc('state', { van_id: l.van_id, item_id: l.item_id, line_id: l.id, field: 'reserved', before: l.reserved, after: keep, worker: by,
+        await run('UPDATE van_lines SET reserved = ?, reserved_firm = LEAST(reserved_firm, ?::double precision) WHERE id = ?', keep, keep, lineId);
+        await logAlloc('state', { van_id: l.van_id, item_id: l.item_id, line_id: l.id, field: 'reserved', before: l.reserved, after: keep, worker: by,
           note: `${STATE_LABEL[state]}: ${q(l.reserved - keep)} back on the shelf${stock === 'shelf' ? ' (received for the van, office chose the shelf)' : ''}` });
-        allocateItem(l.item_id, null, { reason: 'state', worker: by }); // the freed stock goes to the next van waiting
+        await allocateItem(l.item_id, null, { reason: 'state', worker: by }); // the freed stock goes to the next van waiting
       }
     } else {
-      allocateItem(l.item_id, l.van_id, { reason: 'state', worker: by }); // needs stock again
+      await allocateItem(l.item_id, l.van_id, { reason: 'state', worker: by }); // needs stock again
     }
     return { ok: true };
   });
 }
 
 // "Waiting on a decision": customer supplies / to be decided lines, by trade. `vanId`: one van only.
-export function decisionLines({ vanId = null } = {}) {
+export async function decisionLines({ vanId = null } = {}) {
   return all(`SELECT l.id, l.van_id, l.item_id, l.qty, l.reserved, l.reserved_firm, l.issued, l.spec, l.state, l.plan_column, l.note,
                 v.chassis, v.eta, v.status, i.sku, i.name, i.unit, i.trade
               FROM van_lines l JOIN vans v ON v.id = l.van_id JOIN items i ON i.id = l.item_id
-              WHERE ${ACTIVE_VAN} AND l.state IN ('customer','tbd') AND l.issued < l.qty AND (? IS NULL OR v.id = ?)
+              WHERE ${ACTIVE_VAN} AND l.state IN ('customer','tbd') AND l.issued < l.qty AND (?::integer IS NULL OR v.id = ?::integer)
               ORDER BY i.trade = '', i.trade, ${PRIORITY}, i.name`, vanId, vanId);
 }
 
@@ -1453,8 +1514,8 @@ const SPECIAL_ON_ORDER = (l = 'l') => `(${SPECIAL_SHORT(l)} AND ${SPECIAL_COVERE
 // on the reviewed list, was linked the same way before, or its model number is in exactly one part's
 // name), `same` (every other line still to confirm with the same catch-all and the same text, on any
 // van: "Link all N lines with this same text") and `supplier_guess` (a supplier named in the text).
-export function placeholderLines({ vanId = null, onlyShort = false } = {}) {
-  const allRows = all(`
+export async function placeholderLines({ vanId = null, onlyShort = false } = {}) {
+  const allRows = await all(`
     SELECT l.id, l.van_id, l.item_id, l.qty, l.reserved, l.reserved_firm, l.issued, l.spec, l.note, l.plan_column, l.po_ref, l.urgent,
       v.chassis, v.eta, v.status, i.sku, i.name, i.unit,
       l.state, COALESCE((SELECT SUM(${PO_OPEN}) FROM po_lines pl JOIN purchase_orders p ON p.id = pl.po_id
@@ -1463,11 +1524,11 @@ export function placeholderLines({ vanId = null, onlyShort = false } = {}) {
       CASE WHEN ${SPECIAL_ON_ORDER('l')} THEN 1 ELSE 0 END AS is_on_order,
       CASE WHEN ${UNANSWERED_CORR('l')} THEN 1 ELSE 0 END AS is_check
     FROM van_lines l JOIN vans v ON v.id = l.van_id JOIN items i ON i.id = l.item_id
-    WHERE ${ACTIVE_VAN} AND (i.placeholder = 1 OR i.sku LIKE 'PLAN-%') AND l.issued < l.qty
+    WHERE ${ACTIVE_VAN} AND (i.placeholder = 1 OR i.sku ILIKE 'PLAN-%') AND l.issued < l.qty
     ORDER BY ${PRIORITY}, i.name, l.id`);
   // A cell that only holds the dealer's name ("CHASSIS: Caravan Treading Center") is not a part: marked
   // `not_part` and never "still to order" (Small fixes & phone round 1, user-r4-6).
-  const dealers = dealerNames();
+  const dealers = await dealerNames();
   for (const r of allRows) { r.not_part = notAPart(r.spec, dealers); if (r.not_part) r.is_short = r.is_on_order = r.is_check = 0; }
   const rows = onlyShort ? allRows.filter(r => r.is_short) : allRows;
   const byKey = new Map();
@@ -1481,10 +1542,11 @@ export function placeholderLines({ vanId = null, onlyShort = false } = {}) {
   // lines of one van" is always seen): a part the van already has is never suggested — it says "This van
   // already has … – same thing?" instead — nor one part for two lines of one van (round 3, user-r2-3).
   const vanSet = new Set(mine.map(r => r.van_id));
-  const cache = linkableItemsCache();
-  const sugg = mine.length ? suggestionsFor(allRows.filter(r => vanSet.has(r.van_id)), cache) : new Map();
+  const cache = await linkableItemsCache();
+  const sugg = mine.length ? await suggestionsFor(allRows.filter(r => vanSet.has(r.van_id)), cache) : new Map();
   // A text that names 2+ parts: each part with its own suggestion (user-r4-6), and the ones already on the van.
-  const onVan = mine.some(r => textParts(r.spec).length) ? vanParts([...vanSet]) : new Map();
+  const onVan = mine.some(r => textParts(r.spec).length) ? await vanParts([...vanSet]) : new Map();
+  const supOf = await supplierMatcher(); // (supplierFromText for each line, reading the supplier list once)
   const vans = new Map();
   for (const r of mine) {
     if (!vans.has(r.van_id)) vans.set(r.van_id, { van_id: r.van_id, chassis: r.chassis, eta: r.eta, status: r.status, lines: [] });
@@ -1492,8 +1554,8 @@ export function placeholderLines({ vanId = null, onlyShort = false } = {}) {
     vans.get(r.van_id).lines.push({ ...r, duplicate: LINK_FLAG_RE.test(r.note),
       suggest: sg.suggest || null, already: sg.already || null, clash: sg.clash || null, different: sg.different || null,
       same: (byKey.get(sameTextKey(r.sku, r.spec)) || []).filter(x => x.id !== r.id),
-      supplier_guess: supplierFromText(`${r.plan_column} ${r.name} ${r.spec}`),
-      parts: r.not_part ? null : partsFor(r, { items: cache.items, onVan: onVan.get(r.van_id) || null }) });
+      supplier_guess: supOf(`${r.plan_column} ${r.name} ${r.spec}`),
+      parts: r.not_part ? null : await partsFor(r, { items: cache.items, onVan: onVan.get(r.van_id) || null }) });
   }
   return [...vans.values()];
 }
@@ -1505,14 +1567,14 @@ export function placeholderLines({ vanId = null, onlyShort = false } = {}) {
 // Same filters as placeholderLines, so the numbers always match the lists.
 // `not_part`: the lines left off "still to order" because the text is only the dealer's name (user-r4-6) —
 // Purchasing → Special parts says which ones.
-export function placeholderCounts({ vanId = null } = {}) {
-  const rows = all(`
+export async function placeholderCounts({ vanId = null } = {}) {
+  const rows = await all(`
     SELECT l.id, l.van_id, l.spec, l.plan_column, v.chassis, CASE WHEN ${SPECIAL_TO_ORDER('l')} THEN 1 ELSE 0 END AS s,
       CASE WHEN ${SPECIAL_ON_ORDER('l')} THEN 1 ELSE 0 END AS o, CASE WHEN ${UNANSWERED_CORR('l')} THEN 1 ELSE 0 END AS c
     FROM van_lines l JOIN vans v ON v.id = l.van_id JOIN items i ON i.id = l.item_id
-    WHERE ${ACTIVE_VAN} AND (i.placeholder = 1 OR i.sku LIKE 'PLAN-%') AND l.issued < l.qty AND (? IS NULL OR v.id = ?)
+    WHERE ${ACTIVE_VAN} AND (i.placeholder = 1 OR i.sku ILIKE 'PLAN-%') AND l.issued < l.qty AND (?::integer IS NULL OR v.id = ?::integer)
     ORDER BY ${PRIORITY}, l.id`, vanId, vanId);
-  const dealers = dealerNames();
+  const dealers = await dealerNames();
   const notPart = rows.filter(r => notAPart(r.spec, dealers));
   const np = new Set(notPart.map(r => r.id));
   return { short: rows.filter(r => r.s && !np.has(r.id)).length, on_order: rows.filter(r => r.o && !np.has(r.id)).length,
@@ -1525,8 +1587,8 @@ export function placeholderCounts({ vanId = null } = {}) {
 // shelf — the same netting as Purchasing → To order (shortages()), so Stock and Purchasing agree. Never more
 // than "Short". Lines waiting on "Check: already ordered?" are left out, as they are there.
 // Small fixes & phone round 1, user-r4-3 ("Short 10 · On order 3" now also says "Still to order 7").
-export function stillToOrderByItem() {
-  const { rows, settings } = shortages();
+export async function stillToOrderByItem() {
+  const { rows, settings } = await shortages();
   const t = today(), soon = addDays(t, 7 * settings.short_weeks);
   const near = r => r.van_status === 'in_production' || (r.van_status === 'planned' && r.eta && r.eta >= t && r.eta <= soon);
   const out = {};
@@ -1539,19 +1601,19 @@ export function stillToOrderByItem() {
 // this van stays on this line …" (left on the plan line by a merge), "to check: merge with … asked, but nothing
 // moved" (Small fixes & phone round 1, check-r4-1).
 export const LINK_FLAG_RE = /possible duplicate of|two deliveries were received for this van|to check: [\d.]+ (?:received|set aside)|to check: merge with/i;
-function linkableItemsCache() {
-  return { items: linkableItems(), learned: learnedLinks() };
+async function linkableItemsCache() {
+  return { items: await linkableItems(), learned: await learnedLinks() };
 }
 
 // A supplier named in a piece of text ('' = none): the reviewed words, then any supplier name of 4+
 // letters that isn't an ordinary word ("Gold"), e.g. "L&S Doors" → "L & S".
-export function supplierFromText(text) {
-  return supplierMatcher()(text);
+export async function supplierFromText(text) {
+  return (await supplierMatcher())(text);
 }
 // Same, as a function that reads the supplier list once (for checking many lines in one go).
-export function supplierMatcher() {
+export async function supplierMatcher() {
   const list = [...SUPPLIER_WORDS];
-  for (const { name } of all(`SELECT name FROM suppliers ORDER BY length(name) DESC`)) {
+  for (const { name } of await all(`SELECT name FROM suppliers ORDER BY length(name) DESC, name`)) {
     if (NOT_A_BRAND.test(name)) continue;
     const short = name.length < 4;
     if (short && !/^[A-Z0-9&]{2,3}$/.test(name)) continue; // short names only as capitals: "NCE", "HTP", "AZQ"
@@ -1566,9 +1628,9 @@ export function supplierMatcher() {
 
 // Items asked for with 5 or more different plan texts on vans still to build (a sign one item is
 // standing in for several real parts).
-export function manySpecs(min = 5) {
+export async function manySpecs(min = 5) {
   const by = new Map();
-  for (const r of all(`SELECT i.id, i.sku, i.name, i.placeholder, trim(l.spec) AS spec
+  for (const r of await all(`SELECT i.id, i.sku, i.name, i.placeholder, trim(l.spec) AS spec
                        FROM van_lines l JOIN vans v ON v.id = l.van_id JOIN items i ON i.id = l.item_id
                        WHERE ${ACTIVE_VAN} AND trim(l.spec) <> '' ORDER BY l.id`)) {
     if (!by.has(r.id)) by.set(r.id, { id: r.id, sku: r.sku, name: r.name, placeholder: isPlaceholder(r) ? 1 : 0, lines: 0, seen: new Map() });
@@ -1591,63 +1653,63 @@ const LINE_EXPECTED = `COALESCE(NULLIF(pl.expected, ''), p.expected)`;
 // POs made from the production plan (the import's pink cells, or "Yes, on order" on Check: already
 // ordered?). The plan never says when they were ordered: a blank ordered date on these shows as
 // "unknown (from plan)" until someone types it (Small fixes & phone round 1, user-r4-5).
-export const PLAN_PO_SQL = `(notes LIKE '%Imported from the production plan%' OR notes LIKE '%Order number from the production plan%')`;
+export const PLAN_PO_SQL = `(notes ILIKE '%Imported from the production plan%' OR notes ILIKE '%Order number from the production plan%')`;
 const PLAN_PO_RE = /Imported from the production plan|Order number from the production plan/;
 const withPlanFlag = p => ({ ...p, from_plan: PLAN_PO_RE.test(p.notes || '') ? 1 : 0 });
 
-export function listPOs() {
-  return all(`SELECT p.*, COUNT(pl.id) AS line_count, COALESCE(SUM(pl.qty),0) AS qty, COALESCE(SUM(pl.received),0) AS received,
+export async function listPOs() {
+  return (await all(`SELECT p.*, COUNT(pl.id) AS line_count, COALESCE(SUM(pl.qty),0) AS qty, COALESCE(SUM(pl.received),0) AS received,
                 COALESCE(SUM(pl.closed),0) AS closed, CASE WHEN ${PO_TO_CHECK_SQL} THEN 1 ELSE 0 END AS to_check,
-                (SELECT GROUP_CONCAT(chassis, ', ') FROM (SELECT DISTINCT v.chassis FROM po_lines x JOIN vans v ON v.id = x.van_id WHERE x.po_id = p.id ORDER BY v.chassis)) AS vans,
+                (SELECT string_agg(d.chassis, ', ' ORDER BY d.chassis) FROM (SELECT DISTINCT v.chassis FROM po_lines x JOIN vans v ON v.id = x.van_id WHERE x.po_id = p.id) d) AS vans,
                 MIN(CASE WHEN p.status = 'open' AND ${PO_OPEN} > 1e-9 THEN NULLIF(${LINE_EXPECTED}, '') END) AS next_expected
               FROM purchase_orders p LEFT JOIN po_lines pl ON pl.po_id = p.id
-              GROUP BY p.id ORDER BY CASE p.status WHEN 'open' THEN 0 ELSE 1 END, p.id DESC`)
+              GROUP BY p.id ORDER BY CASE p.status WHEN 'open' THEN 0 ELSE 1 END, p.id DESC`))
     .map(p => withPlanFlag({ ...p, vans: p.vans || '', next_expected: p.next_expected || '' }));
 }
 
-export function getPO(id) {
-  const po = get('SELECT * FROM purchase_orders WHERE id = ?', id);
+export async function getPO(id) {
+  const po = await get('SELECT * FROM purchase_orders WHERE id = ?', id);
   if (!po) throw httpError(404, 'PO not found');
-  const ranks = vanRanks();
-  const order = buildOrderInfo();
-  const lines = all(`SELECT pl.*, i.sku, i.name, i.unit, i.kind, v.chassis, v.eta, v.status AS van_status,
-                       (SELECT GROUP_CONCAT(x.state) FROM van_lines x WHERE x.van_id = pl.van_id AND x.item_id = pl.item_id AND x.issued < x.qty) AS van_states
+  const ranks = await vanRanks();
+  const order = await buildOrderInfo();
+  const lines = (await all(`SELECT pl.*, i.sku, i.name, i.unit, i.kind, v.chassis, v.eta, v.status AS van_status,
+                       (SELECT string_agg(x.state, ',') FROM van_lines x WHERE x.van_id = pl.van_id AND x.item_id = pl.item_id AND x.issued < x.qty) AS van_states
                      FROM po_lines pl JOIN items i ON i.id = pl.item_id
-                     LEFT JOIN vans v ON v.id = pl.van_id WHERE pl.po_id = ? ORDER BY i.name, pl.id`, id)
+                     LEFT JOIN vans v ON v.id = pl.van_id WHERE pl.po_id = ? ORDER BY i.name, pl.id`, id))
     .map(l => ({ ...l, open: Math.max(0, l.qty - l.received - l.closed), rank: l.van_id != null ? (ranks.get(l.van_id) ?? 1e6) : 1e7,
                  build_pos: order.get(l.van_id)?.pos ?? null, build_why: order.get(l.van_id)?.why ?? '',
                  expected_eff: l.expected || po.expected || '' }));
   // Rows of one part sit together, vans in build order (the "Total arrived" box fills them in that order).
   lines.sort((a, b) => a.name.localeCompare(b.name) || a.item_id - b.item_id || a.rank - b.rank || a.id - b.id);
   const vans = [...new Set(lines.filter(l => l.chassis).map(l => l.chassis))];
-  const inactive = inactiveVanProblem(po);
-  return { po: withPlanFlag({ ...po, problems: [...poProblems(po), ...inactive], to_check: po.status === 'open' && (po.needs_check || inactive.length) ? 1 : 0 }), lines, vans };
+  const inactive = await inactiveVanProblem(po);
+  return { po: withPlanFlag({ ...po, problems: [...await poProblems(po), ...inactive], to_check: po.status === 'open' && (po.needs_check || inactive.length) ? 1 : 0 }), lines, vans };
 }
 
 // "Yes, all on order" marks the POs it creates (in the notes) so a missing delivery date can be flagged.
 const YES_ALL_MARK = 'Yes, all on order';
 // Why a PO needs a look: no real number, no supplier, the same number used on another PO, or (check-r4-2) made
 // by "Yes, all on order" with no delivery date.
-export function poProblems(po) {
+export async function poProblems(po) {
   const out = [];
   if (po.status === 'open' && !String(po.expected || '').trim() && String(po.notes || '').includes(`(${YES_ALL_MARK})`)
       // an open line with no date of its own (round 2, sp-r1-4: parts added to a PO already in the system count too)
-      && get(`SELECT 1 FROM po_lines pl WHERE pl.po_id = ? AND trim(pl.expected) = '' AND ${PO_OPEN} > 1e-9 LIMIT 1`, po.id)) out.push('no delivery date');
+      && await get(`SELECT 1 FROM po_lines pl WHERE pl.po_id = ? AND trim(pl.expected) = '' AND ${PO_OPEN} > 1e-9 LIMIT 1`, po.id)) out.push('no delivery date');
   const no = String(po.po_no || '').trim();
   if (!/\d/.test(no) || /\(no number\)\s*$/i.test(no)) out.push('no PO number');
   if (!String(po.supplier || '').trim()) out.push('no supplier');
   if (/\d/.test(no)) {
     // Order numbers on the plan run per supplier ("White Vision 11", "Onex 08"): the same number is only
     // a problem for the same supplier, or when one of them has no supplier (can't tell them apart).
-    const dup = all(`SELECT po_no, supplier FROM purchase_orders WHERE id <> ? AND lower(trim(po_no)) = lower(?)
-                       AND (lower(trim(supplier)) = lower(trim(?)) OR trim(supplier) = '' OR trim(?) = '')`, po.id, no, po.supplier || '', po.supplier || '');
+    const dup = await all(`SELECT po_no, supplier FROM purchase_orders WHERE id <> ? AND lower(trim(po_no)) = lower(?)
+                       AND (lower(trim(supplier)) = lower(trim(?)) OR trim(supplier) = '' OR trim(?) = '') ORDER BY id`, po.id, no, po.supplier || '', po.supplier || '');
     if (dup.length) out.push(`number ${no} also used on ${dup.map(d => d.supplier || 'a PO with no supplier').join(', ')}`);
   }
   return out;
 }
-function refreshPoCheck(poId) {
-  const po = get('SELECT * FROM purchase_orders WHERE id = ?', poId);
-  if (po) run('UPDATE purchase_orders SET needs_check = ? WHERE id = ?', poProblems(po).length ? 1 : 0, poId);
+async function refreshPoCheck(poId) {
+  const po = await get('SELECT * FROM purchase_orders WHERE id = ?', poId);
+  if (po) await run('UPDATE purchase_orders SET needs_check = ? WHERE id = ?', (await poProblems(po)).length ? 1 : 0, poId);
 }
 
 // Open PO lines for a van that is finished or cancelled (check-r4-3): still coming, but its van no longer needs
@@ -1656,35 +1718,37 @@ function refreshPoCheck(poId) {
 const INACTIVE_VAN_PO_SQL = (p = 'p') => `EXISTS (SELECT 1 FROM po_lines pl JOIN vans v ON v.id = pl.van_id
   WHERE pl.po_id = ${p}.id AND ${PO_OPEN} > 1e-9 AND v.status NOT IN ('planned','in_production'))`;
 // Every open PO "POs to check" lists: marked needs_check, or with open lines for a van no longer active.
-export const PO_TO_CHECK_SQL = `p.status = 'open' AND (p.needs_check = 1 OR (p.notes NOT LIKE '%looks right%' AND ${INACTIVE_VAN_PO_SQL('p')}))`;
+export const PO_TO_CHECK_SQL = `p.status = 'open' AND (p.needs_check = 1 OR (p.notes NOT ILIKE '%looks right%' AND ${INACTIVE_VAN_PO_SQL('p')}))`;
 const VAN_STATUS_WORD = { completed: 'finished', cancelled: 'cancelled' };
-function inactiveVanProblem(po) {
+async function inactiveVanProblem(po) {
   if (po.status !== 'open' || /looks right/.test(po.notes || '')) return [];
   // Shelf stock is counted as spare for the next van short; a part bought for one van is never handed on by
   // itself, so it is only flagged.
-  const rows = all(`SELECT v.chassis, v.status, SUM(${PO_OPEN}) AS q, (i.kind = 'stock') AS shelf FROM po_lines pl JOIN vans v ON v.id = pl.van_id JOIN items i ON i.id = pl.item_id
+  const rows = await all(`SELECT v.chassis, v.status, SUM(${PO_OPEN}) AS q, (i.kind = 'stock')::int AS shelf FROM po_lines pl JOIN vans v ON v.id = pl.van_id JOIN items i ON i.id = pl.item_id
                     WHERE pl.po_id = ? AND ${PO_OPEN} > 1e-9 AND v.status NOT IN ('planned','in_production')
-                    GROUP BY v.id, (i.kind = 'stock') ORDER BY v.chassis, shelf DESC`, po.id);
+                    GROUP BY v.id, (i.kind = 'stock')::int ORDER BY v.chassis, shelf DESC`, po.id);
   return rows.map(r => `${q(r.q)} still coming for ${r.chassis} (van ${VAN_STATUS_WORD[r.status] || r.status}) – ${r.shelf
     ? 'counted as spare for other vans' : 'bought for that van, no van needs it now'}`);
 }
 
 // "POs to check": open POs marked needs_check (or with lines for vans no longer active), with the reasons and
 // what is on them.
-export function posToCheck() {
-  return all(`SELECT p.* FROM purchase_orders p WHERE ${PO_TO_CHECK_SQL} ORDER BY p.id`).map(po => {
-    const lines = all(`SELECT pl.qty, pl.received, pl.closed, pl.spec, i.name, i.unit, v.chassis, v.status AS van_status FROM po_lines pl JOIN items i ON i.id = pl.item_id
+export async function posToCheck() {
+  const out = [];
+  for (const po of await all(`SELECT p.* FROM purchase_orders p WHERE ${PO_TO_CHECK_SQL} ORDER BY p.id`)) {
+    const lines = await all(`SELECT pl.qty, pl.received, pl.closed, pl.spec, i.name, i.unit, v.chassis, v.status AS van_status FROM po_lines pl JOIN items i ON i.id = pl.item_id
                        LEFT JOIN vans v ON v.id = pl.van_id WHERE pl.po_id = ? ORDER BY i.name`, po.id);
-    return withPlanFlag({ ...po, problems: [...(po.needs_check ? poProblems(po) : []), ...inactiveVanProblem(po)], lines,
-      vans: [...new Set(lines.filter(l => l.chassis).map(l => l.chassis))] });
-  });
+    out.push(withPlanFlag({ ...po, problems: [...(po.needs_check ? await poProblems(po) : []), ...await inactiveVanProblem(po)], lines,
+      vans: [...new Set(lines.filter(l => l.chassis).map(l => l.chassis))] }));
+  }
+  return out;
 }
 
 // Set a PO's number, supplier and dates (inline on "POs to check" or the PO page). Old number /
 // supplier are kept in the notes. `checked`: the office says it's right as it is.
-export function updatePO(id, { po_no, supplier, ordered_at, expected, notes, checked } = {}, by = '') {
-  return tx(() => {
-    const po = get('SELECT * FROM purchase_orders WHERE id = ?', id);
+export async function updatePO(id, { po_no, supplier, ordered_at, expected, notes, checked } = {}, by = '') {
+  return writeTx(async () => {
+    const po = await get('SELECT * FROM purchase_orders WHERE id = ?', id);
     if (!po) throw httpError(404, 'PO not found');
     const set = {}, was = [];
     if (po_no !== undefined) {
@@ -1704,59 +1768,59 @@ export function updatePO(id, { po_no, supplier, ordered_at, expected, notes, che
     if (notes !== undefined) set.notes = String(notes);
     if (was.length) set.notes = [set.notes ?? po.notes, `${was.join(', ')} (changed ${today()}${by ? ` by ${by}` : ''})`].filter(Boolean).join('\n');
     const keys = Object.keys(set);
-    if (keys.length) run(`UPDATE purchase_orders SET ${keys.map(k => `${k} = ?`).join(', ')} WHERE id = ?`, ...keys.map(k => set[k]), id);
-    if (set.supplier) syncSuppliers();
+    if (keys.length) await run(`UPDATE purchase_orders SET ${keys.map(k => `${k} = ?`).join(', ')} WHERE id = ?`, ...keys.map(k => set[k]), id);
+    if (set.supplier) await syncSuppliers();
     if (checked) {
-      run(`UPDATE purchase_orders SET needs_check = 0, notes = trim(notes || char(10) || ?, char(10) || ' ') WHERE id = ?`,
+      await run(`UPDATE purchase_orders SET needs_check = 0, notes = btrim(notes || chr(10) || ?::text, chr(10) || ' ') WHERE id = ?`,
         `Checked – looks right (${today()}${by ? `, ${by}` : ''})`, id);
     }
-    else if (po.needs_check || keys.length) refreshPoCheck(id);
+    else if (po.needs_check || keys.length) await refreshPoCheck(id);
     // Other POs with the old / new number may now be fine (or not).
-    if (set.po_no) for (const o of all(`SELECT id FROM purchase_orders WHERE needs_check = 1 AND id <> ? AND lower(trim(po_no)) IN (lower(?), lower(?))`, id, po.po_no, set.po_no)) refreshPoCheck(o.id);
-    return getPO(id).po;
+    if (set.po_no) for (const o of await all(`SELECT id FROM purchase_orders WHERE needs_check = 1 AND id <> ? AND lower(trim(po_no)) IN (lower(?), lower(?))`, id, po.po_no, set.po_no)) await refreshPoCheck(o.id);
+    return (await getPO(id)).po;
   });
 }
 
 // Move every line of one PO onto another and close the empty one (a vague imported PO that is really
 // part of a real one).
-export function mergePO(fromId, intoId, by = '') {
+export async function mergePO(fromId, intoId, by = '') {
   if (fromId === intoId) throw httpError(400, 'Pick a different PO');
-  return tx(() => {
-    const from = get('SELECT * FROM purchase_orders WHERE id = ?', fromId), into = get('SELECT * FROM purchase_orders WHERE id = ?', intoId);
+  return writeTx(async () => {
+    const from = await get('SELECT * FROM purchase_orders WHERE id = ?', fromId), into = await get('SELECT * FROM purchase_orders WHERE id = ?', intoId);
     if (!from || !into) throw httpError(404, 'PO not found — refresh');
-    const n = run('UPDATE po_lines SET po_id = ? WHERE po_id = ?', intoId, fromId).changes;
+    const n = (await run('UPDATE po_lines SET po_id = ? WHERE po_id = ?', intoId, fromId)).changes;
     const stamp = `${today()}${by ? ` by ${by}` : ''}`;
-    run(`UPDATE purchase_orders SET status = 'closed', needs_check = 0, notes = trim(notes || char(10) || ?, char(10) || ' ') WHERE id = ?`, `Merged into PO ${into.po_no} (${into.supplier || 'no supplier'}) – ${n} line(s) moved, ${stamp}`, fromId);
-    run(`UPDATE purchase_orders SET notes = trim(notes || char(10) || ?, char(10) || ' ') WHERE id = ?`, `${n} line(s) moved here from "${from.po_no}" (${from.supplier || 'no supplier'}), ${stamp}`, intoId);
-    if (get(`SELECT 1 FROM po_lines pl WHERE pl.po_id = ? AND ${PO_OPEN} > 1e-9`, intoId)) run(`UPDATE purchase_orders SET status = 'open' WHERE id = ?`, intoId);
-    if (into.supplier === '' && from.supplier) run('UPDATE purchase_orders SET supplier = ? WHERE id = ?', from.supplier, intoId);
-    refreshPoCheck(intoId);
-    logAlloc('po merged', { field: 'po', before: `PO ${from.po_no} (#${fromId})`, after: `PO ${into.po_no} (#${intoId})`, worker: by, note: `${n} line(s) moved` });
+    await run(`UPDATE purchase_orders SET status = 'closed', needs_check = 0, notes = btrim(notes || chr(10) || ?::text, chr(10) || ' ') WHERE id = ?`, `Merged into PO ${into.po_no} (${into.supplier || 'no supplier'}) – ${n} line(s) moved, ${stamp}`, fromId);
+    await run(`UPDATE purchase_orders SET notes = btrim(notes || chr(10) || ?::text, chr(10) || ' ') WHERE id = ?`, `${n} line(s) moved here from "${from.po_no}" (${from.supplier || 'no supplier'}), ${stamp}`, intoId);
+    if (await get(`SELECT 1 FROM po_lines pl WHERE pl.po_id = ? AND ${PO_OPEN} > 1e-9`, intoId)) await run(`UPDATE purchase_orders SET status = 'open' WHERE id = ?`, intoId);
+    if (into.supplier === '' && from.supplier) await run('UPDATE purchase_orders SET supplier = ? WHERE id = ?', from.supplier, intoId);
+    await refreshPoCheck(intoId);
+    await logAlloc('po merged', { field: 'po', before: `PO ${from.po_no} (#${fromId})`, after: `PO ${into.po_no} (#${intoId})`, worker: by, note: `${n} line(s) moved` });
     return { moved: n };
   });
 }
 
 // Close a PO: whatever has not arrived is cancelled (its balance is written on each line), so those
 // parts go back on the to-order list. Re-open undoes that.
-export function setPOStatus(id, status, by = '') {
-  return tx(() => {
-    const po = get('SELECT * FROM purchase_orders WHERE id = ?', id);
+export async function setPOStatus(id, status, by = '') {
+  return writeTx(async () => {
+    const po = await get('SELECT * FROM purchase_orders WHERE id = ?', id);
     if (!po) throw httpError(404, 'PO not found');
     if (status === 'closed') {
-      for (const pl of all(`SELECT pl.* FROM po_lines pl WHERE pl.po_id = ? AND ${PO_OPEN} > 1e-9`, id)) {
+      for (const pl of await all(`SELECT pl.* FROM po_lines pl WHERE pl.po_id = ? AND ${PO_OPEN} > 1e-9 ORDER BY pl.id`, id)) {
         const bal = pl.qty - pl.received - pl.closed;
-        run('UPDATE po_lines SET closed = closed + ? WHERE id = ?', bal, pl.id);
-        logAlloc('po: balance closed', { van_id: pl.van_id, item_id: pl.item_id, field: 'on order', before: q(bal), after: 0, worker: by, note: `PO ${po.po_no} closed – back on the to-order list` });
-        backToOrderList(pl.van_id, pl.item_id, by, `PO ${po.po_no} closed`);
+        await run('UPDATE po_lines SET closed = closed + ? WHERE id = ?', bal, pl.id);
+        await logAlloc('po: balance closed', { van_id: pl.van_id, item_id: pl.item_id, field: 'on order', before: q(bal), after: 0, worker: by, note: `PO ${po.po_no} closed – back on the to-order list` });
+        await backToOrderList(pl.van_id, pl.item_id, by, `PO ${po.po_no} closed`);
       }
-      run(`UPDATE purchase_orders SET status = 'closed', needs_check = 0 WHERE id = ?`, id);
+      await run(`UPDATE purchase_orders SET status = 'closed', needs_check = 0 WHERE id = ?`, id);
     } else {
-      for (const pl of all('SELECT * FROM po_lines WHERE po_id = ? AND closed > 0', id)) {
-        logAlloc('po: re-opened', { van_id: pl.van_id, item_id: pl.item_id, field: 'on order', before: 0, after: q(pl.closed), worker: by, note: `PO ${po.po_no} re-opened` });
+      for (const pl of await all('SELECT * FROM po_lines WHERE po_id = ? AND closed > 0 ORDER BY id', id)) {
+        await logAlloc('po: re-opened', { van_id: pl.van_id, item_id: pl.item_id, field: 'on order', before: 0, after: q(pl.closed), worker: by, note: `PO ${po.po_no} re-opened` });
       }
-      run('UPDATE po_lines SET closed = 0 WHERE po_id = ?', id);
-      run(`UPDATE purchase_orders SET status = 'open' WHERE id = ?`, id);
-      refreshPoCheck(id);
+      await run('UPDATE po_lines SET closed = 0 WHERE po_id = ?', id);
+      await run(`UPDATE purchase_orders SET status = 'open' WHERE id = ?`, id);
+      await refreshPoCheck(id);
     }
   });
 }
@@ -1764,16 +1828,16 @@ export function setPOStatus(id, status, by = '') {
 // A cancelled PO balance for a van: the van's line goes back on the to-order list. A line with a plan
 // order number would otherwise drop into "Check: already ordered?" — it was ordered and cancelled, so
 // it's marked 'not_ordered' (still to order).
-function backToOrderList(vanId, itemId, by, why) {
+async function backToOrderList(vanId, itemId, by, why) {
   if (vanId == null) return;
-  for (const l of all(`SELECT id, po_ref FROM van_lines WHERE van_id = ? AND item_id = ? AND state = '' AND trim(po_ref) <> '' AND issued < qty`, vanId, itemId)) {
-    run(`UPDATE van_lines SET state = 'not_ordered' WHERE id = ?`, l.id);
-    logAlloc('po: balance closed', { van_id: vanId, item_id: itemId, line_id: l.id, field: 'state', before: '', after: 'not_ordered', worker: by, note: `${why} – still to order (plan said order ${l.po_ref})` });
+  for (const l of await all(`SELECT id, po_ref FROM van_lines WHERE van_id = ? AND item_id = ? AND state = '' AND trim(po_ref) <> '' AND issued < qty ORDER BY id`, vanId, itemId)) {
+    await run(`UPDATE van_lines SET state = 'not_ordered' WHERE id = ?`, l.id);
+    await logAlloc('po: balance closed', { van_id: vanId, item_id: itemId, line_id: l.id, field: 'state', before: '', after: 'not_ordered', worker: by, note: `${why} – still to order (plan said order ${l.po_ref})` });
   }
 }
 
 // Open PO lines that should have arrived already.
-export function overdueLines() {
+export async function overdueLines() {
   const t = today();
   return all(`SELECT pl.id, pl.po_id, p.po_no, p.supplier, ${PO_OPEN} AS open, ${LINE_EXPECTED} AS expected, pl.spec,
                 i.name, i.unit, v.chassis, pl.van_id
@@ -1785,25 +1849,25 @@ export function overdueLines() {
 // lines: [{item_id, qty, van_id?, spec?}]. Lines for the same part, van and spec become one PO line
 // (shelf stock is combined only when the spec matches too). The PO number already being used, or no
 // supplier, needs a yes first (`confirm`): the reply is 409 with `confirm.warnings`.
-export function createPO({ po_no, supplier = '', notes = '', lines = [], ordered_at = '', expected = '', confirm = false }) {
+export async function createPO({ po_no, supplier = '', notes = '', lines = [], ordered_at = '', expected = '', confirm = false }) {
   if (!String(po_no || '').trim()) throw httpError(400, 'PO number is required');
   const valid = lines.filter(l => l.item_id && l.qty > 0);
   if (!valid.length) throw httpError(400, 'Add at least one line');
   if (expected && !validDate(expected)) throw httpError(400, 'Pick the expected date');
-  return tx(() => {
+  return writeTx(async () => {
     // Stops a double-click on "Create PO" making the same order twice (and doubling "on order").
     const no = String(po_no).trim(), sup = String(supplier ?? '').trim();
-    if (get(`SELECT 1 FROM purchase_orders WHERE status = 'open' AND lower(trim(po_no)) = lower(?) AND lower(trim(supplier)) = lower(?)`, no, sup))
+    if (await get(`SELECT 1 FROM purchase_orders WHERE status = 'open' AND lower(trim(po_no)) = lower(?) AND lower(trim(supplier)) = lower(?)`, no, sup))
       throw httpError(409, `PO ${no}${sup ? ` for ${sup}` : ''} already exists`);
     const warnings = [];
     // (numbers run per supplier: only the same supplier, or a PO with no supplier, counts as "used")
-    const used = all(`SELECT po_no, supplier, status FROM purchase_orders WHERE lower(trim(po_no)) = lower(?)
-                        AND (lower(trim(supplier)) = lower(?) OR trim(supplier) = '' OR ? = '')`, no, sup, sup);
+    const used = await all(`SELECT po_no, supplier, status FROM purchase_orders WHERE lower(trim(po_no)) = lower(?)
+                        AND (lower(trim(supplier)) = lower(?) OR trim(supplier) = '' OR ? = '') ORDER BY id`, no, sup, sup);
     if (used.length) warnings.push(`PO number ${no} is already used (${used.map(u => `${u.supplier || 'no supplier'}, ${u.status}`).join('; ')})`);
     if (!sup) warnings.push('No supplier is filled in');
     if (warnings.length && !confirm) throw Object.assign(httpError(409, warnings.join('. ')), { confirm: { warnings } });
-    const id = Number(run('INSERT INTO purchase_orders(po_no, supplier, notes, ordered_at, expected) VALUES(?,?,?,?,?)',
-      no, sup, notes, validDate(ordered_at) || today(), validDate(expected)).lastInsertRowid);
+    const id = await insert('INSERT INTO purchase_orders(po_no, supplier, notes, ordered_at, expected) VALUES(?,?,?,?,?)',
+      no, sup, notes, validDate(ordered_at) || today(), validDate(expected));
     const merged = new Map();
     for (const l of valid) {
       const spec = String(l.spec || '').trim();
@@ -1811,9 +1875,9 @@ export function createPO({ po_no, supplier = '', notes = '', lines = [], ordered
       if (merged.has(k)) merged.get(k).qty += Number(l.qty);
       else merged.set(k, { item_id: Number(l.item_id), van_id: Number(l.van_id) || null, qty: Number(l.qty), spec });
     }
-    for (const l of merged.values()) run('INSERT INTO po_lines(po_id, item_id, qty, van_id, spec) VALUES(?,?,?,?,?)', id, l.item_id, l.qty, l.van_id, l.spec);
-    if (!sup) run('UPDATE purchase_orders SET needs_check = 1 WHERE id = ?', id);
-    syncSuppliers();
+    for (const l of merged.values()) await run('INSERT INTO po_lines(po_id, item_id, qty, van_id, spec) VALUES(?,?,?,?,?)', id, l.item_id, l.qty, l.van_id, l.spec);
+    if (!sup) await run('UPDATE purchase_orders SET needs_check = 1 WHERE id = ?', id);
+    await syncSuppliers();
     return id;
   });
 }
@@ -1827,118 +1891,118 @@ export function createPO({ po_no, supplier = '', notes = '', lines = [], ordered
 // Received for a van = locked to it. More than ordered → the extra goes on the shelf (free stock).
 // A van line now customer supplies / to be decided / fitted → that part goes on the shelf too.
 // Returns { warnings } in plain words.
-export function receivePO(poId, receipts = [], { backorder = {}, closeBalance = [], by = '' } = {}) {
-  return tx(() => {
-    const po = get('SELECT * FROM purchase_orders WHERE id = ?', poId);
+export async function receivePO(poId, receipts = [], { backorder = {}, closeBalance = [], by = '' } = {}) {
+  return writeTx(async () => {
+    const po = await get('SELECT * FROM purchase_orders WHERE id = ?', poId);
     if (!po) throw httpError(404, 'PO not found');
     // A second click on "Receive delivery" must not book the same delivery twice.
     if (po.status === 'closed') throw httpError(409, 'This PO is already fully received. Re-open it to book more.');
     const ref = `PO ${po.po_no}`;
     const warnings = [];
     let booked = 0;
-    const lineRow = id => get(`SELECT pl.*, i.name, i.unit, v.chassis FROM po_lines pl JOIN items i ON i.id = pl.item_id
+    const lineRow = async id => get(`SELECT pl.*, i.name, i.unit, v.chassis FROM po_lines pl JOIN items i ON i.id = pl.item_id
                                LEFT JOIN vans v ON v.id = pl.van_id WHERE pl.id = ? AND pl.po_id = ?`, Number(id), poId);
     for (const r of receipts) {
-      const pl = lineRow(r.id);
+      const pl = await lineRow(r.id);
       const got = Number(r.qty);
       if (!pl || !(got > 0)) continue;
       booked++;
       const due = Math.max(0, pl.qty - pl.received - pl.closed);
       const take = Math.min(got, due), extra = got - take;
       if (take > 0) {
-        run('UPDATE po_lines SET received = received + ? WHERE id = ?', take, pl.id);
+        await run('UPDATE po_lines SET received = received + ? WHERE id = ?', take, pl.id);
         if (pl.van_id != null) {
-          const vanNeed = vanNeedLocked(pl.van_id, pl.item_id);
+          const vanNeed = await vanNeedLocked(pl.van_id, pl.item_id);
           const toVan = Math.min(take, vanNeed), toShelf = take - toVan;
-          if (toVan > 1e-9) receive(pl.item_id, toVan, { ref, vanId: pl.van_id, by, poRef: po.po_no });
+          if (toVan > 1e-9) await receive(pl.item_id, toVan, { ref, vanId: pl.van_id, by, poRef: po.po_no });
           if (toShelf > 1e-9) {
             const msg = `${q(toShelf)} ${pl.unit} ${pl.name}: ${pl.chassis} no longer needs ${toShelf < take ? 'all of them' : 'it'} (customer supplies, to be decided or fitted) – put on the shelf`;
-            receive(pl.item_id, toShelf, { ref, note: msg, by });
+            await receive(pl.item_id, toShelf, { ref, note: msg, by });
             warnings.push(msg);
           }
         } else {
-          receive(pl.item_id, take, { ref, by });
+          await receive(pl.item_id, take, { ref, by });
         }
       }
       if (extra > 1e-9) {
         const msg = `${q(extra)} ${pl.unit} ${pl.name}: ${q(extra)} more than ordered – put on the shelf`;
-        receive(pl.item_id, extra, { ref, note: msg, by });
-        logAlloc('receive: over', { van_id: pl.van_id, item_id: pl.item_id, field: 'on_hand', before: '', after: `+${q(extra)}`, worker: by, note: `${ref}: ${msg}` });
+        await receive(pl.item_id, extra, { ref, note: msg, by });
+        await logAlloc('receive: over', { van_id: pl.van_id, item_id: pl.item_id, field: 'on_hand', before: '', after: `+${q(extra)}`, worker: by, note: `${ref}: ${msg}` });
         warnings.push(msg);
       }
     }
     for (const [lineId, date] of Object.entries(backorder || {})) {
       if (!validDate(date)) continue;
-      const pl = lineRow(lineId);
-      const n = run(`UPDATE po_lines SET expected = ? WHERE id = ? AND po_id = ? AND qty - received - closed > 1e-9`, date, Number(lineId), poId).changes;
-      if (n && pl) logAlloc('receive: short', { van_id: pl.van_id, item_id: pl.item_id, field: 'on order', before: '', after: `${q(pl.qty - pl.received - pl.closed)} still to come`, worker: by,
+      const pl = await lineRow(lineId);
+      const n = (await run(`UPDATE po_lines SET expected = ? WHERE id = ? AND po_id = ? AND qty - received - closed > 1e-9`, date, Number(lineId), poId)).changes;
+      if (n && pl) await logAlloc('receive: short', { van_id: pl.van_id, item_id: pl.item_id, field: 'on order', before: '', after: `${q(pl.qty - pl.received - pl.closed)} still to come`, worker: by,
         note: `${ref}: short delivery – rest expected ${date}` });
       booked += n;
     }
     for (const lineId of closeBalance || []) {
-      const pl = lineRow(lineId);
+      const pl = await lineRow(lineId);
       if (!pl) continue;
       const bal = pl.qty - pl.received - pl.closed;
       if (bal <= 1e-9) continue;
-      run('UPDATE po_lines SET closed = closed + ? WHERE id = ?', bal, pl.id);
-      logAlloc('po: balance closed', { van_id: pl.van_id, item_id: pl.item_id, field: 'on order', before: q(bal), after: 0, worker: by,
+      await run('UPDATE po_lines SET closed = closed + ? WHERE id = ?', bal, pl.id);
+      await logAlloc('po: balance closed', { van_id: pl.van_id, item_id: pl.item_id, field: 'on order', before: q(bal), after: 0, worker: by,
         note: `${ref}: supplier cancelled the rest${pl.chassis ? ` – ${pl.chassis} back on the to-order list` : ''}` });
-      backToOrderList(pl.van_id, pl.item_id, by, `${ref}: supplier cancelled`);
+      await backToOrderList(pl.van_id, pl.item_id, by, `${ref}: supplier cancelled`);
       warnings.push(`${q(bal)} ${pl.unit} ${pl.name} cancelled – ${pl.chassis ? `${pl.chassis} is ` : ''}back on the to-order list`);
       booked++;
     }
     if (!booked) throw httpError(400, 'Enter what arrived');
-    closePoIfDone(poId);
+    await closePoIfDone(poId);
     return { warnings };
   });
 }
 
 // Vans still to build whose due date needs fixing: blank, or a planned van whose date has passed (C1).
-export function datesToCheck() {
+export async function datesToCheck() {
   const t = today();
-  return all(`SELECT v.id, v.chassis, v.eta, v.status FROM vans v WHERE ${ACTIVE_VAN} ORDER BY ${PRIORITY}`)
+  return (await all(`SELECT v.id, v.chassis, v.eta, v.status FROM vans v WHERE ${ACTIVE_VAN} ORDER BY ${PRIORITY}`))
     .filter(v => !v.eta || (v.status === 'planned' && v.eta < t));
 }
 
 // Lines on vans in production / due soon whose quantity looks odd and nobody has said "quantity is right" (C2).
-export function qtyChecks({ nearOnly = true } = {}) {
-  const lines = all(`SELECT l.*, i.unit, i.name, i.plan_column AS item_plan_column, v.chassis FROM van_lines l JOIN items i ON i.id = l.item_id JOIN vans v ON v.id = l.van_id
-                     WHERE ${ACTIVE_VAN} AND l.issued < l.qty ${nearOnly ? `AND ${nearVanSql('v')}` : ''} ORDER BY ${PRIORITY}, i.name`);
-  const usual = itemMedians(lines.map(l => l.item_id));
+export async function qtyChecks({ nearOnly = true } = {}) {
+  const lines = await all(`SELECT l.*, i.unit, i.name, i.plan_column AS item_plan_column, v.chassis FROM van_lines l JOIN items i ON i.id = l.item_id JOIN vans v ON v.id = l.van_id
+                     WHERE ${ACTIVE_VAN} AND l.issued < l.qty ${nearOnly ? `AND ${await nearVanSql('v')}` : ''} ORDER BY ${PRIORITY}, i.name`);
+  const usual = await itemMedians(lines.map(l => l.item_id));
   return lines.map(l => ({ ...l, why: qtyCheckFor(l, usual.get(l.item_id)) })).filter(l => l.why);
 }
 
 // Dashboard. counts: the "Needs action this month" pieces (vans in production or due within the
 // "coming up" weeks for the per-van lists; POs, deliveries and dates for everything).
-export function summary() {
-  const items = listItems().filter(i => !i.placeholder); // "as per plan" catch-alls aren't counted as parts
-  const vans = listVans({ status: 'active' });
-  const sh = shortagesCached(); // listVans just worked it out for the "waiting on PO" split (owner-r3-2)
+export async function summary() {
+  const items = (await listItems()).filter(i => !i.placeholder); // "as per plan" catch-alls aren't counted as parts
+  const vans = await listVans({ status: 'active' });
+  const sh = await shortagesCached(); // listVans just worked it out for the "waiting on PO" split (owner-r3-2)
   const now = sh.rows.filter(r => r.group === 'now' && r.suggest > 1e-9 && !r.check);
-  const near = nearVanSql('v');
+  const near = await nearVanSql('v');
   const nearIds = new Set(vans.filter(v => v.near).map(v => v.id));
-  const checks = checkOrdered();
+  const checks = await checkOrdered();
   const checksNear = checks.filter(g => g.near);
-  const decisions = decisionLines();
-  const received = get(`SELECT COUNT(*) AS c FROM van_lines l JOIN vans v ON v.id = l.van_id
-                        WHERE ${ACTIVE_VAN} AND l.state IN ('customer','tbd') AND l.reserved_firm > 0 AND l.issued < l.qty`).c;
+  const decisions = await decisionLines();
+  const received = (await get(`SELECT COUNT(*) AS c FROM van_lines l JOIN vans v ON v.id = l.van_id
+                        WHERE ${ACTIVE_VAN} AND l.state IN ('customer','tbd') AND l.reserved_firm > 0 AND l.issued < l.qty`)).c;
   // Waiting on parts: vans in production / due soon, with the names of what is missing.
-  const waiting = all(`SELECT v.id, v.chassis, v.eta, v.status, i.name FROM van_lines l JOIN vans v ON v.id = l.van_id JOIN items i ON i.id = l.item_id
+  const waiting = await all(`SELECT v.id, v.chassis, v.eta, v.status, i.name FROM van_lines l JOIN vans v ON v.id = l.van_id JOIN items i ON i.id = l.item_id
                        WHERE ${ACTIVE_VAN} AND ${near} AND l.qty > l.reserved + l.issued + 1e-9 AND ${COUNTS_SHORT_CORR('l')}
-                         AND i.placeholder = 0 AND i.sku NOT LIKE 'PLAN-%' ORDER BY ${PRIORITY}, i.name`);
+                         AND i.placeholder = 0 AND i.sku NOT ILIKE 'PLAN-%' ORDER BY ${PRIORITY}, i.name`);
   const wv = new Map();
   for (const r of waiting) {
     if (!wv.has(r.id)) wv.set(r.id, { van_id: r.id, chassis: r.chassis, eta: r.eta, status: r.status, parts: [] });
     if (!wv.get(r.id).parts.includes(r.name)) wv.get(r.id).parts.push(r.name);
   }
-  const qc = qtyChecks();
+  const qc = await qtyChecks();
   const action = {
     // the one "order now" number: different parts (with its van lines alongside, user-r1-3)
     orderNow: sh.orderNow.parts, orderNowLines: sh.orderNow.lines, orderNowText: sh.orderNow.text, orderNowCheck: sh.orderNow.check,
     checkOrdered: checksNear.length, checkOrderedAll: checks.length,
-    posToCheck: get(`SELECT COUNT(*) AS c FROM purchase_orders p WHERE ${PO_TO_CHECK_SQL}`).c,
-    overdue: overdueLines().length,
-    dates: datesToCheck().length,
+    posToCheck: (await get(`SELECT COUNT(*) AS c FROM purchase_orders p WHERE ${PO_TO_CHECK_SQL}`)).c,
+    overdue: (await overdueLines()).length,
+    dates: (await datesToCheck()).length,
     decisions: decisions.filter(d => nearIds.has(d.van_id)).length, decisionsAll: decisions.length,
     qtyChecks: qc.length,
     received,
@@ -1946,7 +2010,7 @@ export function summary() {
   action.total = action.orderNow + action.checkOrdered + action.posToCheck + action.overdue + action.dates + action.decisions + action.qtyChecks + action.received;
   return {
     vans,
-    settings: purchasingSettings(),
+    settings: await purchasingSettings(),
     counts: {
       planned: vans.filter(v => v.status === 'planned').length,
       inProduction: vans.filter(v => v.status === 'in_production').length,
@@ -1956,11 +2020,11 @@ export function summary() {
       itemsShort: items.filter(i => i.short > 0).length,
       itemsToOrder: sh.orderNow.parts, orderNow: sh.orderNow, orderNowText: sh.orderNow.text,
       comingUp: new Set(sh.rows.filter(r => r.group === 'soon' && !r.check).map(r => r.item_id)).size,
-      toCheck: checkOrderedCount(),
+      toCheck: await checkOrderedCount(),
       lowStock: items.filter(i => i.low).length,
-      openPOs: get(`SELECT COUNT(*) AS c FROM purchase_orders WHERE status = 'open'`).c,
+      openPOs: (await get(`SELECT COUNT(*) AS c FROM purchase_orders WHERE status = 'open'`)).c,
       posToCheck: action.posToCheck,
-      stockChecks: stockChecksCount(),
+      stockChecks: await stockChecksCount(),
     },
     action,
     qtyChecks: qc.slice(0, 100).map(l => ({ id: l.id, van_id: l.van_id, chassis: l.chassis, name: l.name, plan_column: l.plan_column, qty: l.qty, unit: l.unit, why: l.why })),
@@ -1968,8 +2032,8 @@ export function summary() {
     // "Order now" rows, most urgent first.
     toOrder: now.slice(0, 12),
     decisions,
-    overdue: overdueLines(),
-    recent: all(`SELECT m.*, i.sku, i.name, v.chassis FROM movements m JOIN items i ON i.id = m.item_id
+    overdue: await overdueLines(),
+    recent: await all(`SELECT m.*, i.sku, i.name, v.chassis FROM movements m JOIN items i ON i.id = m.item_id
                  LEFT JOIN vans v ON v.id = m.van_id ORDER BY m.id DESC LIMIT 12`),
   };
 }
@@ -1985,20 +2049,20 @@ const RANK = { none: 0, ordered: 1, received: 2, done: 3 };
 // PO or another van's spare PO line, as in getVan), and `pn` (the part names) when it holds more than one part —
 // so the phone's "By van" counts parts the van page's way ("Not ordered 29 · To check 10 · Ordered 18 ·
 // Received 58"). The cells' own colours (the spreadsheet's, also used by the Excel export) are unchanged.
-export function planGrid({ includeFinished = false, parts = false } = {}) {
+export async function planGrid({ includeFinished = false, parts = false } = {}) {
   let columns = [];
-  try { columns = JSON.parse(getSetting('plan_columns', '[]')); } catch { /* none yet */ }
+  try { columns = JSON.parse(await getSetting('plan_columns', '[]')); } catch { /* none yet */ }
   const where = includeFinished ? '' : `WHERE ${ACTIVE_VAN}`;
-  const vans = all(`SELECT v.id, v.chassis, v.model, v.length, v.customer, v.eta, v.status FROM vans v ${where}
+  const vans = await all(`SELECT v.id, v.chassis, v.model, v.length, v.customer, v.eta, v.status FROM vans v ${where}
                     ORDER BY CASE v.status WHEN 'in_production' THEN 0 WHEN 'planned' THEN 1 ELSE 2 END, ${PRIORITY}`);
   const vanIds = `SELECT v.id FROM vans v ${where}`;
-  const onOrder = new Set(all(`SELECT pl.van_id, pl.item_id FROM po_lines pl JOIN purchase_orders p ON p.id = pl.po_id
-                               WHERE ${PO_IS_OPEN} AND pl.van_id IN (${vanIds})`)
+  const onOrder = new Set((await all(`SELECT pl.van_id, pl.item_id FROM po_lines pl JOIN purchase_orders p ON p.id = pl.po_id
+                               WHERE ${PO_IS_OPEN} AND pl.van_id IN (${vanIds})`))
     .map(r => `${r.van_id}|${r.item_id}`));
-  const lines = all(`SELECT l.id, l.van_id, l.item_id, l.qty, l.reserved, l.issued, l.merged_cols, l.state, l.urgent, l.po_ref, i.name, i.unit,
+  const lines = await all(`SELECT l.id, l.van_id, l.item_id, l.qty, l.reserved, l.issued, l.merged_cols, l.state, l.urgent, l.po_ref, i.name, i.unit,
                        COALESCE(NULLIF(l.plan_column, ''), NULLIF(i.plan_column, ''), i.category) AS col
                      FROM van_lines l JOIN items i ON i.id = l.item_id WHERE l.van_id IN (${vanIds}) ORDER BY l.id`);
-  const texts = all(`SELECT van_id, label, value FROM order_fields WHERE section = 'PRODUCTION PLAN' AND van_id IN (${vanIds})`);
+  const texts = await all(`SELECT van_id, label, value FROM order_fields WHERE section = 'PRODUCTION PLAN' AND van_id IN (${vanIds}) ORDER BY id`);
 
   const byVan = new Map(vans.map(v => [v.id, { ...v, cells: {} }]));
   const cell = (vanId, col) => {
@@ -2033,12 +2097,12 @@ export function planGrid({ includeFinished = false, parts = false } = {}) {
   }
   if (parts) {
     const vanQ = new Map(), shelfQ = new Map();
-    for (const r of all(`SELECT pl.item_id, pl.van_id, ${PO_OPEN} AS q FROM po_lines pl JOIN purchase_orders p ON p.id = pl.po_id
+    for (const r of await all(`SELECT pl.item_id, pl.van_id, ${PO_OPEN} AS q FROM po_lines pl JOIN purchase_orders p ON p.id = pl.po_id
                          WHERE ${PO_IS_OPEN} AND (pl.van_id IS NULL OR pl.van_id IN (${vanIds}))`)) {
       if (r.van_id == null) shelfQ.set(r.item_id, (shelfQ.get(r.item_id) || 0) + r.q);
       else { const k = `${r.van_id}|${r.item_id}`; vanQ.set(k, (vanQ.get(k) || 0) + r.q); }
     }
-    const cov = lineCover();
+    const cov = await lineCover();
     const byId = new Map();
     for (const l of lines) {
       const mine = vanQ.get(`${l.van_id}|${l.item_id}`) || 0;
@@ -2060,74 +2124,78 @@ export function planGrid({ includeFinished = false, parts = false } = {}) {
 const q = n => (Number.isInteger(n) ? String(n) : String(Math.round(n * 100) / 100));
 
 // Book stock in against one particular part line (used when a plan cell is marked received).
-function receiveInto(line, qty, ref, { reason = 'receive', by = '', note = '' } = {}) {
-  run('UPDATE items SET on_hand = on_hand + ? WHERE id = ?', qty, line.item_id);
+async function receiveInto(line, qty, ref, { reason = 'receive', by = '', note = '' } = {}) {
+  await run('UPDATE items SET on_hand = on_hand + ? WHERE id = ?', qty, line.item_id);
   // Received for this van: locked to it.
-  run('UPDATE van_lines SET reserved = reserved + ?, reserved_firm = reserved_firm + ? WHERE id = ?', qty, qty, line.id);
-  logAlloc(reason, { van_id: line.van_id, item_id: line.item_id, line_id: line.id, field: 'reserved (locked)', before: '', after: `+${q(qty)}`, note: ref, worker: by,
+  await run('UPDATE van_lines SET reserved = reserved + ?, reserved_firm = reserved_firm + ? WHERE id = ?', qty, qty, line.id);
+  await logAlloc(reason, { van_id: line.van_id, item_id: line.item_id, line_id: line.id, field: 'reserved (locked)', before: '', after: `+${q(qty)}`, note: ref, worker: by,
     change: qty, firm_change: qty });
-  run(`INSERT INTO movements(item_id, qty, type, van_id, ref, note, worker) VALUES(?, ?, 'receive', ?, ?, ?, ?)`, line.item_id, qty, line.van_id, ref, note, by);
+  await run(`INSERT INTO movements(item_id, qty, type, van_id, ref, note, worker) VALUES(?, ?, 'receive', ?, ?, ?, ?)`, line.item_id, qty, line.van_id, ref, note, by);
 }
 
 // Stock arrived for one van line (a grey cell on an updated production plan, C12): open PO lines for
 // that van and part are ticked off first, the rest is booked straight in. Never more than the line still
-// needs (qty − set aside − fitted). Received for the van = locked to it. Call inside a transaction.
-export function receiveForLine(lineId, qty, { ref = 'Production plan update', by = '' } = {}) {
-  const l = get('SELECT * FROM van_lines WHERE id = ?', lineId);
+// needs (qty − set aside − fitted). Received for the van = locked to it. (Joins the caller's write
+// transaction, or runs in its own.)
+export async function receiveForLine(lineId, qty, opts = {}) {
+  return writeTx(() => receiveForLineNow(lineId, qty, opts));
+}
+async function receiveForLineNow(lineId, qty, { ref = 'Production plan update', by = '' } = {}) {
+  const l = await get('SELECT * FROM van_lines WHERE id = ?', lineId);
   if (!l) return 0;
   let left = Math.min(qty, Math.max(0, l.qty - l.reserved - l.issued));
   const got = left;
-  for (const pl of all(`SELECT pl.*, p.po_no FROM po_lines pl JOIN purchase_orders p ON p.id = pl.po_id
+  for (const pl of await all(`SELECT pl.*, p.po_no FROM po_lines pl JOIN purchase_orders p ON p.id = pl.po_id
                         WHERE ${PO_IS_OPEN} AND pl.van_id = ? AND pl.item_id = ? ORDER BY pl.id`, l.van_id, l.item_id)) {
     if (left <= 1e-9) break;
     const take = Math.min(left, pl.qty - pl.received - pl.closed);
-    run('UPDATE po_lines SET received = received + ? WHERE id = ?', take, pl.id);
-    receiveInto(l, take, `PO ${pl.po_no}`, { reason: 'plan update', by, note: ref });
-    closePoIfDone(pl.po_id);
+    await run('UPDATE po_lines SET received = received + ? WHERE id = ?', take, pl.id);
+    await receiveInto(l, take, `PO ${pl.po_no}`, { reason: 'plan update', by, note: ref });
+    await closePoIfDone(pl.po_id);
     left -= take;
   }
-  if (left > 1e-9) receiveInto(l, left, ref, { reason: 'plan update', by, note: ref });
+  if (left > 1e-9) await receiveInto(l, left, ref, { reason: 'plan update', by, note: ref });
   return got;
 }
 
 // Move one part line forward from the plan: 'ordered' (needs po_no), 'received', or 'done'
 // (fitted — received if needed, then issued to the van).
-export function setLineStatus(lineId, status, { po_no = '' } = {}) {
-  return tx(() => {
-    const l = get(`SELECT l.*, i.supplier FROM van_lines l JOIN items i ON i.id = l.item_id WHERE l.id = ?`, lineId);
+export async function setLineStatus(lineId, status, { po_no = '' } = {}) {
+  return writeTx(async () => {
+    const l = await get(`SELECT l.*, i.supplier FROM van_lines l JOIN items i ON i.id = l.item_id WHERE l.id = ?`, lineId);
     if (!l) throw httpError(404, 'Part line not found');
-    const short = () => Math.max(0, get('SELECT qty - reserved - issued AS s FROM van_lines WHERE id = ?', lineId).s);
-    const openPoLines = () => all(`SELECT pl.*, p.po_no FROM po_lines pl JOIN purchase_orders p ON p.id = pl.po_id
+    const short = async () => Math.max(0, (await get('SELECT qty - reserved - issued AS s FROM van_lines WHERE id = ?', lineId)).s);
+    const openPoLines = async () => all(`SELECT pl.*, p.po_no FROM po_lines pl JOIN purchase_orders p ON p.id = pl.po_id
                                    WHERE ${PO_IS_OPEN} AND pl.van_id = ? AND pl.item_id = ?
                                    ORDER BY pl.id`, l.van_id, l.item_id);
 
     if (status === 'ordered') {
       const ref = String(po_no || '').trim();
       if (!ref) throw httpError(400, 'Enter the order number');
-      const need = short() - openPoLines().reduce((s, p) => s + p.qty - p.received - p.closed, 0);
+      const need = (await short()) - (await openPoLines()).reduce((s, p) => s + p.qty - p.received - p.closed, 0);
       if (need > 0) {
-        const po = get(`SELECT id FROM purchase_orders WHERE status = 'open' AND po_no = ? AND supplier = ?`, ref, l.supplier || '');
-        const poId = po ? po.id : Number(run('INSERT INTO purchase_orders(po_no, supplier, ordered_at, needs_check) VALUES(?, ?, ?, ?)', ref, l.supplier || '', today(), l.supplier ? 0 : 1).lastInsertRowid);
-        run('INSERT INTO po_lines(po_id, item_id, qty, van_id, spec) VALUES(?,?,?,?,?)', poId, l.item_id, need, l.van_id, specForPo(l.spec, ref));
-        syncSuppliers();
+        const po = await get(`SELECT id FROM purchase_orders WHERE status = 'open' AND po_no = ? AND supplier = ?`, ref, l.supplier || '');
+        const poId = po ? po.id : await insert('INSERT INTO purchase_orders(po_no, supplier, ordered_at, needs_check) VALUES(?, ?, ?, ?)', ref, l.supplier || '', today(), l.supplier ? 0 : 1);
+        await run('INSERT INTO po_lines(po_id, item_id, qty, van_id, spec) VALUES(?,?,?,?,?)', poId, l.item_id, need, l.van_id, specForPo(l.spec, ref));
+        await syncSuppliers();
       }
-      run('UPDATE van_lines SET po_ref = ? WHERE id = ?', ref, lineId);
+      await run('UPDATE van_lines SET po_ref = ? WHERE id = ?', ref, lineId);
       return;
     }
     if (status !== 'received' && status !== 'done') throw httpError(400, 'Unknown status');
 
     // Anything on order for this van arrives first, then the rest is booked in directly.
-    for (const pl of openPoLines()) {
-      const s = short();
+    for (const pl of await openPoLines()) {
+      const s = await short();
       if (s <= 0) break;
       const take = Math.min(s, pl.qty - pl.received - pl.closed);
-      run('UPDATE po_lines SET received = received + ? WHERE id = ?', take, pl.id);
-      receiveInto(l, take, `PO ${pl.po_no}`);
-      closePoIfDone(pl.po_id);
+      await run('UPDATE po_lines SET received = received + ? WHERE id = ?', take, pl.id);
+      await receiveInto(l, take, `PO ${pl.po_no}`);
+      await closePoIfDone(pl.po_id);
     }
-    const rest = short();
-    if (rest > 0) receiveInto(l, rest, l.po_ref ? `Order ${l.po_ref}` : 'Marked received on plan');
-    if (status === 'done') issueLines(l.van_id, [lineId]);
+    const rest = await short();
+    if (rest > 0) await receiveInto(l, rest, l.po_ref ? `Order ${l.po_ref}` : 'Marked received on plan');
+    if (status === 'done') await issueLines(l.van_id, [lineId]);
   });
 }
 
@@ -2145,9 +2213,9 @@ export function setLineStatus(lineId, status, { po_no = '' } = {}) {
 // for it). Then the worker is asked first (an error with `confirm` comes back): true = take that
 // van's part (it goes straight onto "Order now" for that van), false = no, these are a new delivery.
 // The take is never refused because a part is locked: the books follow the shelf.
-export function takeForVan(lineId, qty, by = '', { extraLine = false, seenIssued, acceptBorrow } = {}) {
-  return tx(() => {
-    const l = get(`SELECT l.*, v.chassis, v.status AS van_status, v.area_id AS van_area, i.name, i.kind FROM van_lines l
+export async function takeForVan(lineId, qty, by = '', { extraLine = false, seenIssued, acceptBorrow } = {}) {
+  return writeTx(async () => {
+    const l = await get(`SELECT l.*, v.chassis, v.status AS van_status, v.area_id AS van_area, i.name, i.kind FROM van_lines l
                    JOIN vans v ON v.id = l.van_id JOIN items i ON i.id = l.item_id WHERE l.id = ?`, lineId);
     if (!l) throw httpError(404, 'Part not found');
     if (!['planned', 'in_production'].includes(l.van_status)) throw httpError(400, `${l.chassis} is finished — parts can't be taken for it`);
@@ -2159,55 +2227,55 @@ export function takeForVan(lineId, qty, by = '', { extraLine = false, seenIssued
     // Took more than the list said: the list grows to match.
     if (l.issued + take > l.qty) {
       rec.oldQty = l.qty;
-      run('UPDATE van_lines SET qty = ? WHERE id = ?', l.issued + take, lineId);
+      await run('UPDATE van_lines SET qty = ? WHERE id = ?', l.issued + take, lineId);
     }
 
     let need = Math.max(0, take - l.reserved);
     const donors = []; // chassis this take borrowed locked / bought-for-van parts from
     if (need > 0) {
-      const { on_hand } = get('SELECT on_hand FROM items WHERE id = ?', l.item_id);
-      const reservedAll = get(`SELECT COALESCE(SUM(x.reserved),0) AS r FROM van_lines x JOIN vans v ON v.id = x.van_id
-                               WHERE x.item_id = ? AND ${ACTIVE_VAN}`, l.item_id).r;
+      const { on_hand } = await get('SELECT on_hand FROM items WHERE id = ?', l.item_id);
+      const reservedAll = (await get(`SELECT COALESCE(SUM(x.reserved),0) AS r FROM van_lines x JOIN vans v ON v.id = x.van_id
+                               WHERE x.item_id = ? AND ${ACTIVE_VAN}`, l.item_id)).r;
       const free = Math.max(0, on_hand - reservedAll);
       const fromFree = Math.min(free, need);
       need -= fromFree;
       let borrowed = 0;
-      const ranks = vanRanks();
+      const ranks = await vanRanks();
       const myRank = ranks.get(l.van_id) ?? Infinity;
-      const others = () => all(`SELECT x.id, x.van_id, x.reserved, x.reserved_firm, x.urgent, x.state, x.po_ref, v.chassis FROM van_lines x JOIN vans v ON v.id = x.van_id
-                                WHERE x.item_id = ? AND x.van_id <> ? AND x.reserved > 0 AND ${ACTIVE_VAN}`, l.item_id, l.van_id)
+      const others = async () => (await all(`SELECT x.id, x.van_id, x.reserved, x.reserved_firm, x.urgent, x.state, x.po_ref, v.chassis FROM van_lines x JOIN vans v ON v.id = x.van_id
+                                WHERE x.item_id = ? AND x.van_id <> ? AND x.reserved > 0 AND ${ACTIVE_VAN}`, l.item_id, l.van_id))
         .sort((a, b) => (ranks.get(b.van_id) ?? 0) - (ranks.get(a.van_id) ?? 0) || b.id - a.id); // built last first
-      const borrow = (o, b, firmCut, urgent) => {
-        run('UPDATE van_lines SET reserved = reserved - ?, reserved_firm = MAX(0, reserved_firm - ?), urgent = CASE WHEN ? THEN 1 ELSE urgent END WHERE id = ?',
+      const borrow = async (o, b, firmCut, urgent) => {
+        await run('UPDATE van_lines SET reserved = reserved - ?, reserved_firm = GREATEST(0, reserved_firm - ?::double precision), urgent = CASE WHEN ?::integer = 1 THEN 1 ELSE urgent END WHERE id = ?',
             b, firmCut, urgent ? 1 : 0, o.id);
         // The donor's plan order number was used up when its part arrived: it is now a plain "still to
         // order" line (not "Check: already ordered?"), so it shows under Order now. Undo puts '' back.
         const toNotOrdered = urgent && !o.state && String(o.po_ref || '').trim() !== '';
         if (toNotOrdered) {
-          run(`UPDATE van_lines SET state = 'not_ordered' WHERE id = ? AND state = ''`, o.id);
-          logAlloc('borrow', { van_id: o.van_id, item_id: l.item_id, line_id: o.id, field: 'state', before: '', after: 'not_ordered', worker: by,
+          await run(`UPDATE van_lines SET state = 'not_ordered' WHERE id = ? AND state = ''`, o.id);
+          await logAlloc('borrow', { van_id: o.van_id, item_id: l.item_id, line_id: o.id, field: 'state', before: '', after: 'not_ordered', worker: by,
             note: `plan order ${String(o.po_ref).trim()} already used — part borrowed for ${l.chassis}, still to order for ${o.chassis}` });
           o.state = 'not_ordered';
         }
         rec.borrowed.push([o.id, b, firmCut, o.urgent, toNotOrdered ? '' : null]);
-        logAlloc('borrow', { van_id: o.van_id, item_id: l.item_id, line_id: o.id, field: 'reserved', before: o.reserved, after: o.reserved - b, worker: by,
+        await logAlloc('borrow', { van_id: o.van_id, item_id: l.item_id, line_id: o.id, field: 'reserved', before: o.reserved, after: o.reserved - b, worker: by,
           note: `borrowed from ${o.chassis} by ${by || 'a worker'} for ${l.chassis}${urgent ? ' — re-order for ' + o.chassis : ''}` });
         need -= b; borrowed += b;
       };
       // 1. Shelf stock merely held for vans built after this one (not received for them): they'll be
       //    supplied again by orders. Per-van parts are never handed on this way.
       if (need > 0 && l.kind === 'stock') {
-        for (const o of others()) {
+        for (const o of await others()) {
           if (need <= 0) break;
           if ((ranks.get(o.van_id) ?? Infinity) <= myRank) continue;
           const flex = Math.max(0, o.reserved - o.reserved_firm);
-          if (flex > 0) borrow(o, Math.min(flex, need), 0, false);
+          if (flex > 0) await borrow(o, Math.min(flex, need), 0, false);
         }
       }
       // 2. What's left is another van's own part (received or bought for it). The worker has it in
       //    their hand, so the books follow — but only after they've been told whose it is.
       if (need > 0) {
-        const left = others().filter(o => o.reserved > 0);
+        const left = (await others()).filter(o => o.reserved > 0);
         const avail = left.reduce((s, o) => s + o.reserved, 0);
         if (avail > 0 && acceptBorrow == null) {
           // The vans it would actually come from (built last first), just enough to cover the take.
@@ -2227,12 +2295,12 @@ export function takeForVan(lineId, qty, by = '', { extraLine = false, seenIssued
             if (need <= 0) break;
             const b = Math.min(o.reserved, need);
             const firmCut = Math.max(0, b - Math.max(0, o.reserved - o.reserved_firm));
-            borrow(o, b, firmCut, true);
+            await borrow(o, b, firmCut, true);
             if (!donors.includes(o.chassis)) donors.push(o.chassis);
           }
         }
       }
-      run('UPDATE van_lines SET reserved = reserved + ? WHERE id = ?', fromFree + borrowed, lineId);
+      await run('UPDATE van_lines SET reserved = reserved + ? WHERE id = ?', fromFree + borrowed, lineId);
       if (need > 0) {
         let ref = l.chassis;
         let note = 'Taken from the shelf but the system showed none — count corrected';
@@ -2240,12 +2308,12 @@ export function takeForVan(lineId, qty, by = '', { extraLine = false, seenIssued
           // It's in the worker's hand, so it has arrived for this van: tick it off this van's order.
           const pos = [];
           let left = need;
-          for (const pl of all(`SELECT pl.*, p.po_no FROM po_lines pl JOIN purchase_orders p ON p.id = pl.po_id
+          for (const pl of await all(`SELECT pl.*, p.po_no FROM po_lines pl JOIN purchase_orders p ON p.id = pl.po_id
                                 WHERE ${PO_IS_OPEN} AND pl.van_id = ? AND pl.item_id = ?
                                 ORDER BY pl.id`, l.van_id, l.item_id)) {
             if (left <= 0) break;
             const q = Math.min(left, pl.qty - pl.received - pl.closed);
-            if (bookPoLine(pl, q)) rec.reopen.push(pl.po_id);
+            if (await bookPoLine(pl, q)) rec.reopen.push(pl.po_id);
             rec.po.push([pl.id, q]);
             left -= q;
             if (!pos.includes(pl.po_no)) pos.push(pl.po_no);
@@ -2253,39 +2321,44 @@ export function takeForVan(lineId, qty, by = '', { extraLine = false, seenIssued
           if (pos.length) ref = `PO ${pos.join(', ')}`;
           note = `Arrived for ${l.chassis} (booked on the floor)`;
         }
-        run('UPDATE items SET on_hand = on_hand + ? WHERE id = ?', need, l.item_id);
-        run('UPDATE van_lines SET reserved = reserved + ? WHERE id = ?', need, lineId);
-        const cm = run(`INSERT INTO movements(item_id, qty, type, van_id, ref, note, worker) VALUES(?, ?, 'adjust', ?, ?, ?, ?)`,
+        await run('UPDATE items SET on_hand = on_hand + ? WHERE id = ?', need, l.item_id);
+        await run('UPDATE van_lines SET reserved = reserved + ? WHERE id = ?', need, lineId);
+        const cm = await insert(`INSERT INTO movements(item_id, qty, type, van_id, ref, note, worker) VALUES(?, ?, 'adjust', ?, ?, ?, ?)`,
                        l.item_id, need, l.van_id, ref, note, by);
         rec.corr = need;
-        rec.corrMv = Number(cm.lastInsertRowid);
+        rec.corrMv = cm;
       }
     }
-    run('UPDATE items SET on_hand = on_hand - ? WHERE id = ?', take, l.item_id);
-    run('UPDATE van_lines SET issued = issued + ?, reserved = MAX(0, reserved - ?) WHERE id = ?', take, take, lineId);
+    await run('UPDATE items SET on_hand = on_hand - ? WHERE id = ?', take, l.item_id);
+    await run('UPDATE van_lines SET issued = issued + ?, reserved = GREATEST(0, reserved - ?::double precision) WHERE id = ?', take, take, lineId);
     const note = donors.length ? `borrowed from ${donors.join(', ')} by ${by || 'a worker'}` : '';
     // Follow-up round 1 (chk-r3-2): this take starts a planned van (it becomes "in production", moves up
     // the build order and gets first call on shelf stock). Noted in the undo record — with where the van
     // stood and the history mark — so an Undo / Put back can put it back to planned if nothing else
     // happened to it since. Takes saved before this have no note and Undo leaves the status as it is.
     if (l.van_status === 'planned') {
-      rec.startedVan = { area: l.van_area ?? null, logMark: get('SELECT COALESCE(MAX(id), 0) AS n FROM allocation_log').n };
+      rec.startedVan = { area: l.van_area ?? null, logMark: (await get('SELECT COALESCE(MAX(id), 0) AS n FROM allocation_log')).n };
     }
-    const mv = run(`INSERT INTO movements(item_id, qty, type, van_id, ref, note, worker, undo) VALUES(?, ?, 'issue', ?, ?, ?, ?, ?)`,
+    const mv = await insert(`INSERT INTO movements(item_id, qty, type, van_id, ref, note, worker, undo) VALUES(?, ?, 'issue', ?, ?, ?, ?, ?)`,
                    l.item_id, -take, l.van_id, l.chassis, note, by, JSON.stringify(rec));
     // Set-aside history for this van's line: what the take used up (and where it came from).
-    const after = get('SELECT reserved, reserved_firm FROM van_lines WHERE id = ?', lineId);
-    const from = [rec.own ? `${q(rec.own)} set aside for it` : '', rec.borrowed.length ? `borrowed from ${[...new Set(donors.length ? donors : rec.borrowed.map(([id]) => get('SELECT v.chassis FROM van_lines x JOIN vans v ON v.id = x.van_id WHERE x.id = ?', id)?.chassis).filter(Boolean))].join(', ')}` : '',
+    const after = await get('SELECT reserved, reserved_firm FROM van_lines WHERE id = ?', lineId);
+    let lentBy = donors;
+    if (rec.borrowed.length && !donors.length) {
+      lentBy = [];
+      for (const [id] of rec.borrowed) lentBy.push((await get('SELECT v.chassis FROM van_lines x JOIN vans v ON v.id = x.van_id WHERE x.id = ?', id))?.chassis);
+    }
+    const from = [rec.own ? `${q(rec.own)} set aside for it` : '', rec.borrowed.length ? `borrowed from ${[...new Set(lentBy.filter(Boolean))].join(', ')}` : '',
       rec.corr ? `${q(rec.corr)} the system didn't show (count corrected)` : ''].filter(Boolean).join(', ');
-    logAlloc('floor take', { van_id: l.van_id, item_id: l.item_id, line_id: lineId, field: 'issued', before: q(l.issued), after: q(l.issued + take), worker: by,
+    await logAlloc('floor take', { van_id: l.van_id, item_id: l.item_id, line_id: lineId, field: 'issued', before: q(l.issued), after: q(l.issued + take), worker: by,
       change: after.reserved - l.reserved, firm_change: after.reserved_firm - l.reserved_firm,
       note: `taken on floor by ${by || 'a worker'}: ${q(take)}${from ? ` (${from})` : ''}` });
     if (l.van_status === 'planned') {
-      run(`UPDATE vans SET status = 'in_production' WHERE id = ?`, l.van_id);
-      logAlloc('floor take', { van_id: l.van_id, item_id: l.item_id, line_id: lineId, field: 'van status', before: 'planned', after: 'in production', worker: by,
+      await run(`UPDATE vans SET status = 'in_production' WHERE id = ?`, l.van_id);
+      await logAlloc('floor take', { van_id: l.van_id, item_id: l.item_id, line_id: lineId, field: 'van status', before: 'planned', after: 'in production', worker: by,
         note: `${l.chassis} started: first part taken on the floor by ${by || 'a worker'}` });
     }
-    return { line_id: lineId, qty: take, movement_id: Number(mv.lastInsertRowid), name: l.name, chassis: l.chassis,
+    return { line_id: lineId, qty: take, movement_id: mv, name: l.name, chassis: l.chassis,
              ...(donors.length ? { borrowedFrom: donors.join(', ') } : {}) };
   });
 }
@@ -2294,21 +2367,21 @@ export function takeForVan(lineId, qty, by = '', { extraLine = false, seenIssued
 // another trade: then that line is ticked off. Only if the van has no open line for it is one added
 // (and Undo removes it again). `seenTaken` (phone only): how many of this part the phone showed as
 // taken for this van — if that changed, the take already went through, so it isn't done twice.
-export function floorExtra(vanId, itemId, qty, by = '', { seenTaken, acceptBorrow } = {}) {
-  return tx(() => {
-    const van = get('SELECT chassis, status FROM vans WHERE id = ?', vanId);
+export async function floorExtra(vanId, itemId, qty, by = '', { seenTaken, acceptBorrow } = {}) {
+  return writeTx(async () => {
+    const van = await get('SELECT chassis, status FROM vans WHERE id = ?', vanId);
     if (!van) throw httpError(404, 'That van no longer exists — refresh');
     if (!['planned', 'in_production'].includes(van.status)) throw httpError(400, `${van.chassis} is finished — parts can't be taken for it`);
-    if (!get('SELECT 1 FROM items WHERE id = ?', itemId)) throw httpError(404, 'Part not found');
+    if (!await get('SELECT 1 FROM items WHERE id = ?', itemId)) throw httpError(404, 'Part not found');
     if (!(qty > 0)) throw httpError(400, 'How many did you take?');
     if (seenTaken != null) {
-      const taken = get('SELECT COALESCE(SUM(issued),0) AS n FROM van_lines WHERE van_id = ? AND item_id = ?', vanId, itemId).n;
+      const taken = (await get('SELECT COALESCE(SUM(issued),0) AS n FROM van_lines WHERE van_id = ? AND item_id = ?', vanId, itemId)).n;
       if (Number(seenTaken) !== taken) throw httpError(409, 'Someone already took some of this. Check the list.');
     }
-    const open = get(`SELECT id FROM van_lines WHERE van_id = ? AND item_id = ? AND issued < qty
+    const open = await get(`SELECT id FROM van_lines WHERE van_id = ? AND item_id = ? AND issued < qty
                       ORDER BY CASE WHEN source = 'manual' THEN 1 ELSE 0 END, id LIMIT 1`, vanId, itemId);
     if (open) return takeForVan(open.id, qty, by, { acceptBorrow });
-    const line = addLine(vanId, { item_id: itemId, qty, note: `Added on the floor${by ? ` by ${by}` : ''}` });
+    const line = await addLine(vanId, { item_id: itemId, qty, note: `Added on the floor${by ? ` by ${by}` : ''}` });
     return takeForVan(line.id, qty, by, { extraLine: true, acceptBorrow });
   });
 }
@@ -2319,99 +2392,100 @@ export function floorExtra(vanId, itemId, qty, by = '', { seenTaken, acceptBorro
 // as nothing else was booked in or counted for that part since; older ones still go to the office.
 // `lineId` / `vanId` (small fixes round 2, sp-r1-5): what the phone thinks it is undoing. When they are
 // sent and the movement is for another line or van, nothing is changed ("already undone").
-export function undoTake(movementId, { sameDay = false, lineId = null, vanId = null } = {}) {
-  return tx(() => {
-    const m = get(`SELECT * FROM movements WHERE id = ? AND type = 'issue'`, movementId);
+export async function undoTake(movementId, { sameDay = false, lineId = null, vanId = null } = {}) {
+  return writeTx(async () => {
+    const m = await get(`SELECT * FROM movements WHERE id = ? AND type = 'issue'`, movementId);
     if (!m) throw httpError(404, 'Nothing to undo');
     if (lineId != null || vanId != null) {
       let recLine = null;
       try { recLine = m.undo ? JSON.parse(m.undo)?.line ?? null : null; } catch { recLine = null; }
       const lineOk = lineId == null || (recLine != null ? Number(recLine) === Number(lineId)
-        : !!get('SELECT 1 FROM van_lines WHERE id = ? AND van_id = ? AND item_id = ?', lineId, m.van_id, m.item_id));
+        : !!await get('SELECT 1 FROM van_lines WHERE id = ? AND van_id = ? AND item_id = ?', lineId, m.van_id, m.item_id));
       const vanOk = vanId == null || Number(m.van_id) === Number(vanId);
       if (!lineOk || !vanOk) throw httpError(404, 'Nothing to undo — it was already undone');
     }
-    if (Date.now() - new Date(m.at.replace(' ', 'T')).getTime() > 15 * 60 * 1000) {
-      const today = get(`SELECT date(?) = date('now','localtime') AS t`, m.at).t;
-      if (!sameDay || !today) throw httpError(400, 'Too late to undo — ask the office');
-      if (get(`SELECT 1 FROM movements WHERE item_id = ? AND id > ? AND type IN ('receive','count','adjust') LIMIT 1`, m.item_id, m.id))
+    // (m.at is Melbourne wall-clock time: its age is worked out in SQL, so the server's own time zone doesn't matter)
+    if ((await get(`SELECT ${AGE_SECS('?')} AS s`, m.at)).s > 15 * 60) {
+      const isToday = String(m.at).slice(0, 10) === today();
+      if (!sameDay || !isToday) throw httpError(400, 'Too late to undo — ask the office');
+      if (await get(`SELECT 1 FROM movements WHERE item_id = ? AND id > ? AND type IN ('receive','count','adjust') LIMIT 1`, m.item_id, m.id))
         throw httpError(400, 'That part was booked in or counted since — ask the office');
     }
-    const van = get('SELECT status FROM vans WHERE id = ?', m.van_id);
+    const van = await get('SELECT status FROM vans WHERE id = ?', m.van_id);
     if (van && !['planned', 'in_production'].includes(van.status)) throw httpError(400, 'That van is finished — ask the office');
     const q = -m.qty;
     let rec = null;
     try { rec = m.undo ? JSON.parse(m.undo) : null; } catch { rec = null; }
     if (!rec) {
       // Taken before Undo kept a record: just put it back on the shelf for this van.
-      const l = get(`SELECT * FROM van_lines WHERE van_id = ? AND item_id = ? AND issued >= ? ORDER BY id DESC LIMIT 1`, m.van_id, m.item_id, q);
+      const l = await get(`SELECT * FROM van_lines WHERE van_id = ? AND item_id = ? AND issued >= ? ORDER BY id DESC LIMIT 1`, m.van_id, m.item_id, q);
       if (!l) throw httpError(400, 'That part was changed since — ask the office');
-      run('UPDATE items SET on_hand = on_hand + ? WHERE id = ?', q, m.item_id);
-      run('UPDATE van_lines SET issued = issued - ?, reserved = reserved + ? WHERE id = ?', q, q, l.id);
-      run('DELETE FROM movements WHERE id = ?', movementId);
+      await run('UPDATE items SET on_hand = on_hand + ? WHERE id = ?', q, m.item_id);
+      await run('UPDATE van_lines SET issued = issued - ?, reserved = reserved + ? WHERE id = ?', q, q, l.id);
+      await run('DELETE FROM movements WHERE id = ?', movementId);
       return;
     }
-    const l = get('SELECT * FROM van_lines WHERE id = ?', rec.line);
+    const l = await get('SELECT * FROM van_lines WHERE id = ?', rec.line);
     if (!l || l.issued < q) throw httpError(400, 'That part was changed since — ask the office');
     // Back on the shelf, less anything the take added only to correct the count.
-    run('UPDATE items SET on_hand = on_hand + ? WHERE id = ?', q - (rec.corr || 0), m.item_id);
-    if (rec.corrMv) run('DELETE FROM movements WHERE id = ?', rec.corrMv);
-    for (const [plId, n] of rec.po || []) run('UPDATE po_lines SET received = MAX(0, received - ?) WHERE id = ?', n, plId);
-    for (const poId of rec.reopen || []) run(`UPDATE purchase_orders SET status = 'open' WHERE id = ?`, poId);
+    await run('UPDATE items SET on_hand = on_hand + ? WHERE id = ?', q - (rec.corr || 0), m.item_id);
+    if (rec.corrMv) await run('DELETE FROM movements WHERE id = ?', rec.corrMv);
+    for (const [plId, n] of rec.po || []) await run('UPDATE po_lines SET received = GREATEST(0, received - ?::double precision) WHERE id = ?', n, plId);
+    for (const poId of rec.reopen || []) await run(`UPDATE purchase_orders SET status = 'open' WHERE id = ?`, poId);
     // Parts borrowed from other vans go back to them (locked part and "order now" mark too).
     for (const [otherId, n, firmCut = 0, wasUrgent, wasState = null] of rec.borrowed || []) {
-      run(`UPDATE van_lines SET reserved = MIN(reserved + ?, MAX(0, qty - issued)), reserved_firm = reserved_firm + ?,
+      await run(`UPDATE van_lines SET reserved = LEAST(reserved + ?::double precision, GREATEST(0, qty - issued)), reserved_firm = reserved_firm + ?,
              urgent = COALESCE(?, urgent) WHERE id = ?`, n, firmCut, wasUrgent ?? null, otherId);
-      const o = get('SELECT van_id, item_id, reserved, state FROM van_lines WHERE id = ?', otherId);
-      if (o) logAlloc('borrow undone', { van_id: o.van_id, item_id: o.item_id, line_id: otherId, field: 'reserved', before: o.reserved - n, after: o.reserved, note: 'take undone on the floor' });
+      const o = await get('SELECT van_id, item_id, reserved, state FROM van_lines WHERE id = ?', otherId);
+      if (o) await logAlloc('borrow undone', { van_id: o.van_id, item_id: o.item_id, line_id: otherId, field: 'reserved', before: o.reserved - n, after: o.reserved, note: 'take undone on the floor' });
       // The borrow turned the donor's plan order number into "still to order": put it back (only if
       // nobody has answered differently since).
       if (o && wasState != null && o.state === 'not_ordered') {
-        run('UPDATE van_lines SET state = ? WHERE id = ?', wasState, otherId);
-        logAlloc('borrow undone', { van_id: o.van_id, item_id: o.item_id, line_id: otherId, field: 'state', before: 'not_ordered', after: wasState, note: 'take undone on the floor' });
+        await run('UPDATE van_lines SET state = ? WHERE id = ?', wasState, otherId);
+        await logAlloc('borrow undone', { van_id: o.van_id, item_id: o.item_id, line_id: otherId, field: 'state', before: 'not_ordered', after: wasState, note: 'take undone on the floor' });
       }
     }
     const issued = l.issued - q;
     if (rec.extraLine && issued <= 0) {
-      run('DELETE FROM van_lines WHERE id = ?', l.id); // added on the floor by mistake
+      await run('DELETE FROM van_lines WHERE id = ?', l.id); // added on the floor by mistake
     } else {
       const newQty = rec.oldQty != null ? Math.max(rec.oldQty, issued) : l.qty;
-      run('UPDATE van_lines SET issued = ?, qty = ?, reserved = MIN(reserved + ?, MAX(0, ? - ?)) WHERE id = ?',
+      await run('UPDATE van_lines SET issued = ?, qty = ?, reserved = LEAST(reserved + ?::double precision, GREATEST(0, ?::double precision - ?::double precision)) WHERE id = ?',
           issued, newQty, rec.own || 0, newQty, issued, l.id);
-      if (rec.ownFirm != null) run('UPDATE van_lines SET reserved_firm = MAX(reserved_firm, MIN(?, reserved)) WHERE id = ?', rec.ownFirm, l.id);
+      if (rec.ownFirm != null) await run('UPDATE van_lines SET reserved_firm = GREATEST(reserved_firm, LEAST(?::double precision, reserved)) WHERE id = ?', rec.ownFirm, l.id);
     }
-    const now = get('SELECT reserved, reserved_firm FROM van_lines WHERE id = ?', l.id);
-    logAlloc('floor take undone', { van_id: l.van_id, item_id: l.item_id, line_id: l.id, field: 'issued', before: l.issued, after: issued, worker: m.worker,
+    const now = await get('SELECT reserved, reserved_firm FROM van_lines WHERE id = ?', l.id);
+    await logAlloc('floor take undone', { van_id: l.van_id, item_id: l.item_id, line_id: l.id, field: 'issued', before: l.issued, after: issued, worker: m.worker,
       change: (now?.reserved ?? 0) - l.reserved, firm_change: (now?.reserved_firm ?? 0) - l.reserved_firm, note: `take of ${q} undone on the floor` });
     // Follow-up round 1 (chk-r3-2): this take is what moved a planned van to "in production". Put it back to
     // planned — so it drops back to its place in the build order and loses first call on shelf stock — but
     // only while nothing else started it since: no other part taken / issued / marked fitted for it, the
     // office hasn't set its status by hand, and it hasn't been moved on the floor map.
     if (rec.startedVan) {
-      const v = get('SELECT chassis, status, area_id FROM vans WHERE id = ?', m.van_id);
-      const otherIssue = get(`SELECT 1 FROM movements WHERE van_id = ? AND type = 'issue' AND id > ? LIMIT 1`, m.van_id, m.id);
-      const officeSet = get(`SELECT 1 FROM allocation_log WHERE van_id = ? AND reason = 'van status' AND id > ? LIMIT 1`, m.van_id, rec.startedVan.logMark ?? 0);
+      const v = await get('SELECT chassis, status, area_id FROM vans WHERE id = ?', m.van_id);
+      const otherIssue = await get(`SELECT 1 FROM movements WHERE van_id = ? AND type = 'issue' AND id > ? LIMIT 1`, m.van_id, m.id);
+      const officeSet = await get(`SELECT 1 FROM allocation_log WHERE van_id = ? AND reason = 'van status' AND id > ? LIMIT 1`, m.van_id, rec.startedVan.logMark ?? 0);
       // "Already fitted" on this van since the take (even with no stock used) also means work has started on it.
-      const fittedSince = get(`SELECT 1 FROM allocation_log WHERE van_id = ? AND reason = 'fitted' AND id > ? LIMIT 1`, m.van_id, rec.startedVan.logMark ?? 0);
+      const fittedSince = await get(`SELECT 1 FROM allocation_log WHERE van_id = ? AND reason = 'fitted' AND id > ? LIMIT 1`, m.van_id, rec.startedVan.logMark ?? 0);
       const sameSpot = v && (v.area_id ?? null) === (rec.startedVan.area ?? null);
       if (v && v.status === 'in_production' && !otherIssue && !officeSet && !fittedSince && sameSpot) {
-        run(`UPDATE vans SET status = 'planned' WHERE id = ?`, m.van_id);
-        logAlloc('floor take undone', { van_id: m.van_id, item_id: m.item_id, line_id: l.id, field: 'van status', before: 'in production', after: 'planned', worker: m.worker,
+        await run(`UPDATE vans SET status = 'planned' WHERE id = ?`, m.van_id);
+        await logAlloc('floor take undone', { van_id: m.van_id, item_id: m.item_id, line_id: l.id, field: 'van status', before: 'in production', after: 'planned', worker: m.worker,
           note: `${v.chassis} back to planned: the take that started it was undone and nothing else was taken for it` });
       } else if (v && v.status === 'in_production' && otherIssue && !officeSet && !fittedSince && sameSpot) {
         // Another floor take came after this one: that take now carries the note, so undoing it as well
         // still puts the van back to planned. (Office issue / "Already fitted" have no undo record: the van stays.)
-        const next = get(`SELECT id, undo FROM movements WHERE van_id = ? AND type = 'issue' AND id > ? ORDER BY id LIMIT 1`, m.van_id, m.id);
+        const next = await get(`SELECT id, undo FROM movements WHERE van_id = ? AND type = 'issue' AND id > ? ORDER BY id LIMIT 1`, m.van_id, m.id);
         let nrec = null;
         try { nrec = next?.undo ? JSON.parse(next.undo) : null; } catch { nrec = null; }
         if (nrec && typeof nrec === 'object' && nrec.line != null && !nrec.startedVan) {
           nrec.startedVan = rec.startedVan;
-          run('UPDATE movements SET undo = ? WHERE id = ?', JSON.stringify(nrec), next.id);
+          await run('UPDATE movements SET undo = ? WHERE id = ?', JSON.stringify(nrec), next.id);
         }
       }
     }
-    run('DELETE FROM movements WHERE id = ?', movementId);
-    allocateItem(m.item_id, m.van_id); // a per-van part goes back to its own van
+    await run('DELETE FROM movements WHERE id = ?', movementId);
+    await allocateItem(m.item_id, m.van_id); // a per-van part goes back to its own van
   });
 }
 
@@ -2419,72 +2493,72 @@ export function undoTake(movementId, { sameDay = false, lineId = null, vanId = n
 // else happened to that part since (no take, count or other delivery) — then everything goes back:
 // the shelf count, the purchase-order lines it ticked off (and any PO it closed), what it set aside.
 // `itemId` (sp-r1-5): the part the phone booked in; a movement for another part is refused.
-export function undoReceive(movementId, by = '', { itemId = null } = {}) {
-  return tx(() => {
-    const m = get(`SELECT * FROM movements WHERE id = ? AND type = 'receive'`, movementId);
+export async function undoReceive(movementId, by = '', { itemId = null } = {}) {
+  return writeTx(async () => {
+    const m = await get(`SELECT * FROM movements WHERE id = ? AND type = 'receive'`, movementId);
     if (!m) throw httpError(404, 'Nothing to undo');
     if (itemId != null && Number(m.item_id) !== Number(itemId)) throw httpError(404, 'Nothing to undo — it was already undone');
-    if (Date.now() - new Date(m.at.replace(' ', 'T')).getTime() > 15 * 60 * 1000) throw httpError(400, 'Too late to undo — ask the office');
+    if ((await get(`SELECT ${AGE_SECS('?')} AS s`, m.at)).s > 15 * 60) throw httpError(400, 'Too late to undo — ask the office');
     let rec = null;
     try { rec = m.undo ? JSON.parse(m.undo) : null; } catch { rec = null; }
     if (!rec || rec.kind !== 'receive') throw httpError(400, "This delivery can't be undone here — ask the office");
-    if (get('SELECT 1 FROM movements WHERE item_id = ? AND id > ? LIMIT 1', m.item_id, m.id)) throw httpError(400, 'That part was taken or booked since — ask the office');
-    const item = get('SELECT on_hand, name FROM items WHERE id = ?', m.item_id);
+    if (await get('SELECT 1 FROM movements WHERE item_id = ? AND id > ? LIMIT 1', m.item_id, m.id)) throw httpError(400, 'That part was taken or booked since — ask the office');
+    const item = await get('SELECT on_hand, name FROM items WHERE id = ?', m.item_id);
     if (!item) throw httpError(404, 'Part not found');
-    run('UPDATE items SET on_hand = on_hand - ? WHERE id = ?', m.qty, m.item_id);
-    for (const [plId, n] of rec.po || []) run('UPDATE po_lines SET received = MAX(0, received - ?) WHERE id = ?', n, plId);
-    for (const poId of rec.reopen || []) run(`UPDATE purchase_orders SET status = 'open' WHERE id = ?`, poId);
+    await run('UPDATE items SET on_hand = on_hand - ? WHERE id = ?', m.qty, m.item_id);
+    for (const [plId, n] of rec.po || []) await run('UPDATE po_lines SET received = GREATEST(0, received - ?::double precision) WHERE id = ?', n, plId);
+    for (const poId of rec.reopen || []) await run(`UPDATE purchase_orders SET status = 'open' WHERE id = ?`, poId);
     for (const [lineId, d, df] of rec.alloc || []) {
-      const l = get('SELECT * FROM van_lines WHERE id = ?', lineId);
+      const l = await get('SELECT * FROM van_lines WHERE id = ?', lineId);
       if (!l) continue;
-      run('UPDATE van_lines SET reserved = MAX(0, reserved - ?) WHERE id = ?', d, lineId);
-      run('UPDATE van_lines SET reserved_firm = MAX(0, MIN(reserved_firm - ?, reserved)) WHERE id = ?', df, lineId);
-      const now = get('SELECT reserved, reserved_firm FROM van_lines WHERE id = ?', lineId);
-      logAlloc('delivery undone', { van_id: l.van_id, item_id: l.item_id, line_id: lineId, field: 'reserved', before: l.reserved, after: now.reserved, worker: by,
+      await run('UPDATE van_lines SET reserved = GREATEST(0, reserved - ?::double precision) WHERE id = ?', d, lineId);
+      await run('UPDATE van_lines SET reserved_firm = GREATEST(0, LEAST(reserved_firm - ?::double precision, reserved)) WHERE id = ?', df, lineId);
+      const now = await get('SELECT reserved, reserved_firm FROM van_lines WHERE id = ?', lineId);
+      await logAlloc('delivery undone', { van_id: l.van_id, item_id: l.item_id, line_id: lineId, field: 'reserved', before: l.reserved, after: now.reserved, worker: by,
         change: now.reserved - l.reserved, firm_change: now.reserved_firm - l.reserved_firm, note: `delivery of ${q(m.qty)} undone on the floor` });
     }
-    run('DELETE FROM movements WHERE id = ?', movementId);
+    await run('DELETE FROM movements WHERE id = ?', movementId);
     // The movement goes, so the part's history keeps a line saying a delivery was undone (sp-r1-5).
-    logAlloc('delivery undone', { item_id: m.item_id, field: 'on_hand', before: q(item.on_hand), after: q(item.on_hand - m.qty), worker: by,
+    await logAlloc('delivery undone', { item_id: m.item_id, field: 'on_hand', before: q(item.on_hand), after: q(item.on_hand - m.qty), worker: by,
       note: `delivery of ${q(m.qty)} booked at ${String(m.at).slice(11, 16)} undone on the floor${m.ref ? ` (${m.ref})` : ''}` });
-    trimReservations(m.item_id, { reason: 'delivery undone', worker: by });
+    await trimReservations(m.item_id, { reason: 'delivery undone', worker: by });
     return { name: item.name, qty: m.qty };
   });
 }
 
 // What is still to come on open purchase orders, one row per part (the worker's "Waiting for" list).
-export function floorWaiting() {
-  return all(`SELECT i.id, i.name, i.sku, i.photo, i.unit, i.unit_size, i.kind, i.on_hand, i.location, i.area_id,
+export async function floorWaiting() {
+  return (await all(`SELECT i.id, i.name, i.sku, i.photo, i.unit, i.unit_size, i.kind, i.on_hand, i.location, i.area_id,
                 (SELECT fa.name FROM floor_areas fa WHERE fa.id = i.area_id) AS area_name,
-                COALESCE(GROUP_CONCAT(DISTINCT NULLIF(trim(p.supplier), '')), NULLIF(trim(i.supplier), '')) AS supplier,
+                COALESCE(string_agg(DISTINCT NULLIF(trim(p.supplier), ''), ','), NULLIF(trim(i.supplier), '')) AS supplier,
                 SUM(${PO_OPEN}) AS to_come,
                 MIN(NULLIF(COALESCE(NULLIF(pl.expected, ''), p.expected), '')) AS expected
               FROM po_lines pl JOIN purchase_orders p ON p.id = pl.po_id JOIN items i ON i.id = pl.item_id
               WHERE ${PO_IS_OPEN} AND i.active = 1
-              GROUP BY i.id`)
+              GROUP BY i.id ORDER BY i.id`))
     // by supplier (a truck's load together), parts with no supplier known last
     .sort((a, b) => (!a.supplier - !b.supplier) || String(a.supplier || '').localeCompare(String(b.supplier || ''), undefined, { sensitivity: 'base' })
       || a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
 }
 
 // Where a part is kept, set from the worker screen ("Set place"): a storage rack and an optional shelf / bin.
-export function setItemPlace(itemId, areaId, location, by = '') {
-  return tx(() => {
-    const it = get('SELECT id, area_id, location FROM items WHERE id = ?', itemId);
+export async function setItemPlace(itemId, areaId, location, by = '') {
+  return writeTx(async () => {
+    const it = await get('SELECT id, area_id, location FROM items WHERE id = ?', itemId);
     if (!it) throw httpError(404, 'Part not found');
-    const a = areaId ? get(`SELECT id, name FROM floor_areas WHERE id = ? AND kind = 'storage'`, Number(areaId)) : null;
+    const a = areaId ? await get(`SELECT id, name FROM floor_areas WHERE id = ? AND kind = 'storage'`, Number(areaId)) : null;
     if (areaId && !a) throw httpError(404, 'That rack no longer exists — refresh');
     const loc = String(location ?? '').trim().slice(0, 60);
-    const oldName = it.area_id ? (get('SELECT name FROM floor_areas WHERE id = ?', it.area_id)?.name || '') : '';
-    run('UPDATE items SET area_id = ?, location = ? WHERE id = ?', a?.id ?? null, loc, itemId);
-    if ((it.area_id ?? null) !== (a?.id ?? null)) logAlloc('catalogue', { item_id: itemId, field: 'rack', before: oldName, after: a?.name || '', worker: by, note: 'set on the floor' });
-    if ((it.location || '') !== loc) logAlloc('catalogue', { item_id: itemId, field: 'location', before: it.location || '', after: loc, worker: by, note: 'set on the floor' });
+    const oldName = it.area_id ? ((await get('SELECT name FROM floor_areas WHERE id = ?', it.area_id))?.name || '') : '';
+    await run('UPDATE items SET area_id = ?, location = ? WHERE id = ?', a?.id ?? null, loc, itemId);
+    if ((it.area_id ?? null) !== (a?.id ?? null)) await logAlloc('catalogue', { item_id: itemId, field: 'rack', before: oldName, after: a?.name || '', worker: by, note: 'set on the floor' });
+    if ((it.location || '') !== loc) await logAlloc('catalogue', { item_id: itemId, field: 'location', before: it.location || '', after: loc, worker: by, note: 'set on the floor' });
     return { area_name: a?.name || '', location: loc };
   });
 }
 
 // Vans for the floor: soonest first, with how far along they are.
-export function floorVans() {
+export async function floorVans() {
   return all(`
     SELECT v.id, v.chassis, v.model, v.length, v.customer, v.eta, v.status,
       (SELECT COUNT(*) FROM van_lines l WHERE l.van_id = v.id) AS total,
@@ -2499,11 +2573,11 @@ export function floorVans() {
 // shelf PO or another van's spare PO line counts as ordered too). Sets on each such line:
 //   l.order = { qty, suppliers: [...], expected: 'YYYY-MM-DD' | '' }  → "On order" tag + "1 on order from Onex · due 2/11"
 //   l.plan_ordered = 'Onex 08'  → the plan gives an order number but the office hasn't confirmed it ("Check: already ordered?")
-function floorOrderInfo(vanId, lines) {
+async function floorOrderInfo(vanId, lines) {
   const short = l => Math.max(0, l.qty - l.reserved - l.issued);
   const open = lines.filter(l => short(l) > 1e-9 && !['customer', 'tbd'].includes(l.state));
   if (!open.length) return;
-  const poRows = all(`SELECT pl.item_id, pl.van_id, ${PO_OPEN} AS q, p.supplier, COALESCE(NULLIF(pl.expected, ''), p.expected) AS expected
+  const poRows = await all(`SELECT pl.item_id, pl.van_id, ${PO_OPEN} AS q, p.supplier, COALESCE(NULLIF(pl.expected, ''), p.expected) AS expected
                       FROM po_lines pl JOIN purchase_orders p ON p.id = pl.po_id
                       WHERE ${PO_IS_OPEN} AND (pl.van_id IS NULL OR pl.van_id = ?) ORDER BY pl.id`, vanId);
   const sum = rs => rs.reduce((s, p) => s + p.q, 0);
@@ -2521,7 +2595,7 @@ function floorOrderInfo(vanId, lines) {
     const st = lineStatus({ ...l, on_order_van: sum(mine), on_order: sum(mine) + sum(shelf) });
     if (st === 'on_order') { l.order = info(mine.length ? mine : shelf, short(l)); continue; }
     if (st === 'to_order') {
-      cov ??= lineCover({ vanId });
+      cov ??= await lineCover({ vanId });
       const c = cov.get(l.id);
       if (c && c.qty >= short(l) - 1e-9) { l.order = info(c.from, short(l)); continue; }
     }
@@ -2529,12 +2603,12 @@ function floorOrderInfo(vanId, lines) {
   }
 }
 
-export function floorVan(vanId) {
-  const van = get(`SELECT v.id, v.chassis, v.model, v.length, v.customer, v.eta, v.status, a.name AS area_name,
+export async function floorVan(vanId) {
+  const van = await get(`SELECT v.id, v.chassis, v.model, v.length, v.customer, v.eta, v.status, a.name AS area_name,
                      (SELECT COUNT(*) FROM van_notes n WHERE n.van_id = v.id) AS notes
                    FROM vans v LEFT JOIN floor_areas a ON a.id = v.area_id WHERE v.id = ?`, vanId);
   if (!van) throw httpError(404, 'Van not found');
-  const lines = all(`
+  const lines = await all(`
     SELECT l.id, l.item_id, l.qty, l.reserved, l.issued, l.spec, l.plan_column, l.state, l.urgent, l.po_ref, i.name, i.sku, i.unit, i.unit_size, i.photo, i.location, i.category, i.on_hand, i.trade,
       (SELECT fa.name FROM floor_areas fa WHERE fa.id = i.area_id) AS area_name,
       COALESCE(NULLIF(l.plan_column, ''), NULLIF(i.plan_column, ''), i.category) AS col,
@@ -2546,22 +2620,22 @@ export function floorVan(vanId) {
   // "set aside for ST0367, ST0380 — ask before taking" instead of "none on the shelf".
   for (const l of lines) {
     if (l.issued >= l.qty || l.reserved > 0 || !(l.on_hand > 0) || l.free > 0) continue;
-    l.held_by = [...new Set(all(`SELECT v.chassis FROM van_lines x JOIN vans v ON v.id = x.van_id
-                                 WHERE x.item_id = ? AND x.van_id <> ? AND x.reserved > 0 AND ${ACTIVE_VAN} ORDER BY ${PRIORITY}`, l.item_id, vanId).map(r => r.chassis))];
+    l.held_by = [...new Set((await all(`SELECT v.chassis FROM van_lines x JOIN vans v ON v.id = x.van_id
+                                 WHERE x.item_id = ? AND x.van_id <> ? AND x.reserved > 0 AND ${ACTIVE_VAN} ORDER BY ${PRIORITY}`, l.item_id, vanId)).map(r => r.chassis))];
   }
-  floorOrderInfo(vanId, lines);
-  const reminders = all(`SELECT id, text, due, trade, worker FROM reminders WHERE van_id = ? AND done = 0
+  await floorOrderInfo(vanId, lines);
+  const reminders = await all(`SELECT id, text, due, trade, worker FROM reminders WHERE van_id = ? AND done = 0
                          ORDER BY CASE WHEN due = '' THEN 1 ELSE 0 END, due, id`, vanId);
   return { van, lines, reminders };
 }
 
 // `by`: a name, or { userId, name } — the login (logins and job roles): its own movements by user id, and only
 // movements saved before logins (no user id) by name, so two people with the same name are never mixed up.
-export function floorStats(by = '') {
+export async function floorStats(by = '') {
   const { userId = null, name = '' } = typeof by === 'object' && by ? by : { name: by };
-  const today = `date(at) = date('now','localtime')`;
+  const today = `substr(at, 1, 10) = ${TODAY_SQL}`;
   const mine = '(user_id = ? OR (user_id IS NULL AND worker = ?))';
-  const row = get(`SELECT
+  const row = await get(`SELECT
       COUNT(*) FILTER (WHERE ${mine}) AS mine,
       COUNT(*) AS team,
       COUNT(*) FILTER (WHERE ${mine} AND type = 'issue') AS mine_took,
@@ -2578,32 +2652,32 @@ export function floorStats(by = '') {
 // stock was in the books); nothing is taken from free stock. One 'issue' movement per item.
 // `done`: the office went through the list for this van (go-live checklist step c) — also with
 // nothing ticked ("nothing else is fitted").
-export function markFitted(vanId, lineIds, worker = '', { done = false } = {}) {
+export async function markFitted(vanId, lineIds, worker = '', { done = false } = {}) {
   if ((!Array.isArray(lineIds) || !lineIds.length) && !done) throw httpError(400, 'Tick the parts that are already fitted');
   lineIds = Array.isArray(lineIds) ? lineIds : [];
-  return tx(() => {
-    const van = get('SELECT id, chassis, status FROM vans WHERE id = ?', vanId);
+  return writeTx(async () => {
+    const van = await get('SELECT id, chassis, status FROM vans WHERE id = ?', vanId);
     if (!van) throw httpError(404, 'Van not found');
-    if (done) logAlloc('fitted: checked', { van_id: vanId, field: 'checked', after: 'yes', worker, note: `${van.chassis}: already-fitted parts checked (${lineIds.length} ticked)` });
+    if (done) await logAlloc('fitted: checked', { van_id: vanId, field: 'checked', after: 'yes', worker, note: `${van.chassis}: already-fitted parts checked (${lineIds.length} ticked)` });
     if (!lineIds.length) return { closed: 0, movements: 0 };
     const ids = lineIds.map(Number);
-    const lines = all(`SELECT * FROM van_lines WHERE van_id = ? AND id IN (${ids.map(() => '?').join(',')}) AND issued < qty`, vanId, ...ids);
+    const lines = await all(`SELECT * FROM van_lines WHERE van_id = ? AND id IN (${ids.map(() => '?').join(',')}) AND issued < qty ORDER BY id`, vanId, ...ids);
     const perItem = new Map();
     let closed = 0;
     for (const l of lines) {
       const fromStock = Math.max(0, Math.min(l.reserved, l.qty - l.issued));
-      run('UPDATE van_lines SET issued = qty, reserved = 0, reserved_firm = 0 WHERE id = ?', l.id);
+      await run('UPDATE van_lines SET issued = qty, reserved = 0, reserved_firm = 0 WHERE id = ?', l.id);
       closed++;
       if (fromStock > 0) perItem.set(l.item_id, (perItem.get(l.item_id) || 0) + fromStock);
-      logAlloc('fitted', { van_id: vanId, item_id: l.item_id, line_id: l.id, field: 'issued', before: l.issued, after: l.qty, worker,
+      await logAlloc('fitted', { van_id: vanId, item_id: l.item_id, line_id: l.id, field: 'issued', before: l.issued, after: l.qty, worker,
         change: -l.reserved, firm_change: -l.reserved_firm,
         note: fromStock >= l.qty - l.issued ? 'fitted before go-live, set-aside stock used'
           : fromStock > 0 ? `fitted before go-live: ${q(fromStock)} from set-aside stock, ${q(l.qty - l.issued - fromStock)} not from stock`
           : 'fitted before go-live, not from stock' });
     }
     for (const [itemId, n] of perItem) {
-      run('UPDATE items SET on_hand = on_hand - ? WHERE id = ?', n, itemId);
-      run(`INSERT INTO movements(item_id, qty, type, van_id, ref, note, worker) VALUES(?, ?, 'issue', ?, ?, 'Already fitted (set up before go-live)', ?)`,
+      await run('UPDATE items SET on_hand = on_hand - ? WHERE id = ?', n, itemId);
+      await run(`INSERT INTO movements(item_id, qty, type, van_id, ref, note, worker) VALUES(?, ?, 'issue', ?, ?, 'Already fitted (set up before go-live)', ?)`,
           itemId, -n, vanId, van.chassis, worker);
     }
     return { closed, movements: perItem.size };
@@ -2618,32 +2692,32 @@ export function markFitted(vanId, lineIds, worker = '', { done = false } = {}) {
 //   before_start 1 = it came in with the production plan import (arrived before the system was used)
 //   covered      1 = what is kept for the van covers everything the line still needs (only these are offered)
 const PLAN_IMPORT_NOTE = 'Received for this van (production plan import)';
-export function fittedQuickStart(vanId) {
-  const van = get(`SELECT v.id, v.chassis, v.status, fa.name AS area_name, fa.kind AS area_kind FROM vans v
+export async function fittedQuickStart(vanId) {
+  const van = await get(`SELECT v.id, v.chassis, v.status, fa.name AS area_name, fa.kind AS area_kind FROM vans v
                    LEFT JOIN floor_areas fa ON fa.id = v.area_id WHERE v.id = ?`, vanId);
   if (!van) throw httpError(404, 'Van not found');
-  const rec = new Map(all(`SELECT item_id, MAX(substr(at, 1, 10)) AS last_at,
+  const rec = new Map((await all(`SELECT item_id, MAX(substr(at, 1, 10)) AS last_at,
                              MAX(CASE WHEN note = ? THEN 0 ELSE 1 END) AS any_real
-                           FROM movements WHERE van_id = ? AND type = 'receive' AND qty > 0 GROUP BY item_id`, PLAN_IMPORT_NOTE, vanId)
+                           FROM movements WHERE van_id = ? AND type = 'receive' AND qty > 0 GROUP BY item_id`, PLAN_IMPORT_NOTE, vanId))
     .map(r => [r.item_id, r]));
   // A line moved off an "as per plan" catch-all onto the real part brought its received stock with it
   // (an 'adjust' "Re-linked from PLAN-X"): it arrived when the catch-all's delivery did.
-  for (const m of all(`SELECT m.item_id, substr(m.at, 1, 10) AS at, m.note FROM movements m
-                       WHERE m.van_id = ? AND m.type = 'adjust' AND m.qty > 0 AND m.note LIKE 'Re-linked from %' ORDER BY m.id`, vanId)) {
-    const from = get('SELECT id FROM items WHERE sku = ?', skuNow(String(m.note).slice('Re-linked from '.length).trim().split(/\s/)[0]));
+  for (const m of await all(`SELECT m.item_id, substr(m.at, 1, 10) AS at, m.note FROM movements m
+                       WHERE m.van_id = ? AND m.type = 'adjust' AND m.qty > 0 AND m.note ILIKE 'Re-linked from %' ORDER BY m.id`, vanId)) {
+    const from = await get('SELECT id FROM items WHERE sku = ?', skuNow(String(m.note).slice('Re-linked from '.length).trim().split(/\s/)[0]));
     const src = from && rec.get(from.id);
     const cur = rec.get(m.item_id);
     const add = src || { last_at: m.at, any_real: 1 };
     rec.set(m.item_id, cur ? { last_at: cur.last_at > add.last_at ? cur.last_at : add.last_at, any_real: cur.any_real || add.any_real } : { ...add });
   }
-  const lines = all(`SELECT id, item_id, qty, issued, reserved, reserved_firm, state FROM van_lines WHERE van_id = ? AND issued < qty`, vanId)
+  const lines = (await all(`SELECT id, item_id, qty, issued, reserved, reserved_firm, state FROM van_lines WHERE van_id = ? AND issued < qty ORDER BY id`, vanId))
     .map(l => {
       const r = rec.get(l.item_id);
       const open = l.qty - l.issued;
       return { id: l.id, received_at: r?.last_at || '', before_start: r && !r.any_real ? 1 : 0, kept: l.reserved_firm,
         covered: l.reserved_firm > 0 && l.reserved_firm >= open - 1e-9 && !['customer', 'tbd'].includes(l.state) ? 1 : 0 };
     });
-  return { van: { ...van, build: buildOrderInfo().get(van.id) || null }, today: today(), lines };
+  return { van: { ...van, build: (await buildOrderInfo()).get(van.id) || null }, today: today(), lines };
 }
 
 // A part the plan says was handed to a worker for this van ("Black Jack Gave to Alex 15/07/2026",
@@ -2653,9 +2727,9 @@ export function fittedQuickStart(vanId) {
 // equals the sum of movements. A part never set aside for the line is closed with no movement (it never
 // was in the books for this van) and the result says so, for the clean-up report. Returns null when the
 // line is already closed or isn't a "given to" line.
-export function closeAsGiven(lineId, { reason = 'given', by = '', text } = {}) {
-  return tx(() => {
-    const l = get(`SELECT l.*, v.chassis, v.status AS van_status, i.unit FROM van_lines l JOIN vans v ON v.id = l.van_id
+export async function closeAsGiven(lineId, { reason = 'given', by = '', text } = {}) {
+  return writeTx(async () => {
+    const l = await get(`SELECT l.*, v.chassis, v.status AS van_status, i.unit FROM van_lines l JOIN vans v ON v.id = l.van_id
                    JOIN items i ON i.id = l.item_id WHERE l.id = ?`, lineId);
     if (!l || l.issued >= l.qty - 1e-9) return null;
     const said = text ?? l.spec;
@@ -2664,15 +2738,15 @@ export function closeAsGiven(lineId, { reason = 'given', by = '', text } = {}) {
     const open = l.qty - l.issued;
     const fromStock = Math.max(0, Math.min(l.reserved, open));
     const reserved = Math.max(0, l.reserved - fromStock);
-    run('UPDATE van_lines SET issued = qty, reserved = ?, reserved_firm = MIN(reserved_firm, ?), urgent = 0 WHERE id = ?', reserved, reserved, l.id);
+    await run('UPDATE van_lines SET issued = qty, reserved = ?, reserved_firm = LEAST(reserved_firm, ?::double precision), urgent = 0 WHERE id = ?', reserved, reserved, l.id);
     const plan = `plan note "${said}"`;
     if (fromStock > 0) {
-      run('UPDATE items SET on_hand = on_hand - ? WHERE id = ?', fromStock, l.item_id);
-      run(`INSERT INTO movements(item_id, qty, type, van_id, ref, note, worker) VALUES(?, ?, 'issue', ?, ?, ?, ?)`,
+      await run('UPDATE items SET on_hand = on_hand - ? WHERE id = ?', fromStock, l.item_id);
+      await run(`INSERT INTO movements(item_id, qty, type, van_id, ref, note, worker) VALUES(?, ?, 'issue', ?, ?, ?, ?)`,
           l.item_id, -fromStock, l.van_id, l.chassis, `Given to ${g.name} for ${l.chassis}${g.date ? ` (plan says ${g.date})` : ''} – ${plan}`, g.name);
     }
     const notFrom = open - fromStock;
-    logAlloc(reason, { van_id: l.van_id, item_id: l.item_id, line_id: l.id, field: 'issued', before: q(l.issued), after: q(l.qty), worker: by,
+    await logAlloc(reason, { van_id: l.van_id, item_id: l.item_id, line_id: l.id, field: 'issued', before: q(l.issued), after: q(l.qty), worker: by,
       change: -fromStock, firm_change: -(l.reserved_firm - Math.min(l.reserved_firm, reserved)),
       note: `given to ${g.name}${g.date ? ` ${g.date}` : ''} (${plan}): ${fromStock > 0 ? `${q(fromStock)} ${l.unit} set aside for ${l.chassis} booked out of the shelf figure` : 'nothing was set aside'}`
         + (notFrom > 1e-9 && fromStock > 0 ? `; ${q(notFrom)} not set aside – shelf figure not changed for those` : '') });
@@ -2682,23 +2756,23 @@ export function closeAsGiven(lineId, { reason = 'given', by = '', text } = {}) {
 
 // ───────────────────────── counts (blind, rack by rack) ─────────────────────────
 
-const COUNTABLE = `i.active = 1 AND i.kind = 'stock' AND i.placeholder = 0 AND i.sku NOT LIKE 'PLAN-%'`;
+const COUNTABLE = `i.active = 1 AND i.kind = 'stock' AND i.placeholder = 0 AND i.sku NOT ILIKE 'PLAN-%'`;
 
 // Parts set aside and locked for vans (received for them), per item: total and per van.
-function lockedFor(itemId) {
-  const rows = all(`SELECT v.chassis, SUM(l.reserved_firm) AS q FROM van_lines l JOIN vans v ON v.id = l.van_id
+async function lockedFor(itemId) {
+  const rows = await all(`SELECT v.chassis, SUM(l.reserved_firm) AS q FROM van_lines l JOIN vans v ON v.id = l.van_id
                     WHERE l.item_id = ? AND ${ACTIVE_VAN} AND l.reserved_firm > 0 GROUP BY v.id ORDER BY ${PRIORITY}`, itemId);
   return { total: rows.reduce((s, r) => s + r.q, 0), vans: rows.map(r => ({ chassis: r.chassis, qty: r.q })) };
 }
 
 // What a count covers: one rack / area, items with no rack yet, or a whole trade. Each item has one
 // place, so it is counted in exactly one rack. Per-van parts are checked on their own list instead.
-function countScope(scope) {
+async function countScope(scope) {
   const s = String(scope || '');
   if (s === 'norack') return { where: 'i.area_id IS NULL', args: [], label: 'No rack yet' };
   let m = /^area:(\d+)$/.exec(s);
   if (m) {
-    const a = get('SELECT name FROM floor_areas WHERE id = ?', Number(m[1]));
+    const a = await get('SELECT name FROM floor_areas WHERE id = ?', Number(m[1]));
     if (!a) throw httpError(404, 'That rack no longer exists — refresh');
     return { where: 'i.area_id = ?', args: [Number(m[1])], label: a.name };
   }
@@ -2708,32 +2782,32 @@ function countScope(scope) {
 }
 
 // What can be counted: racks with how many items each.
-export function countChoices() {
-  const racks = all(`SELECT a.id, a.name, a.kind, COUNT(i.id) AS items FROM floor_areas a JOIN items i ON i.area_id = a.id AND ${COUNTABLE}
+export async function countChoices() {
+  const racks = await all(`SELECT a.id, a.name, a.kind, COUNT(i.id) AS items FROM floor_areas a JOIN items i ON i.area_id = a.id AND ${COUNTABLE}
                      GROUP BY a.id ORDER BY a.sort, a.name`);
-  const norack = get(`SELECT COUNT(*) AS c FROM items i WHERE ${COUNTABLE} AND i.area_id IS NULL`).c;
-  const trades = all(`SELECT i.trade, COUNT(*) AS items FROM items i WHERE ${COUNTABLE} AND i.trade <> '' GROUP BY i.trade ORDER BY i.trade`);
-  const open = all(`SELECT id, label, opened_at, opened_by FROM count_sessions WHERE closed_at = '' ORDER BY id DESC LIMIT 10`);
+  const norack = (await get(`SELECT COUNT(*) AS c FROM items i WHERE ${COUNTABLE} AND i.area_id IS NULL`)).c;
+  const trades = await all(`SELECT i.trade, COUNT(*) AS items FROM items i WHERE ${COUNTABLE} AND i.trade <> '' GROUP BY i.trade ORDER BY i.trade`);
+  const open = await all(`SELECT id, label, opened_at, opened_by FROM count_sessions WHERE closed_at = '' ORDER BY id DESC LIMIT 10`);
   return { racks, norack, trades, open };
 }
 
 // Start a count: the expected figures are written down now but not shown to the counter.
-export function openCount(scope, by = '') {
-  const sc = countScope(scope);
-  return tx(() => {
-    const items = all(`SELECT i.id, i.sku, i.name, i.unit, i.location, i.photo, i.on_hand FROM items i
+export async function openCount(scope, by = '') {
+  return writeTx(async () => {
+    const sc = await countScope(scope);
+    const items = await all(`SELECT i.id, i.sku, i.name, i.unit, i.location, i.photo, i.on_hand FROM items i
                        WHERE ${COUNTABLE} AND ${sc.where} ORDER BY i.location, i.name`, ...sc.args);
     if (!items.length) throw httpError(400, 'Nothing to count there');
     const expected = Object.fromEntries(items.map(i => [i.id, i.on_hand]));
-    const lastMove = get('SELECT COALESCE(MAX(id), 0) AS m FROM movements').m;
-    const id = Number(run('INSERT INTO count_sessions(scope, label, opened_by, last_move_id, expected) VALUES(?,?,?,?,?)',
-      scope, sc.label, by, lastMove, JSON.stringify(expected)).lastInsertRowid);
+    const lastMove = (await get('SELECT COALESCE(MAX(id), 0) AS m FROM movements')).m;
+    const id = await insert('INSERT INTO count_sessions(scope, label, opened_by, last_move_id, expected) VALUES(?,?,?,?,?)',
+      scope, sc.label, by, lastMove, JSON.stringify(expected));
     return { id, label: sc.label, items: items.map(({ on_hand, ...i }) => i) }; // no expected figure: a blind count
   });
 }
 
-function countSession(id) {
-  const s = get('SELECT * FROM count_sessions WHERE id = ?', id);
+async function countSession(id) {
+  const s = await get('SELECT * FROM count_sessions WHERE id = ?', id);
   if (!s) throw httpError(404, 'That count no longer exists — start again');
   if (s.closed_at) throw httpError(409, 'This count was already saved');
   return { ...s, expected: JSON.parse(s.expected || '{}') };
@@ -2757,18 +2831,18 @@ const bigDiff = (expected, counted) => {
 // The "kept for vans" check runs on that resulting book figure: shortfall = locked − books (never
 // less than 0). shortfall_before / shortfall_after / big_before / big_after let the screen show the
 // right question for either answer without asking the server again.
-export function checkCount(id, counts = [], { timing = {} } = {}) {
-  const s = countSession(id);
+export async function checkCount(id, counts = [], { timing = {} } = {}) {
+  const s = await countSession(id);
   const seen = new Set();
-  return counts.filter(c => c.qty !== '' && c.qty != null && Number.isFinite(Number(c.qty)) && s.expected[c.item_id] != null)
-    .filter(c => !seen.has(Number(c.item_id)) && seen.add(Number(c.item_id)))
-    .map(c => {
+  const out = [];
+  for (const c of counts.filter(c => c.qty !== '' && c.qty != null && Number.isFinite(Number(c.qty)) && s.expected[c.item_id] != null)
+    .filter(c => !seen.has(Number(c.item_id)) && seen.add(Number(c.item_id)))) {
       const itemId = Number(c.item_id), counted = Number(c.qty), expected = s.expected[itemId];
-      const it = get('SELECT sku, name, unit, on_hand FROM items WHERE id = ?', itemId);
+      const it = await get('SELECT sku, name, unit, on_hand FROM items WHERE id = ?', itemId);
       const now = it ? it.on_hand : expected;
       const moved = now - expected;
-      const locked = lockedFor(itemId);
-      const moves = all(`SELECT m.at, m.type, m.qty, m.worker, m.note, v.chassis FROM movements m LEFT JOIN vans v ON v.id = m.van_id
+      const locked = await lockedFor(itemId);
+      const moves = await all(`SELECT m.at, m.type, m.qty, m.worker, m.note, v.chassis FROM movements m LEFT JOIN vans v ON v.id = m.van_id
                          WHERE m.item_id = ? AND m.id > ? ORDER BY m.id`, itemId, s.last_move_id);
       const changed = moves.length > 0 || Math.abs(moved) > 1e-9;
       const said = ['before', 'after'].includes(timing[itemId]) ? timing[itemId] : '';
@@ -2777,13 +2851,14 @@ export function checkCount(id, counts = [], { timing = {} } = {}) {
       const shortFor = w => Math.max(0, locked.total - bookFor(w));
       const book = bookFor(when);
       const shortfall = shortFor(when);
-      return { item_id: itemId, sku: it?.sku, name: it?.name, unit: it?.unit, expected, now, moved, counted, moves,
+      out.push({ item_id: itemId, sku: it?.sku, name: it?.name, unit: it?.unit, expected, now, moved, counted, moves,
         changed, timing: changed ? said : 'after', // '' = moved while counting and not answered yet
         book, diff: book - now, diff_before: counted - expected, diff_after: counted - now,
         big: when === 'before' ? bigDiff(expected, counted) : bigDiff(now, counted), big_before: bigDiff(expected, counted), big_after: bigDiff(now, counted),
         locked: locked.total, lockedVans: locked.vans,
-        shortfall, shortfall_before: shortFor('before'), shortfall_after: shortFor('after'), belowLocked: shortfall > 1e-9 };
-    });
+        shortfall, shortfall_before: shortFor('before'), shortfall_after: shortFor('after'), belowLocked: shortfall > 1e-9 });
+  }
+  return out;
 }
 
 // Save a count. counts: [{item_id, qty, reason, recounted}]
@@ -2794,12 +2869,12 @@ export function checkCount(id, counts = [], { timing = {} } = {}) {
 //   fewer than the shortfall = the rest are missing and go back to short.
 // Nothing is saved (all or nothing) unless every question is answered, and no save may leave more set
 // aside for vans than the books hold.
-export function saveCount(id, { counts = [], elsewhere = {}, elsewhereQty = {}, timing = {}, ackMoves = false, by = '' } = {}) {
-  return tx(() => {
-    const s = countSession(id);
+export async function saveCount(id, { counts = [], elsewhere = {}, elsewhereQty = {}, timing = {}, ackMoves = false, by = '' } = {}) {
+  return writeTx(async () => {
+    const s = await countSession(id);
     const when = { ...timing };
     if (ackMoves) for (const c of counts) if (!['before', 'after'].includes(when[c.item_id])) when[c.item_id] = 'after';
-    const rows = checkCount(id, counts, { timing: when });
+    const rows = await checkCount(id, counts, { timing: when });
     if (!rows.length) throw httpError(400, 'Type at least one count');
     const byId = new Map(counts.map(c => [Number(c.item_id), c]));
     const problems = [];
@@ -2831,7 +2906,7 @@ export function saveCount(id, { counts = [], elsewhere = {}, elsewhereQty = {}, 
       const away = awayOf.get(r.item_id) || 0;        // kept elsewhere for vans (in the van, kit area)
       const missing = r.belowLocked ? Math.max(0, r.shortfall - away) : 0;
       const target = r.book + away;                   // on the books = shelf (+ what moved after it was counted) + kept elsewhere
-      const nowOnHand = get('SELECT on_hand FROM items WHERE id = ?', r.item_id).on_hand;
+      const nowOnHand = (await get('SELECT on_hand FROM items WHERE id = ?', r.item_id)).on_hand;
       const delta = target - nowOnHand;               // against the books right now, so nothing is counted twice
       const vans = r.lockedVans.map(v => v.chassis).join(', ');
       const note = [`Counted ${q(r.counted)} ${r.unit || ''}`.trim()
@@ -2841,43 +2916,43 @@ export function saveCount(id, { counts = [], elsewhere = {}, elsewhereQty = {}, 
           + (away ? ` + ${q(away)} kept elsewhere for ${vans}` : ''),
         missing > 1e-9 ? `${q(missing)} kept for ${vans} missing — back to short` : '',
         String(c.reason || '').trim(), c.recounted ? 'recounted' : '', `(${s.label})`].filter(Boolean).join(' · ');
-      run('UPDATE items SET on_hand = on_hand + ?, last_counted = datetime(\'now\',\'localtime\') WHERE id = ?', delta, r.item_id);
-      run(`INSERT INTO movements(item_id, qty, type, ref, note, worker) VALUES(?, ?, 'count', ?, ?, ?)`, r.item_id, delta, `Count #${id}`, note, by);
+      await run(`UPDATE items SET on_hand = on_hand + ?, last_counted = ${NOW_SQL} WHERE id = ?`, delta, r.item_id);
+      await run(`INSERT INTO movements(item_id, qty, type, ref, note, worker) VALUES(?, ?, 'count', ?, ?, ?)`, r.item_id, delta, `Count #${id}`, note, by);
       saved++;
       // More found than the books said: the extra shelf stock goes to vans waiting for it. Stock added
       // by a "kept elsewhere" answer is never handed out — it only covers what is already kept for vans.
-      if (delta > 1e-9 && !away) allocateItem(r.item_id, null, { reason: 'count', worker: by });
+      if (delta > 1e-9 && !away) await allocateItem(r.item_id, null, { reason: 'count', worker: by });
       // Less: shelf stock merely held for the vans built last goes back first (logged)…
-      trimReservations(r.item_id, { reason: 'count', worker: by });
+      await trimReservations(r.item_id, { reason: 'count', worker: by });
       // …then parts received for vans that aren't on the shelf or anywhere else go back to short.
-      if (missing > 1e-9) cutLocked(r.item_id, { reason: 'count: missing', worker: by });
-      const over = get(`SELECT COALESCE(SUM(l.reserved),0) AS r FROM van_lines l JOIN vans v ON v.id = l.van_id WHERE l.item_id = ? AND ${ACTIVE_VAN}`, r.item_id).r
-        - Math.max(0, get('SELECT on_hand FROM items WHERE id = ?', r.item_id).on_hand);
+      if (missing > 1e-9) await cutLocked(r.item_id, { reason: 'count: missing', worker: by });
+      const over = (await get(`SELECT COALESCE(SUM(l.reserved),0) AS r FROM van_lines l JOIN vans v ON v.id = l.van_id WHERE l.item_id = ? AND ${ACTIVE_VAN}`, r.item_id)).r
+        - Math.max(0, (await get('SELECT on_hand FROM items WHERE id = ?', r.item_id)).on_hand);
       if (over > 1e-9) {
         const msg = `${r.name}: this count would leave ${q(over)} more set aside for ${vans || 'vans'} than the books hold — say whether they are kept somewhere else`;
         throw Object.assign(httpError(400, msg), { problems: [msg] }); // nothing is saved
       }
     }
-    run(`UPDATE count_sessions SET closed_at = datetime('now','localtime') WHERE id = ?`, id);
+    await run(`UPDATE count_sessions SET closed_at = ${NOW_SQL} WHERE id = ?`, id);
     return { saved };
   });
 }
 
 // The shelf has less than is locked for vans and the parts are missing: take the set-aside back from
 // the vans built last until it fits, so those lines show as short again (logged).
-function cutLocked(itemId, { reason, worker = '' }) {
-  const onHand = Math.max(0, get('SELECT on_hand FROM items WHERE id = ?', itemId).on_hand);
-  let over = get(`SELECT COALESCE(SUM(l.reserved),0) AS r FROM van_lines l JOIN vans v ON v.id = l.van_id WHERE l.item_id = ? AND ${ACTIVE_VAN}`, itemId).r - onHand;
+async function cutLocked(itemId, { reason, worker = '' }) {
+  const onHand = Math.max(0, (await get('SELECT on_hand FROM items WHERE id = ?', itemId)).on_hand);
+  let over = (await get(`SELECT COALESCE(SUM(l.reserved),0) AS r FROM van_lines l JOIN vans v ON v.id = l.van_id WHERE l.item_id = ? AND ${ACTIVE_VAN}`, itemId)).r - onHand;
   if (over <= 0) return;
-  const ranks = vanRanks();
-  const lines = all(`SELECT l.* FROM van_lines l JOIN vans v ON v.id = l.van_id WHERE l.item_id = ? AND ${ACTIVE_VAN} AND l.reserved > 0`, itemId)
+  const ranks = await vanRanks();
+  const lines = (await all(`SELECT l.* FROM van_lines l JOIN vans v ON v.id = l.van_id WHERE l.item_id = ? AND ${ACTIVE_VAN} AND l.reserved > 0`, itemId))
     .sort((a, b) => (ranks.get(b.van_id) ?? 0) - (ranks.get(a.van_id) ?? 0) || b.id - a.id);
   for (const l of lines) {
     if (over <= 0) break;
     const give = Math.min(over, l.reserved);
-    run('UPDATE van_lines SET reserved = reserved - ?, reserved_firm = MAX(0, reserved_firm - ?) WHERE id = ?', give, give, l.id);
-    logAlloc(reason, { van_id: l.van_id, item_id: itemId, line_id: l.id, field: 'reserved', before: l.reserved, after: l.reserved - give, worker, note: 'not on the shelf when counted — back to short' });
-    if (l.reserved_firm > 0) stillToOrder(l, reason, worker, 'received for it but not found when counted');
+    await run('UPDATE van_lines SET reserved = reserved - ?, reserved_firm = GREATEST(0, reserved_firm - ?::double precision) WHERE id = ?', give, give, l.id);
+    await logAlloc(reason, { van_id: l.van_id, item_id: itemId, line_id: l.id, field: 'reserved', before: l.reserved, after: l.reserved - give, worker, note: 'not on the shelf when counted — back to short' });
+    if (l.reserved_firm > 0) await stillToOrder(l, reason, worker, 'received for it but not found when counted');
     over -= give;
   }
 }
@@ -2885,20 +2960,20 @@ function cutLocked(itemId, { reason, worker = '' }) {
 // A line whose part had arrived (so the plan's order number was used up) and is now gone again —
 // borrowed, or not found in a check: it is a plain "still to order" line, so it shows under Order now
 // instead of "Check: already ordered?" (round 2, check-r1-2). Only lines nobody has answered for.
-function stillToOrder(l, reason, worker, why) {
+async function stillToOrder(l, reason, worker, why) {
   if (l.state || !String(l.po_ref || '').trim()) return;
-  if (!run(`UPDATE van_lines SET state = 'not_ordered' WHERE id = ? AND state = ''`, l.id).changes) return;
-  logAlloc(reason, { van_id: l.van_id, item_id: l.item_id, line_id: l.id, field: 'state', before: '', after: 'not_ordered', worker,
+  if (!(await run(`UPDATE van_lines SET state = 'not_ordered' WHERE id = ? AND state = ''`, l.id)).changes) return;
+  await logAlloc(reason, { van_id: l.van_id, item_id: l.item_id, line_id: l.id, field: 'state', before: '', after: 'not_ordered', worker,
     note: `plan order ${String(l.po_ref).trim()} already used — ${why}, still to order` });
 }
 
 // Parts bought for one van (per-van items) that arrived but aren't fitted yet: checked one by one
 // ("Is ST0389's fridge here?") instead of in the rack counts.
-export function boughtForVanList() {
-  const rows = all(`SELECT l.id, l.van_id, l.item_id, l.qty, l.reserved, l.issued, l.spec, l.plan_column, v.chassis, i.sku, i.name, i.unit, i.photo, i.location,
+export async function boughtForVanList() {
+  const rows = await all(`SELECT l.id, l.van_id, l.item_id, l.qty, l.reserved, l.issued, l.spec, l.plan_column, v.chassis, i.sku, i.name, i.unit, i.photo, i.location,
                       (SELECT MAX(a.at) FROM allocation_log a WHERE a.line_id = l.id AND a.reason = 'check: here') AS checked_at
                     FROM van_lines l JOIN vans v ON v.id = l.van_id JOIN items i ON i.id = l.item_id
-                    WHERE ${ACTIVE_VAN} AND (i.kind = 'per-van' OR i.placeholder = 1 OR i.sku LIKE 'PLAN-%') AND l.reserved > 0 AND l.issued < l.qty
+                    WHERE ${ACTIVE_VAN} AND (i.kind = 'per-van' OR i.placeholder = 1 OR i.sku ILIKE 'PLAN-%') AND l.reserved > 0 AND l.issued < l.qty
                     ORDER BY ${PRIORITY}, i.name, l.id`);
   const vans = new Map();
   for (const r of rows) {
@@ -2909,25 +2984,25 @@ export function boughtForVanList() {
 }
 
 // answer: 'here' | 'missing' | 'fitted'
-export function checkBoughtLine(lineId, answer, by = '') {
-  return tx(() => {
-    const l = get(`SELECT l.*, v.chassis FROM van_lines l JOIN vans v ON v.id = l.van_id WHERE l.id = ?`, lineId);
+export async function checkBoughtLine(lineId, answer, by = '') {
+  return writeTx(async () => {
+    const l = await get(`SELECT l.*, v.chassis FROM van_lines l JOIN vans v ON v.id = l.van_id WHERE l.id = ?`, lineId);
     if (!l) throw httpError(404, 'That part line no longer exists — refresh');
     if (answer === 'fitted') return markFitted(l.van_id, [l.id], by);
     if (answer === 'here') {
-      logAlloc('check: here', { van_id: l.van_id, item_id: l.item_id, line_id: l.id, field: 'checked', before: '', after: q(l.reserved), worker: by, note: `${l.chassis}'s part is here` });
+      await logAlloc('check: here', { van_id: l.van_id, item_id: l.item_id, line_id: l.id, field: 'checked', before: '', after: q(l.reserved), worker: by, note: `${l.chassis}'s part is here` });
       return { ok: true };
     }
     if (answer !== 'missing') throw httpError(400, 'Answer Yes, No or Already fitted');
     if (!(l.reserved > 0)) return { ok: true };
-    const it = get('SELECT on_hand FROM items WHERE id = ?', l.item_id);
+    const it = await get('SELECT on_hand FROM items WHERE id = ?', l.item_id);
     const cut = Math.min(l.reserved, Math.max(0, it.on_hand));
-    run('UPDATE items SET on_hand = on_hand - ? WHERE id = ?', cut, l.item_id);
-    run('UPDATE van_lines SET reserved = 0, reserved_firm = 0 WHERE id = ?', l.id);
-    if (cut > 0) run(`INSERT INTO movements(item_id, qty, type, van_id, ref, note, worker) VALUES(?, ?, 'count', ?, ?, ?, ?)`,
+    await run('UPDATE items SET on_hand = on_hand - ? WHERE id = ?', cut, l.item_id);
+    await run('UPDATE van_lines SET reserved = 0, reserved_firm = 0 WHERE id = ?', l.id);
+    if (cut > 0) await run(`INSERT INTO movements(item_id, qty, type, van_id, ref, note, worker) VALUES(?, ?, 'count', ?, ?, ?, ?)`,
         l.item_id, -cut, l.van_id, l.chassis, `Not found when checked (bought for ${l.chassis}) — back to short`, by);
-    logAlloc('check: missing', { van_id: l.van_id, item_id: l.item_id, line_id: l.id, field: 'reserved', before: l.reserved, after: 0, worker: by, note: `${l.chassis}'s part not found — back to short` });
-    stillToOrder(l, 'check: missing', by, 'bought for it but not found when checked');
+    await logAlloc('check: missing', { van_id: l.van_id, item_id: l.item_id, line_id: l.id, field: 'reserved', before: l.reserved, after: 0, worker: by, note: `${l.chassis}'s part not found — back to short` });
+    await stillToOrder(l, 'check: missing', by, 'bought for it but not found when checked');
     return { ok: true };
   });
 }
@@ -2940,43 +3015,45 @@ export function checkBoughtLine(lineId, answer, by = '') {
 // The "spare" answer is a log entry (reason 'spare', after = how many were unassigned when answered);
 // more stock arriving with no van brings the item back onto the list.
 
-function spareAck(itemId) {
-  const r = get(`SELECT after FROM allocation_log WHERE reason = 'spare' AND item_id = ? ORDER BY id DESC LIMIT 1`, itemId);
+async function spareAck(itemId) {
+  const r = await get(`SELECT after FROM allocation_log WHERE reason = 'spare' AND item_id = ? ORDER BY id DESC LIMIT 1`, itemId);
   return r ? Number(r.after) || 0 : 0;
 }
 
-export function unassignedPerVan({ all: everything = false } = {}) {
-  const rows = all(`SELECT i.id, i.sku, i.name, i.unit, i.unit_size, i.photo, i.supplier, i.placeholder, i.on_hand,
+export async function unassignedPerVan({ all: everything = false } = {}) {
+  const rows = (await all(`SELECT i.id, i.sku, i.name, i.unit, i.unit_size, i.photo, i.supplier, i.placeholder, i.on_hand,
                       i.on_hand - COALESCE((SELECT SUM(l.reserved) FROM van_lines l JOIN vans v ON v.id = l.van_id
                                             WHERE l.item_id = i.id AND ${ACTIVE_VAN}), 0) AS unassigned
-                    FROM items i WHERE i.active = 1 AND i.kind = 'per-van'`).filter(r => r.unassigned > 1e-9);
-  const ranks = vanRanks();
-  return rows.map(r => {
-    const spare = spareAck(r.id);
-    const vans = all(`SELECT l.van_id, v.chassis, v.eta, v.status, SUM(l.qty - l.reserved - l.issued) AS short
+                    FROM items i WHERE i.active = 1 AND i.kind = 'per-van' ORDER BY i.id`)).filter(r => r.unassigned > 1e-9);
+  const ranks = await vanRanks();
+  const out = [];
+  for (const r of rows) {
+    const spare = await spareAck(r.id);
+    const vans = (await all(`SELECT l.van_id, v.chassis, v.eta, v.status, SUM(l.qty - l.reserved - l.issued) AS short
                       FROM van_lines l JOIN vans v ON v.id = l.van_id
                       WHERE l.item_id = ? AND ${ACTIVE_VAN} AND l.qty > l.reserved + l.issued + 1e-9 AND ${ALLOCATABLE('l')}
-                      GROUP BY l.van_id`, r.id).sort((a, b) => (ranks.get(a.van_id) ?? 1e9) - (ranks.get(b.van_id) ?? 1e9));
-    return { ...r, placeholder: isPlaceholder(r) ? 1 : 0, spare, needs_answer: r.unassigned > spare + 1e-9 ? 1 : 0, vans };
-  }).filter(r => everything || r.needs_answer).sort((a, b) => a.name.localeCompare(b.name));
+                      GROUP BY l.van_id, v.id`, r.id)).sort((a, b) => (ranks.get(a.van_id) ?? 1e9) - (ranks.get(b.van_id) ?? 1e9));
+    out.push({ ...r, placeholder: isPlaceholder(r) ? 1 : 0, spare, needs_answer: r.unassigned > spare + 1e-9 ? 1 : 0, vans });
+  }
+  return out.filter(r => everything || r.needs_answer).sort((a, b) => a.name.localeCompare(b.name));
 }
 
 // Put unassigned bought-for-van stock to a van: set aside and locked to it (logged).
-export function assignToVan(itemId, vanId, qty, by = '') {
-  return tx(() => {
-    const it = get('SELECT * FROM items WHERE id = ?', itemId);
+export async function assignToVan(itemId, vanId, qty, by = '') {
+  return writeTx(async () => {
+    const it = await get('SELECT * FROM items WHERE id = ?', itemId);
     if (!it) throw httpError(404, 'Part not found');
-    const free = it.on_hand - get(`SELECT COALESCE(SUM(l.reserved),0) AS r FROM van_lines l JOIN vans v ON v.id = l.van_id WHERE l.item_id = ? AND ${ACTIVE_VAN}`, itemId).r;
+    const free = it.on_hand - (await get(`SELECT COALESCE(SUM(l.reserved),0) AS r FROM van_lines l JOIN vans v ON v.id = l.van_id WHERE l.item_id = ? AND ${ACTIVE_VAN}`, itemId)).r;
     const want = qty == null || qty === '' ? free : Math.min(Number(qty), free);
     if (!(want > 1e-9)) throw httpError(409, 'Nothing left to assign — refresh');
-    const van = get('SELECT chassis FROM vans WHERE id = ?', vanId);
+    const van = await get('SELECT chassis FROM vans WHERE id = ?', vanId);
     if (!van) throw httpError(404, 'That van no longer exists — refresh');
     let left = want;
-    for (const l of all(`SELECT * FROM van_lines l WHERE van_id = ? AND item_id = ? AND l.qty > l.reserved + l.issued + 1e-9 AND ${ALLOCATABLE('l')} ORDER BY id`, vanId, itemId)) {
+    for (const l of await all(`SELECT * FROM van_lines l WHERE van_id = ? AND item_id = ? AND l.qty > l.reserved + l.issued + 1e-9 AND ${ALLOCATABLE('l')} ORDER BY id`, vanId, itemId)) {
       if (left <= 1e-9) break;
       const take = Math.min(left, l.qty - l.reserved - l.issued);
-      run('UPDATE van_lines SET reserved = reserved + ?, reserved_firm = reserved_firm + ? WHERE id = ?', take, take, l.id);
-      logAlloc('assign to van', { van_id: vanId, item_id: itemId, line_id: l.id, field: 'reserved (locked)', before: l.reserved, after: l.reserved + take, worker: by,
+      await run('UPDATE van_lines SET reserved = reserved + ?, reserved_firm = reserved_firm + ? WHERE id = ?', take, take, l.id);
+      await logAlloc('assign to van', { van_id: vanId, item_id: itemId, line_id: l.id, field: 'reserved (locked)', before: l.reserved, after: l.reserved + take, worker: by,
         change: take, firm_change: take, note: `bought-for-van stock with no van – assigned to ${van.chassis}` });
       left -= take;
     }
@@ -2986,11 +3063,11 @@ export function assignToVan(itemId, vanId, qty, by = '') {
 }
 
 // "Keep on the shelf as a spare": the office has seen it; it stays visible as Unassigned.
-export function keepSpare(itemId, by = '') {
-  return tx(() => {
-    const r = unassignedPerVan({ all: true }).find(x => x.id === Number(itemId));
+export async function keepSpare(itemId, by = '') {
+  return writeTx(async () => {
+    const r = (await unassignedPerVan({ all: true })).find(x => x.id === Number(itemId));
     if (!r) throw httpError(409, 'Nothing unassigned for this part — refresh');
-    logAlloc('spare', { item_id: r.id, field: 'spare', before: q(r.spare), after: q(r.unassigned), worker: by, note: `${q(r.unassigned)} ${r.unit} kept on the shelf as a spare (no van)` });
+    await logAlloc('spare', { item_id: r.id, field: 'spare', before: q(r.spare), after: q(r.unassigned), worker: by, note: `${q(r.unassigned)} ${r.unit} kept on the shelf as a spare (no van)` });
     return { ok: true };
   });
 }
@@ -3004,13 +3081,13 @@ export function keepSpare(itemId, by = '') {
 //     movements, once there are 4+ weeks of history) × (supplier lead time + 1 review week).
 // Returns Map itemId → { level, why } (level null = no suggestion yet).
 const WHOLE_UNITS = /^(ea|set|kit|pair|sheet|length|box|roll|pack|pkt|bag)$/i;
-export function reorderSuggestions(itemIds = null) {
-  const items = all(`SELECT i.id, i.unit, i.supplier FROM items i WHERE ${COUNTABLE_ITEM}`).filter(i => !itemIds || itemIds.includes(i.id));
+export async function reorderSuggestions(itemIds = null) {
+  const items = (await all(`SELECT i.id, i.unit, i.supplier FROM items i WHERE ${COUNTABLE_ITEM} ORDER BY i.id`)).filter(i => !itemIds || itemIds.includes(i.id));
   const out = new Map();
   if (!items.length) return out;
-  const onLines = new Set(all('SELECT DISTINCT item_id FROM van_lines').map(r => r.item_id));
-  const med = itemMedians(items.filter(i => onLines.has(i.id)).map(i => i.id));
-  const lead = new Map(all('SELECT name, lead_days FROM suppliers').map(s => [s.name, s.lead_days]));
+  const onLines = new Set((await all('SELECT DISTINCT item_id FROM van_lines')).map(r => r.item_id));
+  const med = await itemMedians(items.filter(i => onLines.has(i.id)).map(i => i.id));
+  const lead = new Map((await all('SELECT name, lead_days FROM suppliers')).map(s => [s.name, s.lead_days]));
   const round = (n, unit) => (WHOLE_UNITS.test(unit || '') ? Math.ceil(n - 1e-9) : Math.round(n * 10) / 10);
   for (const i of items) {
     if (onLines.has(i.id)) {
@@ -3019,11 +3096,12 @@ export function reorderSuggestions(itemIds = null) {
         : { level: null, why: 'no van use yet' });
       continue;
     }
-    const h = get(`SELECT MIN(at) AS first FROM movements WHERE item_id = ? AND type = 'issue'`, i.id);
-    const days = h?.first ? (Date.now() - new Date(h.first.replace(' ', 'T')).getTime()) / 864e5 : 0;
+    // (days since the first one, worked out in SQL: `at` is Melbourne wall-clock time)
+    const h = await get(`SELECT MIN(at) AS first, ${AGE_SECS('MIN(at)')} AS secs FROM movements WHERE item_id = ? AND type = 'issue'`, i.id);
+    const days = h?.first ? h.secs / 86400 : 0;
     if (days < 28) { out.set(i.id, { level: null, why: 'not enough history yet (needs 4 weeks of parts taken)' }); continue; }
     const span = Math.min(days, 84);
-    const used = -get(`SELECT COALESCE(SUM(qty),0) AS s FROM movements WHERE item_id = ? AND type = 'issue' AND at >= datetime('now','localtime', ?)`, i.id, `-${Math.round(span)} days`).s;
+    const used = -(await get(`SELECT COALESCE(SUM(qty),0) AS s FROM movements WHERE item_id = ? AND type = 'issue' AND at >= to_char(${MELB} + ?::interval, 'YYYY-MM-DD HH24:MI:SS')`, i.id, `-${Math.round(span)} days`)).s;
     const perWeek = used / (span / 7);
     const ld = lead.get(String(i.supplier || '').trim()) ?? 14;
     const level = perWeek > 0 ? round(perWeek * (ld / 7 + 1), i.unit) : null;
@@ -3041,16 +3119,16 @@ const SUPPLIER_WORDS = [['E time', /\be[\s-]?time\b/i], ['Battery Stop', /\bbatt
 // Supplier names that are also ordinary words in part names / plan text (a "gold" tap isn't from Gold).
 const NOT_A_BRAND = /^(gold|black|white|grey|silver|chrome|custom|plan|order)$/i;
 const reEsc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-export function supplierSuggestions() {
+export async function supplierSuggestions() {
   const out = new Map();
   const words = [...SUPPLIER_WORDS];
-  for (const { name } of all(`SELECT name FROM suppliers`)) {
+  for (const { name } of await all(`SELECT name FROM suppliers ORDER BY name`)) {
     if (name.length < 4 || NOT_A_BRAND.test(name) || words.some(([s]) => s.toLowerCase() === name.toLowerCase())) continue;
     words.push([name, new RegExp(`\\b${reEsc(name).replace(/\s+/g, '\\s*')}\\b`, 'i')]);
   }
-  const rows = all(`SELECT i.id, l.spec FROM items i JOIN van_lines l ON l.item_id = i.id
-                    WHERE i.active = 1 AND trim(i.supplier) = '' AND trim(l.spec) <> ''`);
-  const blank = all(`SELECT id, sku, name, category, kind FROM items WHERE active = 1 AND trim(supplier) = ''`);
+  const rows = await all(`SELECT i.id, l.spec FROM items i JOIN van_lines l ON l.item_id = i.id
+                    WHERE i.active = 1 AND trim(i.supplier) = '' AND trim(l.spec) <> '' ORDER BY l.id`);
+  const blank = await all(`SELECT id, sku, name, category, kind FROM items WHERE active = 1 AND trim(supplier) = '' ORDER BY id`);
   const hits = new Map(); // itemId → Map(supplier → {n, where})
   const add = (id, text, where) => {
     for (const [sup, re] of words) if (re.test(text)) {
@@ -3068,7 +3146,7 @@ export function supplierSuggestions() {
   }
   // Shelf parts only: sister parts (same code start and category, e.g. TAPS-…) that all have the same
   // supplier. Not for bought-for-van parts — those are brands (an OGO toilet isn't from Thetford).
-  const named = all(`SELECT sku, category, trim(supplier) AS supplier FROM items WHERE active = 1 AND trim(supplier) <> '' AND placeholder = 0`);
+  const named = await all(`SELECT sku, category, trim(supplier) AS supplier FROM items WHERE active = 1 AND trim(supplier) <> '' AND placeholder = 0 ORDER BY id`);
   for (const b of blank) {
     if (out.has(b.id) || b.kind !== 'stock') continue;
     const stem = String(b.sku).split('-')[0];
@@ -3081,10 +3159,10 @@ export function supplierSuggestions() {
 
 // Items with something missing: supplier; for shelf items a rack, a reorder level; a unit size where
 // the unit isn't obvious (length, set, m…). With suggestions to accept.
-export function catalogueGaps() {
-  const items = listItems().filter(i => !i.placeholder);
-  const sups = supplierSuggestions();
-  const reo = reorderSuggestions();
+export async function catalogueGaps() {
+  const items = (await listItems()).filter(i => !i.placeholder);
+  const sups = await supplierSuggestions();
+  const reo = await reorderSuggestions();
   const needsSize = i => !/^(ea|pair)$/i.test(String(i.unit || '').trim()) && !String(i.unit_size || '').trim();
   const rows = items.map(i => {
     const shelf = i.kind === 'stock';
@@ -3101,25 +3179,25 @@ export function catalogueGaps() {
   return {
     rows: rows.filter(r => r.missing.length),
     counts: ['supplier', 'rack', 'unit size', 'reorder level'].reduce((o, k) => ({ ...o, [k]: rows.filter(r => r.missing.includes(k)).length }), {}),
-    racks: all(`SELECT id, name FROM floor_areas WHERE kind = 'storage' ORDER BY sort, name`),
-    suppliers: all('SELECT name FROM suppliers ORDER BY name COLLATE NOCASE').map(s => s.name),
-    counted: firstCountDone(),
+    racks: await all(`SELECT id, name FROM floor_areas WHERE kind = 'storage' ORDER BY sort, name`),
+    suppliers: (await all('SELECT name FROM suppliers ORDER BY lower(name), name')).map(s => s.name),
+    counted: await firstCountDone(),
   };
 }
 
 // Bulk "Put on rack": every ticked item goes to one storage area (logged).
-export function putOnRack(itemIds, areaId, by = '') {
+export async function putOnRack(itemIds, areaId, by = '') {
   const ids = (itemIds || []).map(Number).filter(Boolean);
   if (!ids.length) throw httpError(400, 'Tick the parts to put on the rack');
-  return tx(() => {
-    const a = areaId ? get(`SELECT id, name FROM floor_areas WHERE id = ? AND kind = 'storage'`, Number(areaId)) : null;
+  return writeTx(async () => {
+    const a = areaId ? await get(`SELECT id, name FROM floor_areas WHERE id = ? AND kind = 'storage'`, Number(areaId)) : null;
     if (areaId && !a) throw httpError(404, 'That rack no longer exists — refresh');
     let n = 0;
     for (const id of ids) {
-      const it = get('SELECT id, area_id FROM items WHERE id = ?', id);
+      const it = await get('SELECT id, area_id FROM items WHERE id = ?', id);
       if (!it || it.area_id === (a?.id ?? null)) continue;
-      run('UPDATE items SET area_id = ? WHERE id = ?', a?.id ?? null, id);
-      logAlloc('catalogue', { item_id: id, field: 'rack', before: it.area_id ? (get('SELECT name FROM floor_areas WHERE id = ?', it.area_id)?.name || '') : '', after: a?.name || '', worker: by });
+      await run('UPDATE items SET area_id = ? WHERE id = ?', a?.id ?? null, id);
+      await logAlloc('catalogue', { item_id: id, field: 'rack', before: it.area_id ? ((await get('SELECT name FROM floor_areas WHERE id = ?', it.area_id))?.name || '') : '', after: a?.name || '', worker: by });
       n++;
     }
     return { moved: n };
@@ -3132,18 +3210,18 @@ const LOG_COLS = `a.id, a.at, a.reason, a.van_id, a.item_id, a.line_id, a.field,
 
 // One van line: what is set aside for it now, and every change with who / when / why, plus the stock
 // movements for that van and part.
-export function lineHistory(lineId) {
-  const l = get(`SELECT l.*, v.chassis, i.sku, i.name, i.unit FROM van_lines l JOIN vans v ON v.id = l.van_id JOIN items i ON i.id = l.item_id WHERE l.id = ?`, lineId);
+export async function lineHistory(lineId) {
+  const l = await get(`SELECT l.*, v.chassis, i.sku, i.name, i.unit FROM van_lines l JOIN vans v ON v.id = l.van_id JOIN items i ON i.id = l.item_id WHERE l.id = ?`, lineId);
   if (!l) throw httpError(404, 'That part line no longer exists — refresh');
-  const log = all(`SELECT ${LOG_COLS}, v.chassis FROM allocation_log a LEFT JOIN vans v ON v.id = a.van_id WHERE a.line_id = ? ORDER BY a.id`, lineId);
+  const log = await all(`SELECT ${LOG_COLS}, v.chassis FROM allocation_log a LEFT JOIN vans v ON v.id = a.van_id WHERE a.line_id = ? ORDER BY a.id`, lineId);
   // Borrows *for* this line are logged on the donor's line; show them here too.
-  const borrowedFor = all(`SELECT ${LOG_COLS}, v.chassis FROM allocation_log a LEFT JOIN vans v ON v.id = a.van_id
-                           WHERE a.reason = 'borrow' AND a.item_id = ? AND a.van_id <> ? AND a.note LIKE ? ORDER BY a.id`, l.item_id, l.van_id, `% for ${l.chassis}%`);
-  const moves = all(`SELECT m.id, m.at, m.type, m.qty, m.ref, m.note, m.worker FROM movements m WHERE m.van_id = ? AND m.item_id = ? ORDER BY m.id`, l.van_id, l.item_id);
+  const borrowedFor = await all(`SELECT ${LOG_COLS}, v.chassis FROM allocation_log a LEFT JOIN vans v ON v.id = a.van_id
+                           WHERE a.reason = 'borrow' AND a.item_id = ? AND a.van_id <> ? AND a.note ILIKE ? ORDER BY a.id`, l.item_id, l.van_id, `% for ${l.chassis}%`);
+  const moves = await all(`SELECT m.id, m.at, m.type, m.qty, m.ref, m.note, m.worker FROM movements m WHERE m.van_id = ? AND m.item_id = ? ORDER BY m.id`, l.van_id, l.item_id);
   return { line: l, log, borrowedFor, moves };
 }
 
-export function itemHistory(itemId) {
+export async function itemHistory(itemId) {
   return all(`SELECT ${LOG_COLS}, v.chassis FROM allocation_log a LEFT JOIN vans v ON v.id = a.van_id
               WHERE a.item_id = ? ORDER BY a.id DESC LIMIT 200`, itemId);
 }
@@ -3154,37 +3232,38 @@ export function itemHistory(itemId) {
 // floor / office corrections, borrowings between vans, count differences, over deliveries and the
 // "is the bought-for-van part here?" answers. Shown: everything not yet ticked, plus what was ticked
 // in the last 7 days.
-export function stockChecks() {
-  const recent = `(x.ack = 0 OR x.at >= datetime('now','localtime','-7 days'))`;
-  const corrections = all(`SELECT x.id, x.at, x.qty, x.note, x.ref, x.worker, x.ack, i.name, i.unit, v.chassis FROM movements x
+export async function stockChecks() {
+  const recent = `(x.ack = 0 OR x.at >= to_char(${MELB} - interval '7 days', 'YYYY-MM-DD HH24:MI:SS'))`;
+  const corrections = await all(`SELECT x.id, x.at, x.qty, x.note, x.ref, x.worker, x.ack, i.name, i.unit, v.chassis FROM movements x
                              JOIN items i ON i.id = x.item_id LEFT JOIN vans v ON v.id = x.van_id
-                           WHERE x.type = 'adjust' AND ${recent} AND x.note NOT LIKE 'Re-linked%' AND x.note NOT LIKE 'Plan quantity corrected%'
+                           WHERE x.type = 'adjust' AND ${recent} AND x.note NOT ILIKE 'Re-linked%' AND x.note NOT ILIKE 'Plan quantity corrected%'
                              AND x.note <> 'Demo stock level' ORDER BY x.id DESC`);
-  const ranks = vanRanks();
-  const borrows = all(`SELECT x.id, x.at, x.worker, x.note, x.ack, x.before, x.after, x.line_id, x.van_id, x.item_id, v.chassis, i.name, i.unit,
+  const ranks = await vanRanks();
+  const borrows = [];
+  for (const b of await all(`SELECT x.id, x.at, x.worker, x.note, x.ack, x.before, x.after, x.line_id, x.van_id, x.item_id, v.chassis, i.name, i.unit,
                          l.qty, l.reserved, l.issued, l.urgent
                        FROM allocation_log x JOIN items i ON i.id = x.item_id LEFT JOIN vans v ON v.id = x.van_id LEFT JOIN van_lines l ON l.id = x.line_id
-                       WHERE x.reason = 'borrow' AND ${recent} ORDER BY x.id DESC`).map(b => {
+                       WHERE x.reason = 'borrow' AND ${recent} ORDER BY x.id DESC`)) {
     const to = /\bfor (\S+)/.exec(b.note || '')?.[1] || '';
-    const onOrder = b.van_id ? get(`SELECT COALESCE(SUM(${PO_OPEN}),0) AS q FROM po_lines pl JOIN purchase_orders p ON p.id = pl.po_id
-                                    WHERE ${PO_IS_OPEN} AND pl.van_id = ? AND pl.item_id = ?`, b.van_id, b.item_id).q : 0;
+    const onOrder = b.van_id ? (await get(`SELECT COALESCE(SUM(${PO_OPEN}),0) AS q FROM po_lines pl JOIN purchase_orders p ON p.id = pl.po_id
+                                    WHERE ${PO_IS_OPEN} AND pl.van_id = ? AND pl.item_id = ?`, b.van_id, b.item_id)).q : 0;
     const short = b.qty != null ? Math.max(0, b.qty - b.reserved - b.issued) : 0;
     const reordered = b.qty == null ? 'line gone' : short <= 1e-9 ? 'covered again' : onOrder >= short - 1e-9 ? `re-ordered (${q(onOrder)} on order)` : '';
-    return { ...b, to, qty_moved: Number(b.before) - Number(b.after), reordered, rank: ranks.get(b.van_id) ?? null };
-  });
-  const counts = all(`SELECT x.id, x.at, x.qty, x.note, x.ref, x.worker, x.ack, i.name, i.unit, i.area_id FROM movements x JOIN items i ON i.id = x.item_id
+    borrows.push({ ...b, to, qty_moved: Number(b.before) - Number(b.after), reordered, rank: ranks.get(b.van_id) ?? null });
+  }
+  const counts = await all(`SELECT x.id, x.at, x.qty, x.note, x.ref, x.worker, x.ack, i.name, i.unit, i.area_id FROM movements x JOIN items i ON i.id = x.item_id
                       WHERE x.type = 'count' AND abs(x.qty) > 1e-9 AND ${recent} ORDER BY x.id DESC`);
-  const over = all(`SELECT x.id, x.at, x.qty, x.note, x.ref, x.worker, x.ack, i.name, i.unit FROM movements x JOIN items i ON i.id = x.item_id
-                    WHERE x.type = 'receive' AND x.note LIKE '%more than ordered%' AND ${recent} ORDER BY x.id DESC`);
-  const bought = all(`SELECT x.id, x.at, x.reason, x.worker, x.note, x.ack, x.before, i.name, i.unit, v.chassis FROM allocation_log x
+  const over = await all(`SELECT x.id, x.at, x.qty, x.note, x.ref, x.worker, x.ack, i.name, i.unit FROM movements x JOIN items i ON i.id = x.item_id
+                    WHERE x.type = 'receive' AND x.note ILIKE '%more than ordered%' AND ${recent} ORDER BY x.id DESC`);
+  const bought = await all(`SELECT x.id, x.at, x.reason, x.worker, x.note, x.ack, x.before, i.name, i.unit, v.chassis FROM allocation_log x
                         JOIN items i ON i.id = x.item_id LEFT JOIN vans v ON v.id = x.van_id
                       WHERE x.reason IN ('check: here','check: missing') AND ${recent} ORDER BY x.id DESC`);
   // Racks counted longest ago (never counted first): "Count these next".
-  const areas = all(`SELECT a.id, a.name, COUNT(i.id) AS items, SUM(CASE WHEN i.last_counted = '' THEN 1 ELSE 0 END) AS never,
+  const areas = await all(`SELECT a.id, a.name, COUNT(i.id) AS items, SUM(CASE WHEN i.last_counted = '' THEN 1 ELSE 0 END) AS never,
                        MIN(NULLIF(i.last_counted, '')) AS oldest
                      FROM floor_areas a JOIN items i ON i.area_id = a.id AND ${COUNTABLE_ITEM}
-                     GROUP BY a.id`);
-  const norack = get(`SELECT COUNT(*) AS items, SUM(CASE WHEN i.last_counted = '' THEN 1 ELSE 0 END) AS never, MIN(NULLIF(i.last_counted, '')) AS oldest
+                     GROUP BY a.id ORDER BY a.id`);
+  const norack = await get(`SELECT COUNT(*) AS items, SUM(CASE WHEN i.last_counted = '' THEN 1 ELSE 0 END) AS never, MIN(NULLIF(i.last_counted, '')) AS oldest
                       FROM items i WHERE ${COUNTABLE_ITEM} AND i.area_id IS NULL`);
   const next = [...areas.map(a => ({ scope: `area:${a.id}`, name: a.name, items: a.items, never: a.never || 0, oldest: a.oldest || '' })),
     ...(norack.items ? [{ scope: 'norack', name: 'No rack yet', items: norack.items, never: norack.never || 0, oldest: norack.oldest || '' }] : [])]
@@ -3193,19 +3272,23 @@ export function stockChecks() {
 }
 
 // How many rows on the Stock checks page nobody has ticked yet (nav badge).
-export function stockChecksCount() {
-  return get(`SELECT
-    (SELECT COUNT(*) FROM movements x WHERE x.ack = 0 AND ((x.type = 'adjust' AND x.note NOT LIKE 'Re-linked%' AND x.note NOT LIKE 'Plan quantity corrected%'
-       AND x.note <> 'Demo stock level') OR (x.type = 'count' AND abs(x.qty) > 1e-9) OR (x.type = 'receive' AND x.note LIKE '%more than ordered%')))
-    + (SELECT COUNT(*) FROM allocation_log x WHERE x.ack = 0 AND x.reason IN ('borrow', 'check: here', 'check: missing')) AS n`).n;
+export async function stockChecksCount() {
+  return (await get(`SELECT
+    (SELECT COUNT(*) FROM movements x WHERE x.ack = 0 AND ((x.type = 'adjust' AND x.note NOT ILIKE 'Re-linked%' AND x.note NOT ILIKE 'Plan quantity corrected%'
+       AND x.note <> 'Demo stock level') OR (x.type = 'count' AND abs(x.qty) > 1e-9) OR (x.type = 'receive' AND x.note ILIKE '%more than ordered%')))
+    + (SELECT COUNT(*) FROM allocation_log x WHERE x.ack = 0 AND x.reason IN ('borrow', 'check: here', 'check: missing')) AS n`)).n;
 }
 
 // Tick (or untick) one row of the Stock checks page. kind 'm' = a stock movement, 'a' = a log entry.
-export function ackCheck(kind, id, ack = true) {
+export async function ackCheck(kind, id, ack = true) {
   const table = kind === 'm' ? 'movements' : kind === 'a' ? 'allocation_log' : null;
   if (!table) throw httpError(400, 'Unknown row');
-  if (!run(`UPDATE ${table} SET ack = ? WHERE id = ?`, ack ? 1 : 0, Number(id)).changes) throw httpError(404, 'That row no longer exists — refresh');
-  return { ok: true };
+  // (Postgres refuses a non-number id outright; SQLite just found no row)
+  if (!Number.isSafeInteger(Number(id))) throw httpError(404, 'That row no longer exists — refresh');
+  return writeTx(async () => {
+    if (!(await run(`UPDATE ${table} SET ack = ? WHERE id = ?`, ack ? 1 : 0, Number(id))).changes) throw httpError(404, 'That row no longer exists — refresh');
+    return { ok: true };
+  });
 }
 
 export function httpError(status, message) {

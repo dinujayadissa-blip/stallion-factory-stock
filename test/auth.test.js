@@ -303,8 +303,7 @@ test('issue #1: every line of the table can be reached — a ":id" line never sw
   assert.equal(auth.allowed('GET', '/api/items/12', 'worker'), true);
 });
 
-// Needs src/inventory.js on Postgres (Task 3) — until then the module can't even be imported.
-test('issue #2: floor stats count by login id; only old movements (no id) by name', { skip: 'inventory.js not yet on Postgres (Task 3)' }, async () => {
+test('issue #2: floor stats count by login id; only old movements (no id) by name', async () => {
   const inv = await import('../src/inventory.js');
   const item = await insert(`INSERT INTO items(sku, name) VALUES('ST-1', 'Stats part')`);
   const mv = (worker, userId) => run(`INSERT INTO movements(item_id, qty, type, worker, user_id) VALUES(?, -1, 'issue', ?, ?)`, item, worker, userId);

@@ -105,14 +105,20 @@ export const COUNTS_SHORT_CORR = (l = 'l') => `(${l}.state NOT IN ('customer','t
 // special parts / to check / to order or on order.
 export const STILL_MISSING = (l = 'l') => `(${l}.state NOT IN ('customer','tbd') AND ${l}.qty > ${l}.reserved + ${l}.issued + 1e-9)`;
 // "As per plan" catch-alls (special parts to confirm).
-export const SPECIAL_ITEM = (i = 'i') => `(${i}.placeholder = 1 OR ${i}.sku LIKE 'PLAN-%')`;
+export const SPECIAL_ITEM = (i = 'i') => `(${i}.placeholder = 1 OR ${i}.sku ILIKE 'PLAN-%')`; // (ILIKE: SQLite's LIKE ignored case)
 // Lines stock may be set aside for (allocation never reserves for a reminder line).
 export const ALLOCATABLE = (l = 'l') => `${l}.state NOT IN ('customer','tbd')`;
 
-// ── dates (local, YYYY-MM-DD) ──
+// ── dates (YYYY-MM-DD) ──
 const p2 = n => String(n).padStart(2, '0');
 export const isoDate = d => `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}`;
-export const today = () => isoDate(new Date());
+// Today in Melbourne (the factory), whatever time zone the server runs in — the cloud runs in UTC, where
+// 9 am in Melbourne is still "yesterday".
+const MELBOURNE_DAY = new Intl.DateTimeFormat('en-AU', { timeZone: 'Australia/Melbourne', year: 'numeric', month: '2-digit', day: '2-digit' });
+export const today = () => {
+  const p = Object.fromEntries(MELBOURNE_DAY.formatToParts(new Date()).map(x => [x.type, x.value]));
+  return `${p.year}-${p.month}-${p.day}`;
+};
 export function addDays(iso, days) {
   const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(iso || '');
   if (!m) return '';
