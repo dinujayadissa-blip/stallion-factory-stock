@@ -37,6 +37,7 @@ const MIGRATIONS = path.join(HERE, '..', 'supabase', 'migrations');
 const BATCH = 500;
 const q = name => `"${String(name).replace(/"/g, '""')}"`;
 const isUrl = to => /^postgres(ql)?:\/\//i.test(String(to));
+export const TIDY_BACKUP_NOTE = 'Backup from before the clean-up: the original data on the home PC (unchanged)';
 
 // ── The source: a brought-up-to-date temporary copy ──
 // Anything a child process says on failure goes through this first: it could quote a value.
@@ -51,14 +52,20 @@ const redact = s => String(s ?? '').trim().split('\n')[0].replace(/"[^"]*"/g, '"
 // same modules server.js imports, in the same order, then calls server.js's start-up lines 22–29:
 //   seed(); syncCatalog(); assignMissingTrades(); layout.seedLayout(); layout.drawingRemindersAll();
 //   runTidy(); and assignMissingTrades() again when the clean-up ran.
-// It only reports counts and the clean-up steps' fixed labels.
+// It only reports counts, a few totals (parts, on hand, set aside, firm: before and after) and the clean-up
+// steps' fixed labels.
 const RUNNER = `import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 const file = path.join(process.env.DATA_DIR, 'factory.db');
 const counts = d => Object.fromEntries(d.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").all()
   .map(r => [r.name, d.prepare('SELECT COUNT(*) AS n FROM "' + r.name.replace(/"/g, '""') + '"').get().n]));
+// The totals people work from: parts, stock on hand, set aside and firm (null: a database too old to have it).
+const one = (d, sql) => { try { const v = d.prepare(sql).get().v; return v == null ? 0 : Number(v); } catch { return null; } };
+const figures = d => ({ items: one(d, 'SELECT COUNT(*) AS v FROM items'), on_hand: one(d, 'SELECT SUM(on_hand) AS v FROM items'),
+  reserved: one(d, 'SELECT SUM(reserved) AS v FROM van_lines'), reserved_firm: one(d, 'SELECT SUM(reserved_firm) AS v FROM van_lines') });
 const pre = new DatabaseSync(file, { readOnly: true });
 const before = counts(pre);
+const figuresBefore = figures(pre);
 pre.close();
 const dbm = await import('./src/db.js');
 await import('./src/photos.js');
@@ -86,9 +93,10 @@ const status = tidyStatus();
 const stopped = STEPS.find(s => !dbm.getSetting('tidy_' + s.key + '_v1'));
 const label = Object.fromEntries(STEPS.map(s => [s.key, s.label]));
 const after = counts(dbm.db);
+const figuresAfter = figures(dbm.db);
 dbm.db.exec('PRAGMA journal_mode = DELETE');
 dbm.db.close();
-console.log('@@PREPARE ' + JSON.stringify({ before, after, steps: status.steps, done: status.done,
+console.log('@@PREPARE ' + JSON.stringify({ before, after, figures: { before: figuresBefore, after: figuresAfter }, steps: status.steps, done: status.done,
   stopped: stopped ? stopped.label : null, backupFailed: !!tidyResult.error,
   ran: (tidyResult.ran || []).map(r => ({ label: label[r.key], changed: Number(r.changed) })) }));
 process.exit(0);
@@ -129,6 +137,7 @@ function prepareCopy(dataDir) {
     return {
       tidy: r.ran.map(x => ({ label: x.label, changed: Number.isFinite(x.changed) ? x.changed : null })),
       tidySteps: r.steps,
+      figures: r.figures,
       rows: names.map(name => ({ name, before: r.before[name] ?? 0, after: r.after[name] ?? 0 })),
     };
   } finally {
@@ -397,7 +406,18 @@ export async function copyAll({ from, to, photosDir, photosTo, wipe = false, pre
           const present = wanted.filter(n => photos.names.has(n)).length;
           checks.push({ name: 'photos referenced by items: present', from: wanted.length, to: present, ok: present === wanted.length });
         }
-        const report = { tables, checks, ok: checks.every(x => x.ok),
+        // The clean-up's backup (settings.tidy_backup, shown on the Clean-up report) was taken inside the temporary
+        // copy, which is deleted when this ends: the target says where the data from before the clean-up really
+        // is instead — never a temp path. (After the value checks above, which compare the copy as it was.)
+        let tidyBackupNote = false;
+        if (tmp.prepared) {
+          const cur = (await c.query(`SELECT value FROM settings WHERE key = 'tidy_backup'`)).rows[0]?.value ?? '';
+          if (tmp.prepared.tidy.length || String(cur).startsWith(tmp.dir)) {
+            await c.query(`INSERT INTO settings(key, value) VALUES('tidy_backup', $1) ON CONFLICT (key) DO UPDATE SET value = excluded.value`, [TIDY_BACKUP_NOTE]);
+            tidyBackupNote = true;
+          }
+        }
+        const report = { tables, checks, ok: checks.every(x => x.ok), ...(tidyBackupNote ? { tidyBackupNote } : {}),
           ...(tmp.prepared ? { prepare: tmp.prepared } : {}), ...(photos?.skipped.length ? { photosSkipped: photos.skipped } : {}) };
         if (!report.ok) throw new ChecksFailed(report); // roll everything back
         return report;
@@ -441,6 +461,24 @@ export function formatReport(r) {
     out.push(`Stock clean-up: ${r.prepare.tidy.length} of ${r.prepare.tidySteps} step(s) ran now (the others had run before)`);
     for (const t of r.prepare.tidy) out.push(`  ${t.label} — ${t.changed ?? '?'} change(s)`);
     out.push('');
+    // Totals only (never a row): what the owner's figures look like before and after the start-up.
+    const f = r.prepare.figures;
+    if (f) {
+      const sign = d => (d > 0 ? `+${fmt(d)}` : fmt(d));
+      out.push('What the start-up and clean-up changed (original -> prepared, totals only):');
+      const row = (label, key, say) => {
+        const a = f.before?.[key], b = f.after?.[key];
+        if (a == null || b == null) return out.push(`  ${label.padEnd(w - 2)}${String(a ?? '-').padStart(14)}${String(b ?? '-').padStart(14)}  (not in the original)`);
+        const d = Math.round((b - a) * 1e6) / 1e6;
+        out.push(`  ${label.padEnd(w - 2)}${fmt(a).padStart(14)}${fmt(b).padStart(14)}  ${d === 0 ? 'no change' : say(d)}`);
+      };
+      row('items', 'items', d => (d > 0 ? `+${d} added` : `${d} fewer`));
+      row('on hand (all items)', 'on_hand', d => `${sign(d)} in total`);
+      row('set aside (reserved)', 'reserved', d => `${sign(d)} in total`);
+      row('firm (reserved_firm)', 'reserved_firm', d => `${sign(d)} in total`);
+      out.push('');
+    }
+    if (r.tidyBackupNote) out.push('Clean-up backup: the original data on the home PC (the temporary copy is not kept)', '');
   }
   if (r.photosSkipped) out.push(`Photos folder: ${r.photosSkipped.length} file(s) skipped (not .jpg): ${r.photosSkipped.join(', ')}`, '');
   out.push(line('Table', 'From', 'To'), ...r.tables.map(t => line(t.name, fmt(t.from), fmt(t.to), t.from === t.to ? 'ok' : 'DIFFERENT')), '');

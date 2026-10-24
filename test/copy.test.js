@@ -323,7 +323,33 @@ test('prepare: the copy is started once with the sqlite-final app first (stock c
     assert.equal(flags, report.prepare.tidySteps, 'every clean-up step is marked done in the target');
     assert.ok((await rows(d, `SELECT COUNT(*) AS n FROM allocation_log WHERE reason = 'tidy:supplier'`))[0].n >= 1);
     assert.ok((await rows(d, `SELECT COUNT(*) AS n FROM items`))[0].n > 2, 'syncCatalog added the starter catalogue parts');
+    // I6: the clean-up's backup was made on the temporary copy, which is gone: the target says where the
+    // original really is instead (never a temp path)
+    const [b] = await rows(d, `SELECT value FROM settings WHERE key = 'tidy_backup'`);
+    assert.equal(b.value, 'Backup from before the clean-up: the original data on the home PC (unchanged)');
+    // M8: the totals before (the original) and after the start-up, as the target now holds them
+    const [t] = await rows(d, `SELECT (SELECT COUNT(*) FROM items) AS items, (SELECT SUM(on_hand) FROM items) AS on_hand,
+      (SELECT SUM(reserved) FROM van_lines) AS reserved, (SELECT SUM(reserved_firm) FROM van_lines) AS reserved_firm`);
+    const round = x => Math.round(x * 1e6) / 1e6;
+    assert.deepEqual(Object.fromEntries(Object.entries(report.prepare.figures.after).map(([k, v]) => [k, round(v)])),
+      { items: t.items, on_hand: round(t.on_hand), reserved: round(t.reserved), reserved_firm: round(t.reserved_firm) });
   });
+  // the original's totals (fill() above): 2 items, 12.5 + 0.1 on hand, 3 + 0.1 + 2 set aside, 1.5 + 0 + 2 firm
+  const f = report.prepare.figures.before;
+  assert.deepEqual({ items: f.items, on_hand: Math.round(f.on_hand * 1e6) / 1e6, reserved: Math.round(f.reserved * 1e6) / 1e6, reserved_firm: f.reserved_firm },
+    { items: 2, on_hand: 12.6, reserved: 5.1, reserved_firm: 3.5 });
+  const text = formatReport(report);
+  const head = 'What the start-up and clean-up changed (original -> prepared, totals only):';
+  const lines = text.slice(text.indexOf(head)).split('\n').map(l => l.trim().split(/ {2,}/));
+  const row = name => lines.find(l => l[0] === name);
+  assert.ok(text.includes('What the start-up and clean-up changed (original -> prepared, totals only):'), text);
+  const added = report.prepare.figures.after.items - 2;
+  assert.deepEqual(row('items'), ['items', '2', String(report.prepare.figures.after.items), `+${added} added`]);
+  assert.deepEqual(row('on hand (all items)').slice(0, 2), ['on hand (all items)', '12.6']);
+  assert.deepEqual(row('set aside (reserved)').slice(0, 2), ['set aside (reserved)', '5.1']);
+  assert.deepEqual(row('firm (reserved_firm)').slice(0, 2), ['firm (reserved_firm)', '3.5']);
+  assert.match(row('on hand (all items)')[3], /^(no change|[+-]\d)/);
+  assert.doesNotMatch(text, /fs-copy-/, 'no temp path is printed');
   // nothing of the old code is left behind
   assert.deepEqual(fs.readdirSync(path.join(ROOT, 'node_modules', '.cache')).filter(n => n.startsWith('fs-sqlite-final-')), []);
 });
