@@ -1028,7 +1028,7 @@ async function renderPlan() {
   planData = data;
   if (!data.columns.length && !data.vans.length) {
     app.innerHTML = `<div class="page-head"><h1>Production plan</h1></div>
-      <div class="panel empty">Nothing here yet. Import your production plan spreadsheet under <a href="#/settings">Settings</a>, or load a dealer order.</div>`;
+      <div class="panel empty">Nothing here yet. Load a dealer order to add a van. (The production plan spreadsheet is imported on the original version of the app, not in this one.)</div>`;
     return;
   }
   const phone = isPhone();

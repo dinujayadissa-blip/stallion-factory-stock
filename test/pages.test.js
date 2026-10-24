@@ -217,3 +217,9 @@ test('the Pages build has the screens at the top, three.js and _routes.json, and
     assert.equal(fs.readFileSync(path.join(out, 'index.html'), 'utf8'), fs.readFileSync(path.join(root, 'views', 'index.html'), 'utf8'));
   } finally { fs.rmSync(out, { recursive: true, force: true }); }
 });
+
+test('the empty production plan screen does not offer a plan import (it is done on the original version)', () => {
+  const app = fs.readFileSync(path.join(root, 'public', 'app.js'), 'utf8');
+  assert.doesNotMatch(app, /Import your production plan spreadsheet/);
+  assert.match(app, /The production plan spreadsheet is imported on the original version of the app/);
+});
