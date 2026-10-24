@@ -16,10 +16,11 @@ export function apiUrl(env, pathname, search = '') {
 // must not choose itself, plus ours.
 export function upstreamHeaders(request, env) {
   const headers = new Headers(request.headers);
-  for (const h of ['host', 'x-pass-secret', 'x-region', 'x-forwarded-host', 'x-forwarded-for']) headers.delete(h);
+  for (const h of ['host', 'x-pass-secret', 'x-region', 'x-forwarded-host', 'x-forwarded-for', 'x-forwarded-proto']) headers.delete(h);
   headers.set('x-pass-secret', env.PASS_SECRET);
   headers.set('x-region', REGION);
   headers.set('x-forwarded-host', new URL(request.url).host);
+  headers.set('x-forwarded-proto', 'https'); // Pages is https only; the function's Secure-cookie decision needs it
   const ip = request.headers.get('cf-connecting-ip');
   if (ip) headers.set('x-forwarded-for', ip);
   return headers;

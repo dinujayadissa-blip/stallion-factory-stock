@@ -56,6 +56,7 @@ test('pass-through keeps cookies and body bytes', async () => {
     assert.equal(h.get('x-region'), 'ap-southeast-2');
     assert.equal(h.get('x-forwarded-host'), 'stallion-stock.pages.dev');
     assert.equal(h.get('x-forwarded-for'), '203.0.113.9');
+    assert.equal(h.get('x-forwarded-proto'), 'https');
     assert.equal(h.get('cookie'), 'fs_session=tok');
     assert.equal(h.get('content-type'), 'application/pdf');
     assert.equal(seen[0].init.method, 'POST');
@@ -157,16 +158,17 @@ test('office manifest is valid JSON with a 512 icon', () => {
   }
 });
 
-test('the Pages build has the screens at the top, the functions and three.js, and no views/ folder', () => {
+test('the Pages build has the screens at the top, three.js and _routes.json, and no views/ or functions/ folder', () => {
   const out = fs.mkdtempSync(path.join(os.tmpdir(), 'pages-'));
   try {
     build(out);
     const has = p => fs.existsSync(path.join(out, p));
     for (const f of ['index.html', 'floor.html', 'login.html', 'app.js', 'office.webmanifest', 'floor.webmanifest', 'assets/app/icon-512.png',
-      'functions/_middleware.js', 'functions/_forward.js', 'functions/api/[[path]].js', 'functions/photos/[[path]].js',
-      'vendor/three/build/three.module.js', 'vendor/three/addons/controls/OrbitControls.js', '_headers']) assert.ok(has(f), f);
+      'vendor/three/build/three.module.js', 'vendor/three/addons/controls/OrbitControls.js', '_headers', '_routes.json']) assert.ok(has(f), f);
+    assert.ok(!has('functions'), 'the root functions/ is what gets deployed, not a copy');
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(out, '_routes.json'), 'utf8')), { version: 1,
+      include: ['/', '/index.html', '/floor', '/floor.html', '/login', '/login.html', '/api/*', '/photos/*'], exclude: [] });
     assert.ok(!has('views'), 'views/ is not published as files');
     assert.equal(fs.readFileSync(path.join(out, 'index.html'), 'utf8'), fs.readFileSync(path.join(root, 'views', 'index.html'), 'utf8'));
-    assert.ok(!fs.readFileSync(path.join(out, 'functions', '_forward.js'), 'utf8').includes(ENV_BASE.PASS_SECRET));
   } finally { fs.rmSync(out, { recursive: true, force: true }); }
 });
