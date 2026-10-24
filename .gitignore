@@ -18,3 +18,7 @@ _testdata/
 .env
 .claude/
 .superpowers/
+
+# Cloudflare Pages build output and wrangler cache
+dist-pages/
+.wrangler/
