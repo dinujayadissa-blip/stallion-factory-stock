@@ -30,4 +30,10 @@ supabase/.branches/
 
 # Cloudflare Pages build output and wrangler cache
 dist-pages/
+
+# Cloud spike: tooling installed only under spike/, and the staged Supabase function copy
+spike/node_modules/
+supabase/functions/spike/
+supabase/.temp/
+supabase/.branches/
 .wrangler/
