@@ -203,3 +203,26 @@ test('item photos: saved, shown to a login, replaced, removed', async () => {
   assert.equal((await get('SELECT photo FROM items WHERE id = ?', item)).photo, '');
   assert.equal(fs.readdirSync(path.join(tmp, 'photos')).filter(f => f.startsWith(`${item}-`)).length, 0);
 });
+
+// M4: the office PC's server.js never starts on the cloud database by accident (two servers writing the same
+// data, start-up jobs run against the live copy): it stops with the reason unless --cloud-db is given.
+test('server.js refuses a Supabase database unless --cloud-db, and never prints the address', async () => {
+  const { spawnSync } = await import('node:child_process');
+  const { fileURLToPath } = await import('node:url');
+  const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const run = (env, args = []) => spawnSync(process.execPath, [path.join(root, 'server.js'), ...args], {
+    cwd: root, encoding: 'utf8', timeout: 20000,
+    env: { ...process.env, DATA_DIR: tmp, PORT: '0', DATABASE_URL: '', SUPABASE_URL: '', ...env },
+  });
+  const secretUrl = 'postgresql://postgres.abcdefghijklmnopqrst:not-a-real-password@aws-0-ap-southeast-2.pooler.supabase.com:6543/postgres';
+  for (const env of [{ DATABASE_URL: secretUrl }, { DATABASE_URL: 'postgres://postgres:pw@db.abcdefghijklmnopqrst.supabase.co:5432/postgres' },
+    { SUPABASE_URL: 'https://abcdefghijklmnopqrst.supabase.co' }]) {
+    const r = run(env);
+    assert.equal(r.status, 2, JSON.stringify(env) + r.stdout + r.stderr);
+    const said = r.stdout + r.stderr;
+    assert.match(said, /cloud database/i);
+    assert.match(said, /--cloud-db/);
+    assert.doesNotMatch(said, /not-a-real-password|pw@/, 'the address (with its password) is never printed');
+    assert.doesNotMatch(said, /Factory Stock is running/);
+  }
+});

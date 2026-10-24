@@ -10,6 +10,22 @@ import * as layout from './src/layout.js';
 import { assignMissingTrades } from './src/trades.js';
 import * as auth from './src/auth.js';
 
+// Never on the cloud database by accident: a second server writing the live data, and its start-up jobs run
+// against it. DATABASE_URL pointing at Supabase (or SUPABASE_URL set, as it is in the copy-day window) stops
+// here, before the database is opened, unless --cloud-db is given on purpose. (The address holds the
+// password: it is never printed.)
+const cloudDb = /\bsupabase\.(com|co)\b/i.test(process.env.DATABASE_URL || '') || !!String(process.env.SUPABASE_URL || '').trim();
+if (cloudDb && !process.argv.includes('--cloud-db')) {
+  console.error([
+    'Factory Stock did not start: this window is set up for the cloud database',
+    `(${String(process.env.SUPABASE_URL || '').trim() ? 'SUPABASE_URL is set' : 'DATABASE_URL points at Supabase'}).`,
+    'The office PC version must not run on the online data: the online app already does, and this one would',
+    'run its start-up jobs on it. Open a new window (the values set with $env: are gone there) and start it again.',
+    'Only if you really mean to run this server on the cloud database: node server.js --cloud-db',
+  ].join('\n'));
+  process.exit(2);
+}
+
 // PORT=0 picks any free port; unset = 3000.
 const PORT = process.env.PORT != null && String(process.env.PORT).trim() !== '' ? Number(process.env.PORT) : 3000;
 auth.setCookiePort(PORT);
