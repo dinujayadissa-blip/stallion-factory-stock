@@ -11,7 +11,7 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { makeDriver } from '../src/pg.js';
-import { copyAll } from '../scripts/copy-to-cloud.js';
+import { copyAll, formatReport } from '../scripts/copy-to-cloud.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const VENDORED = path.join(ROOT, 'scripts', 'sqlite-final', 'db.js');
@@ -98,7 +98,7 @@ test('vendored sqlite-final db.js is the tagged one', () => {
 test('copy matches every check', async () => {
   const before = sha(SRC);
   const to = path.join(tmp('to'), 'pg');
-  const report = await copyAll({ from: SRC, to });
+  const report = await copyAll({ from: SRC, prepare: false, to });
   assert.equal(report.ok, true, JSON.stringify(report.checks.filter(c => !c.ok)));
   assert.equal(sha(SRC), before, 'the source file is never changed');
 
@@ -135,13 +135,13 @@ test('copy matches every check', async () => {
 
 test('refuses a non-empty target without --wipe', async () => {
   const to = path.join(tmp('to'), 'pg');
-  assert.equal((await copyAll({ from: SRC, to })).ok, true);
-  await assert.rejects(copyAll({ from: SRC, to }), /not empty.*--wipe/s);
+  assert.equal((await copyAll({ from: SRC, prepare: false, to })).ok, true);
+  await assert.rejects(copyAll({ from: SRC, prepare: false, to }), /not empty.*--wipe/s);
   await withTarget(to, async d => {
     assert.equal((await rows(d, 'SELECT COUNT(*) AS n FROM vans'))[0].n, 2, 'left as it was');
     await d.query(`INSERT INTO vans(chassis) VALUES('TEST-EXTRA')`);
   });
-  const report = await copyAll({ from: SRC, to, wipe: true });
+  const report = await copyAll({ from: SRC, prepare: false, to, wipe: true });
   assert.equal(report.ok, true);
   assert.equal(report.tables.find(x => x.name === 'vans').to, 2, 'wiped first, not added on top');
   await withTarget(to, async d => {
@@ -153,7 +153,7 @@ test('refuses a non-empty target without --wipe', async () => {
 test('next movement id is above every copied one', async () => {
   // copied ids go up to 5, a count noted movement 9, and the undone movement 12 had been given out
   const to = path.join(tmp('to'), 'pg');
-  const report = await copyAll({ from: SRC, to });
+  const report = await copyAll({ from: SRC, prepare: false, to });
   assert.ok(report.checks.some(c => c.name === 'next movement id' && c.ok && c.to === 13));
   await withTarget(to, async d => {
     const [m] = await rows(d, `INSERT INTO movements(item_id, qty, type) VALUES(3, 1, 'receive') RETURNING id`);
@@ -184,7 +184,7 @@ test('a database behind the code is brought up to date on a temporary copy first
   d.close();
   const before = sha(from);
   const to = path.join(tmp('to'), 'pg');
-  const report = await copyAll({ from, to });
+  const report = await copyAll({ from, prepare: false, to });
   assert.equal(report.ok, true, JSON.stringify(report.checks.filter(c => !c.ok)));
   assert.equal(sha(from), before, 'the source file is never changed');
   assert.equal(report.tables.find(x => x.name === 'users').from, 0);
@@ -209,7 +209,7 @@ test('a failed load leaves the target unchanged', async () => {
       await t.query(fs.readFileSync(path.join(ROOT, 'supabase', 'migrations', f), 'utf8'));
     }
   });
-  await assert.rejects(copyAll({ from, to }), e => /Loading vans failed: .*integer/.test(e.message) && !/soon/.test(e.message));
+  await assert.rejects(copyAll({ from, prepare: false, to }), e => /Loading vans failed: .*integer/.test(e.message) && !/soon/.test(e.message));
   await withTarget(to, async t => {
     assert.equal((await rows(t, 'SELECT COUNT(*) AS n FROM items'))[0].n, 0);
     assert.equal((await rows(t, `SELECT value FROM settings WHERE key = 'data_version'`))[0].value, '0');
@@ -220,26 +220,37 @@ test('photos are copied under the same names (local folder)', async () => {
   const photos = tmp('photos');
   fs.writeFileSync(path.join(photos, '3-100.jpg'), Buffer.from([0xff, 0xd8, 0xff, 1, 2, 3]));
   fs.writeFileSync(path.join(photos, '3-100-t.jpg'), Buffer.from([0xff, 0xd8, 0xff, 4]));
+  fs.writeFileSync(path.join(photos, 'Thumbs.db'), 'not a photo');
   const base = tmp('to');
-  const report = await copyAll({ from: SRC, to: path.join(base, 'pg'), photosDir: photos });
+  const report = await copyAll({ from: SRC, prepare: false, to: path.join(base, 'pg'), photosDir: photos });
   assert.equal(report.ok, true);
   assert.deepEqual(report.checks.find(c => c.name === 'photos'), { name: 'photos', from: 2, to: 2, ok: true });
+  assert.deepEqual(report.checks.find(c => c.name === 'photos referenced by items: present'),
+    { name: 'photos referenced by items: present', from: 2, to: 2, ok: true });
+  assert.deepEqual(report.photosSkipped, ['Thumbs.db']);
+  assert.match(formatReport(report), /1 file\(s\) skipped \(not \.jpg\): Thumbs\.db/);
   assert.deepEqual(fs.readdirSync(path.join(base, 'photos')).sort(), ['3-100-t.jpg', '3-100.jpg']);
   assert.equal(sha(path.join(base, 'photos', '3-100.jpg')), sha(path.join(photos, '3-100.jpg')));
 });
 
-test('photos go to Storage when SUPABASE_URL is set', async () => {
+test('photos go to Storage when SUPABASE_URL is set; a missing photo fails the checks', async () => {
   const photos = tmp('photos');
+  // item 3 points at 3-100.jpg (and its thumbnail 3-100-t.jpg), which are not in this folder
   fs.writeFileSync(path.join(photos, '7-200.jpg'), Buffer.from([0xff, 0xd8, 0xff, 9]));
   const calls = [];
+  const to = path.join(tmp('to'), 'pg');
   const oldFetch = globalThis.fetch;
   const oldEnv = { url: process.env.SUPABASE_URL, key: process.env.SUPABASE_SERVICE_ROLE_KEY };
   globalThis.fetch = async (url, init) => { calls.push({ url: String(url), init }); return new Response('{}', { status: 200 }); };
   process.env.SUPABASE_URL = 'https://example.test';
   process.env.SUPABASE_SERVICE_ROLE_KEY = 'test-key';
   try {
-    const report = await copyAll({ from: SRC, to: path.join(tmp('to'), 'pg'), photosDir: photos });
-    assert.equal(report.ok, true);
+    const report = await copyAll({ from: SRC, prepare: false, to, photosDir: photos });
+    assert.equal(report.ok, false);
+    assert.equal(report.rolledBack, true);
+    assert.deepEqual(report.checks.find(c => c.name === 'photos referenced by items: present'),
+      { name: 'photos referenced by items: present', from: 2, to: 0, ok: false });
+    assert.match(formatReport(report), /CHECKS FAILED — nothing to switch to/);
   } finally {
     globalThis.fetch = oldFetch;
     if (oldEnv.url === undefined) delete process.env.SUPABASE_URL; else process.env.SUPABASE_URL = oldEnv.url;
@@ -254,4 +265,29 @@ test('photos go to Storage when SUPABASE_URL is set', async () => {
   assert.equal(h.get('content-type'), 'image/jpeg');
   assert.equal(h.get('x-upsert'), 'true');
   assert.deepEqual(Buffer.from(calls[0].init.body), Buffer.from([0xff, 0xd8, 0xff, 9]));
+  // failed checks keep nothing — here not even the schema the copy put into the new PGlite folder
+  await withTarget(to, async d => assert.equal((await rows(d, `SELECT to_regclass('public.vans') IS NULL AS gone`))[0].gone, true));
+});
+
+test('prepare: the copy is started once with the sqlite-final app first (stock clean-up and all)', async () => {
+  // item 7 (TST-2) has no supplier, but its PO line is on a "Test Supplier" PO: the clean-up step
+  // "Blank suppliers filled from the part's purchase orders" fills it in
+  const before = sha(SRC);
+  const to = path.join(tmp('to'), 'pg');
+  const report = await copyAll({ from: SRC, to });
+  assert.equal(report.ok, true, JSON.stringify(report.checks.filter(c => !c.ok)));
+  assert.equal(sha(SRC), before, 'the source file is never changed');
+  const step = report.prepare.tidy.find(t => /Blank suppliers filled/.test(t.label));
+  assert.ok(step && step.changed >= 1, 'the supplier step ran and changed something');
+  assert.equal(report.prepare.tidy.length, report.prepare.tidySteps, 'every clean-up step ran');
+  assert.match(formatReport(report), /Blank suppliers filled from the part's purchase orders — \d+ change\(s\)/);
+  await withTarget(to, async d => {
+    assert.equal((await rows(d, `SELECT supplier FROM items WHERE sku = 'TST-2'`))[0].supplier, 'Test Supplier');
+    const flags = (await rows(d, `SELECT COUNT(*) AS n FROM settings WHERE key LIKE 'tidy%v1' AND value <> ''`))[0].n;
+    assert.equal(flags, report.prepare.tidySteps, 'every clean-up step is marked done in the target');
+    assert.ok((await rows(d, `SELECT COUNT(*) AS n FROM allocation_log WHERE reason = 'tidy:supplier'`))[0].n >= 1);
+    assert.ok((await rows(d, `SELECT COUNT(*) AS n FROM items`))[0].n > 2, 'syncCatalog added the starter catalogue parts');
+  });
+  // nothing of the old code is left behind
+  assert.deepEqual(fs.readdirSync(path.join(ROOT, 'node_modules', '.cache')).filter(n => n.startsWith('fs-sqlite-final-')), []);
 });

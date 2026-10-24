@@ -2,8 +2,11 @@
 // id, then check the copy against the original.
 //
 //   node scripts/copy-to-cloud.js --from <factory.db> --to <postgres://… | PGlite folder>
-//                                 [--photos <photos folder>] [--photos-to <folder>] [--wipe]
+//                                 [--photos <photos folder>] [--photos-to <folder>] [--wipe] [--no-prepare]
 //
+// - First, unless --no-prepare: the temporary copy is started once with the whole sqlite-final app's
+//   start-up (stock clean-up, catalogue updates, trades, layout, reminders — see prepareCopy below),
+//   as the old server would on its next start, so the cloud gets the data in its finished shape.
 // - The source file is never changed: it is copied (VACUUM INTO) to a temporary folder, and the SQLite
 //   code as it was before the cloud move (scripts/sqlite-final/db.js, the `sqlite-final` tag's
 //   src/db.js, byte for byte) is run on that copy, so a database that missed some start-up migrations
@@ -26,6 +29,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { makeDriver } from '../src/pg.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
+const SQLITE_FINAL_TAG = 'sqlite-final';
 const SQLITE_FINAL_DB_JS = path.join(HERE, 'sqlite-final', 'db.js');
 const MIGRATIONS = path.join(HERE, '..', 'supabase', 'migrations');
 const BATCH = 500;
@@ -33,24 +37,127 @@ const q = name => `"${String(name).replace(/"/g, '""')}"`;
 const isUrl = to => /^postgres(ql)?:\/\//i.test(String(to));
 
 // ── The source: a brought-up-to-date temporary copy ──
-function upgradedCopy(from) {
+// Anything a child process says on failure goes through this first: it could quote a value.
+const redact = s => String(s ?? '').trim().split('\n')[0].replace(/"[^"]*"/g, '"…"').replace(/'[^']*'/g, "'…'").slice(0, 300);
+
+// "Prepare": start the old app's start-up once on the temp copy, exactly as server.js at the
+// sqlite-final tag does before it listens — so a live database that never ran those steps (the stock
+// clean-up, new catalogue items, trades, the floor layout, drawing reminders) gets them before it moves.
+// The old src/ (and package.json, for "type": "module") come out of the tag with `git show`; they are
+// put under node_modules/.cache so Node finds this checkout's node_modules for them (express, exceljs,
+// pdfjs-dist, xlsx, three — the same versions the tag's package-lock has). The runner below imports the
+// same modules server.js imports, in the same order, then calls server.js's start-up lines 22–29:
+//   seed(); syncCatalog(); assignMissingTrades(); layout.seedLayout(); layout.drawingRemindersAll();
+//   runTidy(); and assignMissingTrades() again when the clean-up ran.
+// It only reports counts and the clean-up steps' fixed labels.
+const RUNNER = `import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+const file = path.join(process.env.DATA_DIR, 'factory.db');
+const counts = d => Object.fromEntries(d.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").all()
+  .map(r => [r.name, d.prepare('SELECT COUNT(*) AS n FROM "' + r.name.replace(/"/g, '""') + '"').get().n]));
+const pre = new DatabaseSync(file, { readOnly: true });
+const before = counts(pre);
+pre.close();
+const dbm = await import('./src/db.js');
+await import('./src/photos.js');
+await import('./src/webImage.js');
+const layout = await import('./src/layout.js');
+const { seed, syncCatalog } = await import('./src/seed.js');
+await import('./src/importPlan.js');
+await import('./src/golive.js');
+await import('./src/parseOrder.js');
+await import('./src/rules.js');
+await import('./src/inventory.js');
+await import('./src/exportXlsx.js');
+const { assignMissingTrades } = await import('./src/trades.js');
+const { runTidy, tidyStatus, STEPS } = await import('./src/tidy.js');
+await import('./src/relink.js');
+await import('./src/auth.js');
+seed();
+syncCatalog();
+assignMissingTrades();
+layout.seedLayout();
+layout.drawingRemindersAll();
+const tidyResult = runTidy({ log: () => {} });
+if (tidyResult.ran?.length) assignMissingTrades();
+const status = tidyStatus();
+const stopped = STEPS.find(s => !dbm.getSetting('tidy_' + s.key + '_v1'));
+const label = Object.fromEntries(STEPS.map(s => [s.key, s.label]));
+const after = counts(dbm.db);
+dbm.db.exec('PRAGMA journal_mode = DELETE');
+dbm.db.close();
+console.log('@@PREPARE ' + JSON.stringify({ before, after, steps: status.steps, done: status.done,
+  stopped: stopped ? stopped.label : null, backupFailed: !!tidyResult.error,
+  ran: (tidyResult.ran || []).map(r => ({ label: label[r.key], changed: Number(r.changed) })) }));
+process.exit(0);
+`;
+
+function prepareCopy(dataDir) {
+  const repo = path.join(HERE, '..');
+  const git = (args, opts = {}) => execFileSync('git', args, { cwd: repo, stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 256 << 20, ...opts });
+  let files;
+  try {
+    files = git(['ls-tree', '-r', '--name-only', SQLITE_FINAL_TAG, '--', 'src', 'package.json'], { encoding: 'utf8' }).split('\n').filter(Boolean);
+  } catch { files = []; }
+  if (!files.includes('package.json') || !files.includes('src/tidy.js')) {
+    throw new Error(`Preparing the copy needs the git tag ${SQLITE_FINAL_TAG} in this checkout (or --no-prepare, for a copy that has already been started once with the sqlite-final app)`);
+  }
+  fs.mkdirSync(path.join(repo, 'node_modules', '.cache'), { recursive: true });
+  const code = fs.mkdtempSync(path.join(repo, 'node_modules', '.cache', 'fs-sqlite-final-'));
+  try {
+    for (const f of files) {
+      fs.mkdirSync(path.dirname(path.join(code, f)), { recursive: true });
+      fs.writeFileSync(path.join(code, f), git(['show', `${SQLITE_FINAL_TAG}:${f}`]));
+    }
+    fs.writeFileSync(path.join(code, 'prepare-runner.mjs'), RUNNER);
+    let out;
+    try {
+      out = execFileSync(process.execPath, [path.join(code, 'prepare-runner.mjs')], {
+        cwd: code, env: { ...process.env, DATA_DIR: dataDir, PORT: '0' }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 256 << 20,
+      });
+    } catch (e) {
+      throw new Error(`Preparing the copy (the sqlite-final start-up) failed: ${redact(String(e.stderr || '').split('\n').find(l => /Error/.test(l)) || e.message)}`);
+    }
+    const line = out.split('\n').find(l => l.startsWith('@@PREPARE '));
+    if (!line) throw new Error('Preparing the copy (the sqlite-final start-up) ended without reporting back');
+    const r = JSON.parse(line.slice('@@PREPARE '.length));
+    if (r.backupFailed) throw new Error('Preparing the copy failed: the stock clean-up could not make its backup, so it did not run');
+    if (r.stopped || r.done < r.steps) throw new Error(`Preparing the copy failed: the stock clean-up stopped at "${r.stopped}" (${r.done} of ${r.steps} steps done)`);
+    const names = [...new Set([...Object.keys(r.before), ...Object.keys(r.after)])].sort();
+    return {
+      tidy: r.ran.map(x => ({ label: x.label, changed: Number.isFinite(x.changed) ? x.changed : null })),
+      tidySteps: r.steps,
+      rows: names.map(name => ({ name, before: r.before[name] ?? 0, after: r.after[name] ?? 0 })),
+    };
+  } finally {
+    fs.rmSync(code, { recursive: true, force: true, maxRetries: 5 });
+  }
+}
+
+function upgradedCopy(from, { prepare = true } = {}) {
   if (!fs.existsSync(from)) throw new Error(`No database at --from ${from}`);
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fs-copy-'));
   const file = path.join(dir, 'factory.db');
-  const src = new DatabaseSync(from, { readOnly: true });
-  try { src.exec(`VACUUM INTO '${file.replace(/\\/g, '/').replace(/'/g, "''")}'`); } finally { src.close(); }
-  // The old db.js opens DATA_DIR/factory.db and runs its CREATE TABLE IF NOT EXISTS / addColumn steps.
-  // A child process, so the file is closed (and the temp folder removable) when it ends.
-  fs.copyFileSync(SQLITE_FINAL_DB_JS, path.join(dir, 'sqlite-final-db.mjs'));
-  fs.writeFileSync(path.join(dir, 'upgrade.mjs'),
-    `const m = await import('./sqlite-final-db.mjs');\nm.db.exec('PRAGMA journal_mode = DELETE');\nm.db.close();\n`);
   try {
-    execFileSync(process.execPath, [path.join(dir, 'upgrade.mjs')], { env: { ...process.env, DATA_DIR: dir }, stdio: ['ignore', 'pipe', 'pipe'] });
+    const src = new DatabaseSync(from, { readOnly: true });
+    try { src.exec(`VACUUM INTO '${file.replace(/\\/g, '/').replace(/'/g, "''")}'`); } finally { src.close(); }
+    const prepared = prepare ? prepareCopy(dir) : null;
+    // The old db.js opens DATA_DIR/factory.db and runs its CREATE TABLE IF NOT EXISTS / addColumn steps
+    // (after a prepare that has already happened, so this changes nothing then). A child process, so the
+    // file is closed (and the temp folder removable) when it ends.
+    fs.copyFileSync(SQLITE_FINAL_DB_JS, path.join(dir, 'sqlite-final-db.mjs'));
+    fs.writeFileSync(path.join(dir, 'upgrade.mjs'),
+      `const m = await import('./sqlite-final-db.mjs');\nm.db.exec('PRAGMA journal_mode = DELETE');\nm.db.close();\n`);
+    try {
+      execFileSync(process.execPath, [path.join(dir, 'upgrade.mjs')], { env: { ...process.env, DATA_DIR: dir }, stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (e) {
+      throw new Error(`Bringing the copy up to date failed: ${redact(e.stderr || e.message)}`);
+    }
+    return { dir, file, prepared };
   } catch (e) {
     fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
-    throw new Error(`Bringing the copy up to date failed: ${String(e.stderr || e.message).trim().split('\n')[0]}`);
+    throw e;
   }
-  return { dir, file };
 }
 
 function readSource(file) {
@@ -134,10 +241,12 @@ const srcMap = (db, sql) => new Map(db.prepare(sql).all().map(r => [String(r.k),
 const tgtMap = async (c, sql) => new Map((await c.query(sql)).rows.map(r => [String(r.k), r.v]));
 
 // ── Photos ──
-const TYPES = { '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp' };
+// Only JPEGs: the app saves nothing else (savePhoto refuses other files), so anything else is left out.
+const isJpeg = name => /\.jpe?g$/i.test(name);
 async function copyPhotos(dir, { to, photosTo }) {
   if (!fs.statSync(dir, { throwIfNoEntry: false })?.isDirectory()) throw new Error(`No photos folder at --photos ${dir}`);
-  const names = fs.readdirSync(dir, { withFileTypes: true }).filter(e => e.isFile()).map(e => e.name).sort();
+  const all = fs.readdirSync(dir, { withFileTypes: true }).filter(e => e.isFile()).map(e => e.name).sort();
+  const names = all.filter(isJpeg), skipped = all.filter(n => !isJpeg(n));
   let done = 0;
   const base = process.env.SUPABASE_URL, key = process.env.SUPABASE_SERVICE_ROLE_KEY;
   if (!photosTo && base) {
@@ -147,7 +256,7 @@ async function copyPhotos(dir, { to, photosTo }) {
       for (let name; (name = queue.shift()) !== undefined;) {
         const res = await fetch(`${base.replace(/\/+$/, '')}/storage/v1/object/item-photos/${encodeURIComponent(name)}`, {
           method: 'POST',
-          headers: { Authorization: `Bearer ${key}`, apikey: key, 'Content-Type': TYPES[path.extname(name).toLowerCase()] || 'image/jpeg', 'x-upsert': 'true' },
+          headers: { Authorization: `Bearer ${key}`, apikey: key, 'Content-Type': 'image/jpeg', 'x-upsert': 'true' },
           body: fs.readFileSync(path.join(dir, name)),
         });
         if (!res.ok) throw new Error(`Uploading photo ${name} failed: HTTP ${res.status} ${(await res.text().catch(() => '')).slice(0, 200)}`);
@@ -161,7 +270,7 @@ async function copyPhotos(dir, { to, photosTo }) {
     fs.mkdirSync(dest, { recursive: true });
     for (const name of names) { fs.copyFileSync(path.join(dir, name), path.join(dest, name)); done++; }
   }
-  return { name: 'photos', from: names.length, to: done, ok: done === names.length };
+  return { check: { name: 'photos', from: names.length, to: done, ok: done === names.length }, skipped, names: new Set(names) };
 }
 
 class ChecksFailed extends Error {
@@ -169,9 +278,9 @@ class ChecksFailed extends Error {
 }
 
 // ── The copy ──
-export async function copyAll({ from, to, photosDir, photosTo, wipe = false } = {}) {
+export async function copyAll({ from, to, photosDir, photosTo, wipe = false, prepare = true } = {}) {
   if (!from || !to) throw new Error('copyAll needs from and to');
-  const tmp = upgradedCopy(path.resolve(from));
+  const tmp = upgradedCopy(path.resolve(from), { prepare });
   let src, drv;
   try {
     src = readSource(tmp.file);
@@ -183,7 +292,7 @@ export async function copyAll({ from, to, photosDir, photosTo, wipe = false } = 
       const full = await nonEmpty(drv, Object.keys((await targetInfo(drv)).cols));
       if (full.length) throw refuse(full);
     }
-    const photoCheck = photosDir ? await copyPhotos(photosDir, { to, photosTo }) : null;
+    const photos = photosDir ? await copyPhotos(photosDir, { to, photosTo }) : null;
 
     try {
       return await drv.begin(async c => {
@@ -277,8 +386,16 @@ export async function copyAll({ from, to, photosDir, photosTo, wipe = false } = 
         // The load is one write: screens that are open see the data version move on.
         await c.query(`INSERT INTO settings(key, value) VALUES('data_version', $1) ON CONFLICT (key) DO UPDATE SET value = excluded.value`, [String(version + 1)]);
 
-        if (photoCheck) checks.push(photoCheck);
-        const report = { tables, checks, ok: checks.every(x => x.ok) };
+        if (photos) {
+          checks.push(photos.check);
+          // every photo a part points at is in the folder: the picture and its thumbnail (<name>-t.jpg)
+          const wanted = src.db.prepare(`SELECT photo FROM items WHERE photo <> ''`).all()
+            .flatMap(r => [r.photo, r.photo.replace(/\.jpg$/i, '-t.jpg')]);
+          const present = wanted.filter(n => photos.names.has(n)).length;
+          checks.push({ name: 'photos referenced by items: present', from: wanted.length, to: present, ok: present === wanted.length });
+        }
+        const report = { tables, checks, ok: checks.every(x => x.ok),
+          ...(tmp.prepared ? { prepare: tmp.prepared } : {}), ...(photos?.skipped.length ? { photosSkipped: photos.skipped } : {}) };
         if (!report.ok) throw new ChecksFailed(report); // roll everything back
         return report;
       });
@@ -299,11 +416,12 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--wipe') o.wipe = true;
+    else if (a === '--no-prepare') o.prepare = false;
     else if (['--from', '--to', '--photos', '--photos-to'].includes(a) && argv[i + 1] !== undefined) {
       o[{ '--from': 'from', '--to': 'to', '--photos': 'photosDir', '--photos-to': 'photosTo' }[a]] = argv[++i];
     } else throw new Error(`Unknown or incomplete option: ${a}`);
   }
-  if (!o.from || !o.to) throw new Error('Usage: node scripts/copy-to-cloud.js --from <factory.db> --to <postgres://… | PGlite folder> [--photos <folder>] [--photos-to <folder>] [--wipe]');
+  if (!o.from || !o.to) throw new Error('Usage: node scripts/copy-to-cloud.js --from <factory.db> --to <postgres://… | PGlite folder> [--photos <folder>] [--photos-to <folder>] [--wipe] [--no-prepare]');
   return o;
 }
 
@@ -311,7 +429,18 @@ export function formatReport(r) {
   const fmt = v => (typeof v === 'number' ? String(Math.round(v * 1e6) / 1e6) : String(v));
   const w = Math.max(28, ...r.tables.map(t => t.name.length + 2), ...r.checks.map(c => c.name.length + 2));
   const line = (a, b, c, d = '') => `${a.padEnd(w)}${b.padStart(14)}${c.padStart(14)}  ${d}`;
-  const out = [line('Table', 'From', 'To'), ...r.tables.map(t => line(t.name, fmt(t.from), fmt(t.to), t.from === t.to ? 'ok' : 'DIFFERENT')), ''];
+  const out = [];
+  if (r.prepare) {
+    out.push('Start-up of the sqlite-final app on the temporary copy (rows before -> after, changed tables only):');
+    const moved = r.prepare.rows.filter(x => x.before !== x.after);
+    for (const x of moved) out.push(`  ${x.name.padEnd(w - 2)}${String(x.before).padStart(14)}${String(x.after).padStart(14)}`);
+    if (!moved.length) out.push('  (no table changed)');
+    out.push(`Stock clean-up: ${r.prepare.tidy.length} of ${r.prepare.tidySteps} step(s) ran now (the others had run before)`);
+    for (const t of r.prepare.tidy) out.push(`  ${t.label} — ${t.changed ?? '?'} change(s)`);
+    out.push('');
+  }
+  if (r.photosSkipped) out.push(`Photos folder: ${r.photosSkipped.length} file(s) skipped (not .jpg): ${r.photosSkipped.join(', ')}`, '');
+  out.push(line('Table', 'From', 'To'), ...r.tables.map(t => line(t.name, fmt(t.from), fmt(t.to), t.from === t.to ? 'ok' : 'DIFFERENT')), '');
   out.push(line('Check', 'From', 'To'));
   for (const c of r.checks) out.push(line(c.name, fmt(c.from), fmt(c.to), (c.ok ? 'ok' : 'FAILED') + (c.detail ? ` (${c.detail.join(', ')})` : '')));
   out.push('');
