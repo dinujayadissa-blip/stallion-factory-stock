@@ -119,3 +119,31 @@ test('inTx is true only inside tx / writeTx', async () => {
   await writeTx(async () => { assert.equal(inTx(), true); });
   assert.equal(inTx(), false);
 });
+
+test('writeTx { bump: false }: locked and all-or-nothing, but no new data_version (unless a bumping one joins)', async () => {
+  const v0 = Number(await dataVersion());
+  await writeTx(() => newItem('NB1'), { bump: false });
+  assert.equal(Number(await dataVersion()), v0);
+  assert.equal(await count('items'), 1);
+  await assert.rejects(writeTx(async () => { await newItem('NB2'); throw new Error('stop'); }, { bump: false }), /stop/);
+  assert.equal(await count('items'), 1);
+  // a bumping writeTx inside a non-bumping one: one bump, at the end
+  await writeTx(async () => { await writeTx(() => newItem('NB3')); await writeTx(() => newItem('NB4'), { bump: false }); }, { bump: false });
+  assert.equal(Number(await dataVersion()), v0 + 1);
+  // a non-bumping one inside a bumping one: still the one bump
+  await writeTx(async () => { await writeTx(() => newItem('NB5'), { bump: false }); });
+  assert.equal(Number(await dataVersion()), v0 + 2);
+  // inside a plain tx(): a non-bumping writeTx takes the lock, a later bumping one still bumps (once)
+  await tx(async () => { await writeTx(() => newItem('NB6'), { bump: false }); await writeTx(() => newItem('NB7')); await writeTx(() => newItem('NB8')); });
+  assert.equal(Number(await dataVersion()), v0 + 3);
+});
+
+test('migrate builds an empty database once, and leaves a built one alone', async () => {
+  const { migrate, openDb } = await import('../src/db.js');
+  assert.equal(await migrate(), false); // freshDb already applied the migrations
+  await openDb({ pgliteDir: 'memory://' }); // brand new, no tables
+  assert.equal(await migrate(), true);
+  assert.equal(await dataVersion(), '0');
+  assert.equal(await count('items'), 0);
+  assert.equal(await migrate(), false);
+});

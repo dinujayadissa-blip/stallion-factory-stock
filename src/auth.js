@@ -2,7 +2,7 @@
 //
 // The table API_RULES below is the one place that says which job role may use which /api route.
 // It is read top to bottom; the first line that matches the method + path wins. Any /api route that is
-// not in the table is owner-only (default deny) — so a new route added to server.js without a line here
+// not in the table is owner-only (default deny) — so a new route added to src/app.js without a line here
 // only works for the owner until someone decides who else may use it.
 //
 // Only node:crypto is used (no extra packages): scrypt for passwords, random 32-byte session tokens of
@@ -45,7 +45,7 @@ export const API_RULES = [
   ['POST', '/api/login', PUBLIC],
   ['POST', '/api/logout', PUBLIC],
   ['GET', '/api/setup', PUBLIC],
-  ['POST', '/api/setup', PUBLIC],        // only works with no logins yet, from this PC itself (checked in server.js)
+  ['POST', '/api/setup', PUBLIC],        // only works with no logins yet, from this PC itself (checked in src/app.js)
   // ── my own login ──
   ['GET', '/api/me', SESSION],
   ['POST', '/api/me/password', SESSION],
@@ -54,7 +54,7 @@ export const API_RULES = [
   ['*', '/api/users/:id', OWNER],
   ['*', '/api/users/:id/:action', OWNER],
 
-  // ── worker app (/floor): everyone. A worker only ever sees their own trade (forced in server.js) ──
+  // ── worker app (/floor): everyone. A worker only ever sees their own trade (forced in src/app.js) ──
   ['GET', '/api/trades', ALL],
   ['GET', '/api/floor/vans', ALL],
   ['GET', '/api/floor/vans/:id', ALL],
@@ -63,9 +63,9 @@ export const API_RULES = [
   ['GET', '/api/floor/waiting', ALL],
   ['POST', '/api/floor/take', ALL],
   ['POST', '/api/floor/extra', ALL],
-  ['POST', '/api/floor/undo', ALL],              // a worker: only their own takes (checked in server.js)
+  ['POST', '/api/floor/undo', ALL],              // a worker: only their own takes (checked in src/app.js)
   ['POST', '/api/floor/receive', ALL],           // book in a delivery
-  ['POST', '/api/floor/receive/undo', ALL],      // a worker: only their own bookings (checked in server.js)
+  ['POST', '/api/floor/receive/undo', ALL],      // a worker: only their own bookings (checked in src/app.js)
   ['POST', '/api/floor/items/:id/place', ALL],   // Find a part → Set place (rack / shelf)
   ['GET', '/api/items', ALL],                    // part search on the phone
   // (office lists under /api/items/… — the literal names win over /api/items/:id, see apiRule)
@@ -490,8 +490,10 @@ export const clearCookie = ({ secure = false } = {}) => `${COOKIE}=; Path=/; Htt
 // minutes; 30 wrong tries from one address within 15 minutes → that address is locked for 15 minutes.
 // A row per key: 'u:<ip>|<username lower-cased>' or 'i:<ip>'. fails/first_at count the wrong tries in the
 // current 15-minute window (it starts at the first wrong try); locked_until is ms (0 = not locked).
-// Everything that changes a row runs in writeTx, so concurrent wrong tries are counted one by one.
+// Everything that changes a row runs in writeTx, so concurrent wrong tries are counted one by one — without a
+// new data_version ({ bump: false }): no screen shows these rows, so a wrong password refreshes nothing.
 
+const NO_BUMP = { bump: false };
 export const WRONG = 'Wrong username or password';
 export const LOCKED = 'Too many tries — wait 15 minutes';
 
@@ -524,9 +526,9 @@ export function createThrottle({ perUser = 5, perIp = 30, windowMs = 15 * 60 * 1
         const u = await bump(uKey(ip, user), perUser, now);
         const i = await bump(iKey(ip), perIp, now);
         return Math.min(u, i);
-      });
+      }, NO_BUMP);
     },
-    success(ip, user) { return writeTx(async () => { await run('DELETE FROM login_throttle WHERE key = ?', uKey(ip, user)); }); },
+    success(ip, user) { return writeTx(async () => { await run('DELETE FROM login_throttle WHERE key = ?', uKey(ip, user)); }, NO_BUMP); },
     // Usernames locked right now (from any address) → when the lock ends: for the Logins page.
     async lockedUsers(now = Date.now()) {
       const out = new Map();
@@ -539,9 +541,9 @@ export function createThrottle({ perUser = 5, perIp = 30, windowMs = 15 * 60 * 1
     // The owner's Unlock (and a password reset): every address's lock and wrong tries for this username.
     unlockUser(user) {
       const n = String(user).trim().toLowerCase();
-      return writeTx(async () => { await run(`DELETE FROM login_throttle WHERE left(key, 2) = 'u:' AND substr(key, strpos(key, '|') + 1) = ?`, n); });
+      return writeTx(async () => { await run(`DELETE FROM login_throttle WHERE left(key, 2) = 'u:' AND substr(key, strpos(key, '|') + 1) = ?`, n); }, NO_BUMP);
     },
-    clear() { return writeTx(async () => { await run('DELETE FROM login_throttle'); }); },
+    clear() { return writeTx(async () => { await run('DELETE FROM login_throttle'); }, NO_BUMP); },
   };
 }
 
@@ -558,11 +560,13 @@ export async function login({ username, password, ip = '', ua = '' }, throttle, 
     // says nothing about which usernames exist.
     throw httpError(401, WRONG, { left, ...(left === 0 ? { until: await throttle.lockedUntil(ip, uname, now) } : {}) });
   }
-  await throttle.success(ip, uname);
+  // One transaction: the wrong tries are cleared, last login and the new session saved. No new data_version
+  // (nothing any screen shows changed), so logging in doesn't refresh everyone else's screens.
   const token = await writeTx(async () => {
+    await throttle.success(ip, uname);
     await run(`UPDATE users SET last_login = ${MELBOURNE_NOW} WHERE id = ?`, row.id);
     return createSession(row.id, { ip, ua }, now);
-  });
+  }, NO_BUMP);
   return { token, user: { ...publicUser(row), mustChange: !!row.must_change } };
 }
 

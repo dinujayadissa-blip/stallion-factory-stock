@@ -1,7 +1,5 @@
 // Logins and job roles through the real app: started in this process on a new, empty in-memory database
 // (PGlite) and a free port — never on real data, never on port 3000.   node --test test/
-// NOTE: needs createApp() from src/app.js, which arrives with Task 5 (server.js is split then); until then
-// this file cannot run. The database work below is already on the async db.js helpers.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';

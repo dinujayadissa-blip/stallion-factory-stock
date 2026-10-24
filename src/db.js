@@ -116,17 +116,45 @@ export async function tx(fn) {
 // held until commit), and settings.data_version goes up by one in the same commit, so other screens can
 // tell their figures are out of date. Inside a writeTx it just joins (one lock, one bump); inside a plain
 // tx() it takes the lock there and bumps the version once.
-export async function writeTx(fn) {
+// { bump: false }: the lock and the transaction, but no new data_version — for writes no screen shows
+// (wrong-password counters, last login, a new session), so a wrong password doesn't refresh every screen.
+// A bumping writeTx that joins a non-bumping one still gets its bump (once, at the end).
+const bumpVersion = async store => {
+  await run(`UPDATE settings SET value = (value::int + 1)::text WHERE key = 'data_version'`);
+  store.bumped = true;
+};
+export async function writeTx(fn, { bump = true } = {}) {
   const cur = als.getStore();
-  if (cur?.write) return fn();
+  if (cur?.write) {
+    if (bump) cur.bump = true;
+    const r = await fn();
+    // (the writeTx that took the lock already finished: we are in a plain tx() after it)
+    if (bump && cur.lockDone && !cur.bumped) await bumpVersion(cur);
+    return r;
+  }
   const body = async () => {
     await run('SELECT pg_advisory_xact_lock(42)');
-    als.getStore().write = true;
+    const store = als.getStore();
+    store.write = true;
+    if (bump) store.bump = true;
     const r = await fn();
-    await run(`UPDATE settings SET value = (value::int + 1)::text WHERE key = 'data_version'`);
+    if (store.bump && !store.bumped) await bumpVersion(store);
+    store.lockDone = true;
     return r;
   };
   return cur ? body() : tx(body);
+}
+
+// A brand-new database (a new local DATA_DIR/pg folder) has no tables: build them from
+// supabase/migrations/*.sql, in name order — the same files the cloud database is made from. A database
+// that already has them is left alone. (Only the local runner calls this; the cloud is migrated by hand.)
+export async function migrate() {
+  if ((await get(`SELECT to_regclass('public.settings') IS NOT NULL AS ok`)).ok) return false;
+  const dir = path.join(root, 'supabase', 'migrations');
+  await tx(async () => {
+    for (const f of fs.readdirSync(dir).filter(f => f.endsWith('.sql')).sort()) await run(fs.readFileSync(path.join(dir, f), 'utf8'));
+  });
+  return true;
 }
 
 export async function dataVersion() {
