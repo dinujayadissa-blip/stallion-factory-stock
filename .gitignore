@@ -18,3 +18,7 @@ _testdata/
 .env
 .claude/
 .superpowers/
+
+# Expo (mobile app)
+mobile/.expo/
+mobile/dist/
