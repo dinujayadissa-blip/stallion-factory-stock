@@ -4,19 +4,47 @@ Turns the dealer's **New Caravan Purchase Agreement** PDF into a parts list for 
 aside for it, and tells you what to order — replacing the manual allocation in the production plan
 spreadsheet.
 
-## Running it
+## Online version
 
-Needs **Node.js 22.13 or newer** (this PC has 24; give the office PC Node.js 24 LTS too).
+Factory Stock now runs on the internet, free: the screens on Cloudflare Pages
+(**https://stallion-stock.pages.dev**), one Supabase Edge Function `api` running this same app
+(`src/app.js`), a Postgres database (Sydney) and a private Storage bucket for the item photos.
+Phones and PCs install it as an app. **`HANDOVER-CLOUD.md`** is the owner's guide: sign-ins, secrets, installing,
+cut-over day, backups. `docs/RESTORE.md` is how to restore a nightly backup. `CHANGES.md` ("Online version") says
+what changed for staff.
 
-- Double-click **`Start Factory Stock.bat`**, or run `npm start`.
-- Open **http://localhost:3000** on this PC. Other PCs and tablets on the factory network use the
-  address printed in the window (e.g. `http://192.168.1.20:3000`). Windows may ask to allow Node
-  through the firewall the first time — allow it on *private* networks.
-- All data lives in the `data` folder: `factory.db` (a SQLite file) and `photos/` (item photos).
-  While the app runs, recent work is also held in `factory.db-wal` — so **don't back up by copying
-  files**; use `npm run backup` (below).
-- When it starts, the window shows `Data folder: ... - N vans, M items`. If it says **NO VANS**, it
-  has opened an empty data folder — stop it and check before anyone enters work.
+How the pieces fit: browser or app → Cloudflare Pages (`functions/`: a pass-through that adds a shared secret) →
+Supabase Edge Function (`supabase/functions/api`, entry `src/edge.js`, `CLOUD=1`) → Postgres + Storage.
+The tables are in `supabase/migrations/`.
+
+**Deploy** (needs the one-time sign-ins in HANDOVER-CLOUD.md; secrets are typed at the prompts, never kept in a file):
+
+```
+powershell -ExecutionPolicy Bypass -File scripts\deploy-api.ps1 -Ref <project ref> -SetSecrets    the tables + the Edge Function
+powershell -ExecutionPolicy Bypass -File scripts\deploy-pages.ps1                               the screens (Cloudflare Pages)
+node scripts/copy-to-cloud.js --from <factory.db> --to <DATABASE_URL> --photos <photos> --wipe   one-off: move the old data up
+```
+
+Later deploys leave out `-SetSecrets`. The Android app is in `mobile/` (see `mobile/README.md`). The nightly backup is a
+separate private repository (HANDOVER-CLOUD.md step 7). The one-off copy first runs the old start-up stock clean-up on a
+temporary copy, so it needs the local `sqlite-final` tag (the original SQLite version).
+
+## Running it on this PC (for trying things out)
+
+The same app runs locally on **PGlite** (Postgres in a folder), so no internet or account is needed.
+Needs **Node.js 22.13 or newer**.
+
+- Run `npm install` once, then double-click **`Start Factory Stock.bat`**, or run `npm start`.
+- Open **http://localhost:3000**. Other devices on the same network use the address printed in the window.
+  Windows may ask to allow Node through the firewall the first time — allow it on *private* networks.
+- Data lives in the `data` folder: `pg/` (the PGlite database) and `photos/` (item photos). Set `DATA_DIR` to use
+  another folder, or `DATABASE_URL` to use a Postgres server instead. The window shows
+  `Data: ... - N vans, M items`; if it says **NO VANS**, it has opened an empty database.
+- A brand-new folder starts **empty**: no starter catalogue, and the plan import is not in this version. To try
+  real-looking data, load a copy of an original (SQLite) database into it, with the app stopped:
+  `node scripts/copy-to-cloud.js --from <factory.db> --to data\pg --photos <photos folder>`.
+- With no logins yet, opening the app **on this PC** shows *Create the owner login*.
+- `npm test` runs the tests (about 130; two are skipped on purpose). It needs no internet.
 
 **Item photos:** open an item on the Stock page → *Add photo*. On a phone or tablet this offers the
 camera. **From internet…** takes a picture link *or* a supplier's product page link (the page's
@@ -28,13 +56,15 @@ show in the stock list, on van parts lists / picking lists and on the production
 
 | Command | What it does |
 | --- | --- |
-| `npm start` | Run the app |
-| `npm run backup -- "E:\Factory Stock backups"` | Safe backup while the app runs (see *Backups*) |
-| `npm run users -- list` (`add` / `reset` / `disable` / `enable`) | Logins from the command line (see *Logins and roles*) |
-| `npm run demo` | **Testing only — never on the office PC.** Wipes everything and loads made-up stock levels |
-| `npm run reset` | **Testing only — never on the office PC.** Wipes everything and loads the starter catalogue |
+| `npm start` | Run the app on this PC (PGlite in `data/pg`) |
+| `npm test` | Run the tests |
+| `npm run users -- list` (`add` / `reset` / `disable` / `enable`) | Logins from the command line (see *Logins and roles*). With `DATABASE_URL` set it works on the online database |
+| `npm run backup -- "E:\Factory Stock backups"` | Backs up an **old SQLite** data folder (`data/factory.db`) only. The online backup is the nightly job (HANDOVER-CLOUD.md step 7) |
 
-`reset` / `demo` refuse to run on a database that has vans in it unless `--yes` is added.
+The old `npm run seed`, `reset` and `demo` commands were taken out of `package.json`: they only worked on the SQLite
+version (`src/seed.js` is still in the folder for that version). The sections *Backups*, *Moving to the office PC /
+restoring a backup* and *Running it 24/7 on the office PC* below describe the original local (SQLite) setup, not the
+online version.
 
 ## Logins and roles
 
@@ -52,7 +82,10 @@ The server checks every request (the table is at the top of `src/auth.js`; anyth
 Buttons a login can't use are hidden; if one is tried anyway the message is *"Your login can't do that — ask the owner"*.
 Every change records the name of the person logged in.
 
-**First time (on the office PC itself).** With no logins yet, open **http://localhost:3000** *on the office PC* —
+**First time (local only).** Online there is no first-time page: the owner makes the first login with `npm run users -- add <username> owner`
+with `DATABASE_URL` set (HANDOVER-CLOUD.md step 6D). Locally:
+
+**First time (on this PC itself).** With no logins yet, open **http://localhost:3000** *on the office PC* —
 the page says **Create the owner login** (name, username, password). This only works on the office PC itself and only
 while there are no logins; from another PC it says "Open this on the office PC itself to create the first login".
 Then on **Logins** add one login per person: name, username, job role (and trade for a worker) and a temporary
@@ -87,6 +120,9 @@ the cookie its *Secure* flag). See HANDOVER.md.
 
 ## Backups
 
+> **Original local setup.** Online, the database and photos are backed up every night to a private GitHub repository
+> (HANDOVER-CLOUD.md step 7; restore with `docs/RESTORE.md`). This section covers `npm run backup` for an old SQLite folder.
+
 `npm run backup -- "<folder>"` (or set `BACKUP_DIR`) makes a complete copy of the database while the
 app keeps running: `<folder>\2026-10-12_1730\factory.db`. Photos go into one shared `<folder>\photos`
 (new photos only). The newest 30 copies are kept (change with `BACKUP_KEEP`); older ones are removed.
@@ -103,6 +139,8 @@ app keeps running: `<folder>\2026-10-12_1730\factory.db`. Photos go into one sha
   is from the last day or two. *Settings → Export* also shows *Last backup*.
 
 ## Moving to the office PC / restoring a backup
+
+> **Replaced by the online version** (HANDOVER-CLOUD.md). Kept for the original SQLite setup.
 
 Copy **only this main folder** — not the old `factory-stock\factory-stock` copy inside it (it has old
 data and also uses port 3000).
@@ -133,6 +171,8 @@ data and also uses port 3000).
    double-click *Start Factory Stock.bat* and check the same line in its window.
 
 ## Running it 24/7 on the office PC
+
+> **Replaced by the online version.** Kept for the original SQLite setup.
 
 `scripts\install-autostart.ps1` sets the app to start when the PC starts (no window, no login needed),
 start again by itself if it stops on an error, and allows port 3000 through the firewall on private
@@ -225,6 +265,9 @@ this PC, so it looks the same without internet. Colours are set at the top of `p
 production-plan pink/grey/blue) are kept as they were so they still mean the same thing.
 
 ## Production plan
+
+> **Online version:** the plan import (*Update from the production plan spreadsheet* and *Start again from the spreadsheet*) is not
+> available online and its panels are hidden. It is done on the original (SQLite) version before the data is moved up.
 
 The **Production plan** page is the same grid as `2026 Production Plan.xlsx`: one row per van, one
 column per part, with the same colours — white not ordered, pink ordered, grey received, blue
@@ -355,10 +398,16 @@ src/parseOrder.js    reads the dealer PDF
 src/rules.js         order options → parts list
 src/inventory.js     stock, allocation, purchasing
 src/exportXlsx.js    Excel export
-src/seed-data.js     starter catalogue and rules
+src/seed-data.js, seed.js, importPlan.js, tidy.js   original-version only (SQLite): starter catalogue, plan import, one-off clean-up
 public/              the web pages
-scripts/backup.js    safe backup (npm run backup)
+scripts/backup.js    safe backup of an old SQLite data folder (npm run backup)
+src/edge.js          the Supabase Edge Function entry (online); supabase/ = its code and the database tables
+src/db.js, src/pg.js the database layer (PGlite locally, Postgres online)
+functions/           Cloudflare Pages pass-through (the screens' server side); scripts/build-pages.js, deploy-pages.ps1, deploy-api.ps1
+scripts/copy-to-cloud.js  one-off: moves a SQLite database and its photos into the online database
+mobile/              the Android app (Expo WebView shell)
+docs/RESTORE.md, HANDOVER-CLOUD.md  restoring a backup; the owner's online guide
 scripts/install-autostart.ps1, run-forever.bat   start at boot, restart on errors
-data/                your data: factory.db + photos (back up with npm run backup, not by copying)
+data/                your data when running locally: pg/ (PGlite database) + photos
 logs/server.log      what the app printed, with times (when started automatically)
 ```

@@ -5,6 +5,58 @@ time the new version starts; they are safe on the real database and safe to run 
 
 ---
 
+## Online version (newest: Factory Stock moves to the internet)
+
+This entry is first because it is the newest. Everything below it is the history of the home-PC version, which the
+online version carries over.
+
+### What changes for staff (plain words)
+
+- **One address for everyone: https://stallion-stock.pages.dev.** It works from the factory, from home or on the road.
+  No more `http://192.168...` addresses, and the office PC no longer has to stay switched on for the phones to work.
+- **Install it like an app.** Android: the Stallion app (installed from a file). iPhone: Safari, Share, *Add to Home Screen*.
+  Windows: Edge, the three dots, Apps, *Install this site as an app*. Steps are in `HANDOVER-CLOUD.md`.
+- **You log in as before.** The same job roles and screens. Logins are not copied across (the old data had
+  none): the owner makes the first owner login, then a spare owner login, then the staff logins on **Logins**.
+  Staff stay logged in for 30 days on a phone.
+- **Photos** are kept online in a private store. Taking a photo with the phone camera works as before.
+- **Updates from the production plan spreadsheet are not in the online version.** The two panels in Settings
+  (*Update from the production plan spreadsheet* and *Start again from the spreadsheet*) are hidden. Any plan update is
+  done on the original version at the home PC.
+- **A save that fails saves nothing.** If a sheet or form fails part-way (for example a stocktake sheet with one bad row),
+  none of it is saved. The message says what is wrong; fix the row and send the sheet again. Before, the good rows were
+  saved and only the bad row was skipped.
+- **"The database is asleep or unreachable — try again in a minute"** can appear if the free database has gone to sleep or the
+  internet is down. The owner can wake it from the Supabase website (`HANDOVER-CLOUD.md` step 5).
+- **Stock figures were tidied once at the move.** The one-off stock clean-up (the same one as in the earlier entries
+  below) was run on a copy of the real data before it went online. On the trial copy it locked 673 lines of received stock
+  to their vans, among other changes. The office should glance over **Stock checks**, the **Clean-up report** and the
+  **Dashboard** shortages after cut-over.
+- **Backups are automatic.** Every night a copy of the database and photos goes to a private GitHub repository (30 nights
+  kept). `docs/RESTORE.md` says how to get one back.
+
+### What changed underneath
+
+- The database is Postgres: on the PC (PGlite, in `data/pg`) when running locally, and at Supabase (Sydney) online. All the
+  stock, purchasing, factory-floor, Excel and login code was converted to it, and one request is saved at a time (so two
+  people can't clash).
+- Online, the screens are on Cloudflare Pages and one Supabase Edge Function runs the app (`src/edge.js`,
+  `supabase/functions/api`). A shared secret stops anything else calling the Edge Function directly. The Edge Function reads
+  the visitor's address and the public host from the pass-through, so the log in lock-out and the change checks still
+  work per person.
+- Item photos are in a private Supabase Storage bucket (`item-photos`) online, in `data/photos` locally.
+- `scripts/copy-to-cloud.js` moves a SQLite database and its photos up, running the old start-up clean-up on a temporary copy
+  first, and checks every table and total before and after; it leaves the database unchanged if any check fails.
+- `package.json`: `npm run seed`, `reset` and `demo` were removed (they only worked on the SQLite version). `npm run backup`
+  still works on an old SQLite folder only.
+- Not in the online version: the plan import (`src/importPlan.js`), the one-off clean-up code (`src/tidy.js`) and the starter
+  catalogue (`src/seed.js`) are kept for the original version only.
+- New files: `HANDOVER-CLOUD.md` (owner's guide), `docs/RESTORE.md`, `supabase/`, `functions/`, `mobile/`,
+  `scripts/deploy-api.ps1`, `scripts/deploy-pages.ps1`, `scripts/build-pages.js`, `scripts/copy-to-cloud.js`,
+  `scripts/restore-photos.mjs`. The nightly backup lives in its own private repository.
+
+---
+
 ## Round 1, batch 1 — stock clean-up foundation (C1–C4)
 
 ### How the one-off clean-up works (src/tidy.js — new)

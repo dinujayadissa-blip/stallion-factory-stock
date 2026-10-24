@@ -9,9 +9,6 @@
   },
   "scripts": {
     "start": "node server.js",
-    "seed": "node src/seed.js",
-    "reset": "node src/seed.js --reset",
-    "demo": "node src/seed.js --demo",
     "backup": "node scripts/backup.js",
     "users": "node scripts/users.js",
     "test": "node --test \"test/*.test.js\""
