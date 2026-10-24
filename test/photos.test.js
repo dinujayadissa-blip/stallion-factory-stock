@@ -62,9 +62,14 @@ test('non-JPEG refused', async () => {
 
 test('name with ../ refused', async () => {
   fs.writeFileSync(path.join(tmp, 'secret.jpg'), 'secret');
-  for (const bad of ['../secret.jpg', '..\secret.jpg', 'a/b.jpg', '..', '1-2.jpg/../../x', '1-2.png', 'x.jpg', '%2e%2e/secret.jpg', '1-2.jpg\0']) {
+  for (const bad of ['../secret.jpg', '..\\secret.jpg', 'a/b.jpg', 'a\\b.jpg', '..', '1-2.jpg/../../x', '%2e%2e/secret.jpg', '1-2.jpg\0']) {
     await assert.rejects(readPhoto(bad), { status: 400 }, `read ${JSON.stringify(bad)}`);
     await assert.rejects(deletePhoto(bad), { status: 400 }, `delete ${JSON.stringify(bad)}`);
+  }
+  // Safe but not one of our names: read says "no such picture" (the route answers 404); delete stays strict.
+  for (const odd of ['none.jpg', 'x.jpg', '1-2.png', 'secret.jpg']) {
+    assert.equal(await readPhoto(odd), null, odd);
+    await assert.rejects(deletePhoto(odd), { status: 400 }, odd);
   }
   assert.equal(fs.readFileSync(path.join(tmp, 'secret.jpg'), 'utf8'), 'secret');
 });
@@ -124,4 +129,23 @@ test('Storage backend: other failures throw, bad names never reach the network',
   await assert.rejects(readPhoto('../x.jpg'), { status: 400 });
   await assert.rejects(deletePhoto('a/b.jpg'), { status: 400 });
   assert.equal(n, 0);
+});
+
+test('Storage backend: failed thumbnail upload removes the full one and rethrows the original error', async () => {
+  process.env.SUPABASE_URL = 'https://proj.supabase.co';
+  process.env.SUPABASE_SERVICE_ROLE_KEY = 'service-key';
+  const calls = [];
+  globalThis.fetch = async (url, init = {}) => {
+    calls.push({ url: String(url), method: init.method });
+    if (init.method === 'POST' && String(url).endsWith('-t.jpg')) return new Response('thumb boom', { status: 503 });
+    return new Response('{}', { status: 200 });
+  };
+  await assert.rejects(savePhoto(5, dataUrl(FULL), dataUrl(THUMB)), /upload failed \(503\)/);
+  const del = calls.find(c => c.method === 'DELETE');
+  assert.ok(del, 'cleanup DELETE was sent');
+  // Even if the cleanup itself fails, the original error is what comes out.
+  calls.length = 0;
+  globalThis.fetch = async (url, init = {}) => (init.method === 'POST' && String(url).endsWith('-t.jpg')
+    ? new Response('thumb boom', { status: 503 }) : init.method === 'DELETE' ? Promise.reject(new Error('net down')) : new Response('{}', { status: 200 }));
+  await assert.rejects(savePhoto(5, dataUrl(FULL), dataUrl(THUMB)), /upload failed \(503\)/);
 });

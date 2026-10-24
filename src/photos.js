@@ -27,6 +27,11 @@ function decodeJpeg(dataUrl, what) {
   return buf;
 }
 
+// Unsafe = could point outside the folder / bucket. Those are refused with 400 everywhere.
+function checkSafe(name) {
+  if (typeof name !== 'string' || /[/\\\0]|\.\./.test(name)) throw httpError(400, 'Bad picture name');
+  return name;
+}
 function checkName(name) {
   if (typeof name !== 'string' || !NAME_RE.test(name)) throw httpError(400, 'Bad picture name');
   return name;
@@ -72,7 +77,13 @@ export async function savePhoto(itemId, fullDataUrl, thumbDataUrl) {
   const s = storage();
   if (s) {
     await storagePut(s, name, fullBuf);
-    await storagePut(s, thumbOf(name), thumbBuf);
+    try {
+      await storagePut(s, thumbOf(name), thumbBuf);
+    } catch (e) {
+      // Don't leave a lone full picture behind (best effort; the upload error is what the caller sees).
+      try { await fetch(s.url, { method: 'DELETE', headers: { ...authHeaders(s.key), 'Content-Type': 'application/json' }, body: JSON.stringify({ prefixes: [name] }) }); } catch { /* ignore */ }
+      throw e;
+    }
   } else {
     fs.mkdirSync(PHOTO_DIR, { recursive: true });
     fs.writeFileSync(path.join(PHOTO_DIR, name), fullBuf);
@@ -103,7 +114,8 @@ export async function deletePhoto(name) {
 
 // The picture (full, or the `-t` thumbnail name) as bytes, or null when there is no such picture.
 export async function readPhoto(name) {
-  checkName(name);
+  checkSafe(name);
+  if (!NAME_RE.test(name)) return null; // safe, but not a name we ever made: no such picture
   const s = storage();
   if (s) {
     const res = await fetch(objectUrl(s, name), { method: 'GET', headers: authHeaders(s.key) });
