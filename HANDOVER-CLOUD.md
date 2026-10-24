@@ -380,6 +380,16 @@ Variable changes in Cloudflare only take effect on the next deploy.
 
 After the first deploy, log in from two phones on different networks and read the function logs (Supabase dashboard > Edge Functions > api > Logs). The line `Logged in: <username> (<role>) from <ip>` must show **two different, real public addresses**. If every login shows the same address (or a Cloudflare or Supabase one), something on the way is dropping or replacing the `x-fs-client-ip` / `x-fs-host` / `x-fs-proto` headers (set in `functions/_forward.js`, read in `src/app.js`: `clientIp`, `hostOf`, `secure`): the login throttle would lock everyone together, the host check would refuse changes and cookies would lack `Secure`. Stop and fix that before staff use it. Also check, logged out, that `/index.html`, `//index.html`, `/%69ndex.html` and `/floor.html` go to `/login`, and that a worker opening `/` lands on `/floor`.
 
+### Check one writer at a time (after the first deploy, on made-up data, before cut-over)
+
+The write lock (`writeTx`: `pg_advisory_xact_lock(42)` in the same transaction as the change) only works if every statement of a transaction stays on one database connection. The function checks this itself when it starts (`sameTransactionCheck` in `src/edge.js`: `txid_current()` twice in one transaction). If the logs show **`SELF-CHECK FAILED`**, every request answers 503 "Server setup problem — tell Claude": check that the function's `DATABASE_URL` is the **transaction** pooler (port 6543), then redeploy.
+
+Then the real test, once:
+
+1. Logs: Supabase dashboard > Edge Functions > api > Logs has no `SELF-CHECK FAILED` line.
+2. Parallel take: on made-up data, a part with **1** on hand, set aside on two vans' lines. Two worker phones open those two vans and tap **Take** for that part at the same moment (count down "3, 2, 1"). Afterwards the part's movements on the **Stock** page show the takes one after the other, with on hand going down step by step and never below what the takes allow; neither phone shows "Something went wrong". A "Busy — try again in a moment" on one phone is fine (it waited too long for the other); tapping again works.
+3. Repeat step 2 three times. Any doubled or lost take: stop, do not cut over, tell Claude.
+
 ### Cut-over commands (owner's PowerShell, values set as in step 2)
 
 1. Source copy: stop the original version and use its `npm run backup -- "<folder>"` (or copy `factory.db` and `photos\` once it has stopped). Optional plan import first, on a copy, in a `sqlite-final` checkout. The copy script itself opens the source read-only and works on a temporary copy.

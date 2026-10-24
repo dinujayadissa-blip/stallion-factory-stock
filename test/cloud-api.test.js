@@ -7,10 +7,10 @@ import assert from 'node:assert/strict';
 import net from 'node:net';
 import http from 'node:http';
 import { freshDb } from './helpers.js';
-import { get, closeDb, openDb, isUnreachable } from '../src/db.js';
+import { get, tx, closeDb, openDb, isUnreachable } from '../src/db.js';
 import * as auth from '../src/auth.js';
 import { createApp } from '../src/app.js';
-import { functionPath, edgeHandler } from '../src/edge.js';
+import { functionPath, edgeHandler, sameTransactionCheck, SETUP_PROBLEM } from '../src/edge.js';
 
 const SECRET = 'test-pass-secret-0123456789abcdef';
 const HOST = 'stallion-stock.pages.dev';
@@ -216,6 +216,46 @@ test('the function entry: Supabase\'s path is the app\'s path, and the database 
     assert.equal(opens, 3);
     assert.deepEqual(seen, ['/api/me', '/photos/b.jpg']);
   } finally { await new Promise(r => s.close(r)); }
+});
+
+// I4: the whole write lock rests on a transaction staying on one database connection. If the pooler ever handed
+// the statements of one transaction to different connections, the lock would protect nothing: the function
+// checks this once at start-up and, if it fails, refuses every request instead of working unsafely.
+test('start-up self-check: one transaction is one connection (txid_current twice), on the real driver and a fake', async () => {
+  assert.equal(SETUP_PROBLEM, 'Server setup problem — tell Claude');
+  assert.equal(await sameTransactionCheck({ tx, get }), true, 'PGlite: the same transaction id twice');
+  // a fake driver whose "transaction" spreads over connections: a new id on every statement
+  let n = 100;
+  const spread = { tx: fn => fn(), get: async () => ({ t: n++ }) };
+  assert.equal(await sameTransactionCheck(spread), false);
+  assert.equal(await sameTransactionCheck({ tx: fn => fn(), get: async () => ({ t: 7 }) }), true);
+  assert.equal(await sameTransactionCheck({ tx: fn => fn(), get: async () => ({ t: null }) }), false, 'no id is not a pass');
+});
+
+test('start-up self-check failing: every request gets 503 "Server setup problem", loudly logged', async t => {
+  const logged = [];
+  t.mock.method(console, 'error', (...a) => { logged.push(a.map(String).join(' ')); });
+  let appCalls = 0;
+  const handler = edgeHandler({ open: async () => {}, check: async () => false, app: (req, res) => { appCalls++; res.end('ok'); } });
+  const s = http.createServer(handler);
+  await new Promise(r => s.listen(0, '127.0.0.1', r));
+  try {
+    const port = s.address().port;
+    for (const p of ['/api/api/me', '/api/photos/a.jpg', '/api/api/floor/take']) {
+      const r = await fetch(`http://127.0.0.1:${port}${p}`);
+      assert.equal(r.status, 503, p);
+      assert.equal(r.headers.get('x-fs-app'), '1');
+      assert.deepEqual(await r.json(), { error: SETUP_PROBLEM });
+    }
+    assert.equal(appCalls, 0, 'the app is never reached');
+    assert.ok(logged.some(l => /SELF-CHECK FAILED/.test(l) && /txid_current/.test(l)), logged.join(' | '));
+  } finally { await new Promise(r => s.close(r)); }
+  // passing: through to the app
+  const ok = edgeHandler({ open: async () => {}, check: async () => true, app: (req, res) => res.end('ok') });
+  const s2 = http.createServer(ok);
+  await new Promise(r => s2.listen(0, '127.0.0.1', r));
+  try { assert.equal(await (await fetch(`http://127.0.0.1:${s2.address().port}/api/api/me`)).text(), 'ok'); }
+  finally { await new Promise(r => s2.close(r)); }
 });
 
 // (last: the app's database is pointed at nothing from here on)
