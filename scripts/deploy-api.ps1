@@ -2,7 +2,8 @@
 # that the private photo bucket item-photos is there (scripts/ensure-bucket.mjs).
 #
 #   powershell -ExecutionPolicy Bypass -File scripts\deploy-api.ps1 -Ref <project ref id>
-#   ... -SetSecrets   also asks for the function's secrets (typed here, never shown, never saved in a file)
+#   ... -SetSecrets   also asks for the function's secrets (typed here, never shown; passed on through a temporary
+#                     env file in $env:TEMP that is deleted straight after, never on a command line)
 #   ... -StageOnly    only builds the deploy folder (.deploy-api), to look at it; no sign-in needed
 #
 # Needs the one-time `npx supabase login` first (HANDOVER-CLOUD.md). Run from anywhere; it works in the repo.
@@ -65,14 +66,32 @@ if ($SetSecrets) {
     'PASS_SECRET'   = 'the same random secret as the Pages project''s PASS_SECRET'
     'ALLOWED_HOSTS' = 'the public address without https://, e.g. stallion-stock.pages.dev'
   }
+  # The values never go on a command line (other programs on the PC can read those): they are written to a
+  # temporary env file in $env:TEMP (this Windows user's own folder), handed over with --env-file, and the
+  # file is deleted in the finally block, whatever happens. Each value is in single quotes, so nothing in it
+  # is read as a variable or a comment.
+  $lines = New-Object System.Collections.Generic.List[string]
   foreach ($name in $names.Keys) {
     $secure = Read-Host -AsSecureString "$name ($($names[$name]))"
     $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
     try { $value = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
-    if ($value) { Run-Step "Set $name" { npx supabase secrets set "$name=$value" --project-ref $Ref } }
+    if ($value) {
+      if ($value.Contains("'") -or $value.Contains("`n") -or $value.Contains("`r")) { throw "Stopped: the value for $name has a ' or a line break in it, which can't be passed on safely. Nothing was set." }
+      $lines.Add("$name='$value'")
+    }
     $value = $null
   }
-  Run-Step 'Set CLOUD=1' { npx supabase secrets set 'CLOUD=1' --project-ref $Ref }
+  $lines.Add("CLOUD='1'")
+  $envFile = Join-Path $env:TEMP ("fs-secrets-" + [guid]::NewGuid().ToString('N') + ".env")
+  try {
+    [System.IO.File]::WriteAllLines($envFile, $lines, (New-Object System.Text.UTF8Encoding($false)))
+    $lines.Clear()
+    Run-Step "Set the function's secrets ($($names.Keys -join ', '), CLOUD=1; empty ones kept as they were)" {
+      npx supabase secrets set --env-file $envFile --project-ref $Ref
+    }
+  } finally {
+    if (Test-Path $envFile) { Remove-Item -Force $envFile -Confirm:$false }
+  }
 }
 
 # ---- 4. The function ----
