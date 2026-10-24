@@ -1,0 +1,8 @@
+{
+  "imports": {
+    "express": "npm:express@4.22.3",
+    "postgres": "npm:postgres@3.4.9",
+    "exceljs": "npm:exceljs@4.4.0",
+    "pdfjs-dist/": "npm:/pdfjs-dist@4.10.38/"
+  }
+}

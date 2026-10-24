@@ -22,3 +22,8 @@ _testdata/
 # Expo (mobile app)
 mobile/.expo/
 mobile/dist/
+
+# Supabase CLI: link details, and the folder scripts/deploy-api.ps1 builds to deploy the function
+supabase/.temp/
+supabase/.branches/
+.deploy-api/

@@ -2081,8 +2081,9 @@ async function renderSettings() {
   $$('[data-copy]').forEach(b => b.onclick = () => {
     navigator.clipboard?.writeText(b.dataset.copy).then(() => toast('Copied'), () => toast(b.dataset.copy));
   });
-  // The online version doesn't import the plan spreadsheet (or start again from it): no such buttons.
-  if (ME?.cloud) for (const el of [$('#plan-import'), $('#plan-reset').closest('.panel')]) el.style.display = 'none';
+  // Plan import (and start again from it) is done on the original version of the app, before the move — here
+  // the server refuses it (410), locally and online: no such buttons.
+  for (const el of [$('#plan-import'), $('#plan-reset').closest('.panel')]) el.style.display = 'none';
   const pf = $('#plan-file');
   pf.onchange = () => { $('#plan-check').disabled = !pf.files.length; $('#plan-reset').disabled = !pf.files.length; $('#plan-out').innerHTML = ''; };
   const send = async (url) => {

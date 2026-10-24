@@ -1,0 +1,12 @@
+# Supabase CLI settings for this project (only what Factory Stock needs; the rest are the CLI's defaults).
+# The project itself is chosen with --project-ref when deploying (scripts/deploy-api.ps1).
+project_id = "factory-stock"
+
+# The one Edge Function: the whole app (supabase/functions/api/index.ts).
+# verify_jwt = false: the app has its own logins, and the Pages pass-through sends no Supabase key —
+# the function instead refuses anything without the pass secret (src/app.js).
+[functions.api]
+enabled = true
+verify_jwt = false
+import_map = "./functions/api/deno.json"
+entrypoint = "./functions/api/index.ts"

@@ -23,10 +23,14 @@ const listen = app => new Promise(r => { const s = app.listen(0, '127.0.0.1', ()
 let local, cloud, owner;
 
 // One request to one of the two servers; `as` = a session token (sent under the cookie name in use).
+// The cloud one is called as the Pages pass-through calls it (the pass secret, the host the visitor used).
+const PASS = 'server-test-pass-secret';
+const viaPages = { 'x-pass-secret': PASS, 'x-forwarded-host': '127.0.0.1', 'x-forwarded-for': '192.0.2.10' };
 async function call(server, method, p, { body, as, headers = {} } = {}) {
   const res = await fetch(`http://127.0.0.1:${server.address().port}${p}`, {
     method, redirect: 'manual',
-    headers: { ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}), ...(as ? { Cookie: `${auth.COOKIE}=${as}` } : {}), ...headers },
+    headers: { ...(server === cloud ? viaPages : {}), ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+      ...(as ? { Cookie: `${auth.COOKIE}=${as}` } : {}), ...headers },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const buf = Buffer.from(await res.arrayBuffer());
@@ -39,7 +43,7 @@ async function call(server, method, p, { body, as, headers = {} } = {}) {
 before(async () => {
   await freshDb();
   local = await listen(createApp({ cloud: false }));
-  cloud = await listen(createApp({ cloud: true }));
+  cloud = await listen(createApp({ cloud: true, passSecret: PASS }));
   auth.setCookiePort(local.address().port);
   await auth.createUser({ username: 'boss', name: 'Bea Boss', role: 'owner', password: 'owner-pass-1', mustChange: false });
   const r = await call(local, 'POST', '/api/login', { body: { username: 'boss', password: 'owner-pass-1' } });

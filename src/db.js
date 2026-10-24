@@ -70,8 +70,20 @@ function skipQuoted(sql, i) {
 const CONNECTION_CODES = new Set(['ECONNREFUSED', 'ECONNRESET', 'ENOTFOUND', 'ETIMEDOUT', 'EAI_AGAIN', 'EHOSTUNREACH',
   'ENETUNREACH', 'EPIPE', 'CONNECT_TIMEOUT', 'CONNECTION_CLOSED', 'CONNECTION_ENDED', 'CONNECTION_DESTROYED',
   '57P01', '57P02', '57P03']); // (and every SQLSTATE 08xxx, "connection exception")
-const unreachable = e => CONNECTION_CODES.has(e?.code) || /^08/.test(String(e?.code ?? '')) || /\bpaused\b/i.test(String(e?.message ?? ''));
-const translate = e => (unreachable(e)
+// Supabase's pooler (Supavisor) answers "Tenant or user not found" while the project is paused. Network
+// failures are also recognised by their text, for runtimes (Deno, in the Edge Function) whose errors may not
+// carry Node's codes — but never on the server's own SQL errors (a statement timeout is not the database
+// being away). A wrapped error is judged by its cause.
+const SQLSTATE = /^[0-9A-Z]{5}$/;
+const NETWORK_TEXT = /\b(ECONNREFUSED|ECONNRESET|ENOTFOUND|ETIMEDOUT|EAI_AGAIN|EHOSTUNREACH|ENETUNREACH|CONNECT_TIMEOUT)\b|connection refused|timed out|getaddrinfo|failed to lookup address|dns error/i;
+export function isUnreachable(e, depth = 0) {
+  if (!e || depth > 2) return false;
+  const code = String(e.code ?? ''), msg = String(e.message ?? '');
+  if (CONNECTION_CODES.has(code) || /^08/.test(code) || /\bpaused\b/i.test(msg) || /tenant or user not found/i.test(msg)) return true;
+  if (!SQLSTATE.test(code) && NETWORK_TEXT.test(msg)) return true;
+  return isUnreachable(e.cause, depth + 1);
+}
+const translate = e => (isUnreachable(e)
   ? Object.assign(new Error('The database is asleep or unreachable — try again in a minute'), { status: 503, cause: e })
   : e);
 

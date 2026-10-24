@@ -41,8 +41,10 @@ async function postgresDriver(url) {
   };
 }
 
+// (the name is in a variable so the Edge Function's bundler doesn't pack PGlite — never used in the cloud)
+const PGLITE = '@electric-sql/pglite';
 async function pgliteDriver(dir) {
-  const { PGlite } = await import('@electric-sql/pglite');
+  const { PGlite } = await import(PGLITE);
   const pg = await PGlite.create({ dataDir: dir, parsers: { [INT8]: toNumber, [NUMERIC]: toNumber } });
   // PGlite's query() takes one statement; exec() takes several but no params. Use exec only when
   // there are no params, the same split the postgres client makes.

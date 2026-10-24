@@ -391,7 +391,8 @@ export function setActive(id, active, actor = null) {
 }
 
 // New password set by the owner (or `npm run users -- reset`): ends all of that person's sessions.
-export async function resetPassword(id, password, { mustChange = true } = {}) {
+// also(user): more work that must be committed with the reset (or not at all), inside its writeTx.
+export async function resetPassword(id, password, { mustChange = true, also = null } = {}) {
   const first = await getUser(id); // (only for the username, which never changes; re-read under the lock below)
   if (!first) throw httpError(404, 'That login no longer exists — refresh');
   const bad = passwordProblem(password, first.username);
@@ -402,6 +403,7 @@ export async function resetPassword(id, password, { mustChange = true } = {}) {
     if (!u) throw httpError(404, 'That login no longer exists — refresh');
     await run('UPDATE users SET pass_hash = ?, must_change = ? WHERE id = ?', hash, mustChange ? 1 : 0, u.id);
     await endUserSessions(u.id);
+    if (also) await also(u);
     return getUser(u.id);
   });
 }
@@ -593,7 +595,9 @@ export async function setupOwner({ username, name, password }) {
 // Stops "DNS rebinding" (a web page on another site pretending to be this PC). Allowed: localhost,
 // 127.0.0.1, [::1], this PC's network addresses and name, and ALLOWED_HOSTS (comma list, e.g. the
 // tunnel's name). ALLOWED_HOSTS=* turns the check off.
+// In the cloud (CLOUD=1) there is no "this PC": only ALLOWED_HOSTS (the public pages.dev name).
 
+const allowedHosts = () => String(process.env.ALLOWED_HOSTS || '').split(',').map(h => h.trim().toLowerCase()).filter(Boolean);
 let lanCache = { at: 0, set: new Set() };
 function thisPcNames() {
   if (Date.now() - lanCache.at < 60 * 1000) return lanCache.set;
@@ -602,7 +606,7 @@ function thisPcNames() {
   const hn = os.hostname().toLowerCase();
   set.add(hn);
   set.add(`${hn}.local`);
-  for (const h of String(process.env.ALLOWED_HOSTS || '').split(',')) if (h.trim()) set.add(h.trim().toLowerCase());
+  for (const h of allowedHosts()) set.add(h);
   lanCache = { at: Date.now(), set };
   return set;
 }
@@ -616,6 +620,7 @@ export function hostAllowed(hostHeader) {
   if (String(process.env.ALLOWED_HOSTS || '').trim() === '*') return true;
   const h = hostOnly(hostHeader);
   if (!h) return false;
+  if (inCloud()) return allowedHosts().includes(h);
   const names = thisPcNames();
   if (names.has(h)) return true;
   // This PC's name under the network's own ending ("office-pc.lan", "office-pc.home").

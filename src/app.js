@@ -4,13 +4,16 @@
 //
 // cloud: true — the online version. The pages (/, /floor, /login and the files in public/) come from
 // Cloudflare Pages, not from here; first-time setup and plan import are refused (410); GET /api/me says
-// cloud: true so the office app hides the plan-import buttons.
+// cloud: true. It runs as a Supabase Edge Function (src/edge.js) that only Cloudflare Pages may call: every
+// request must carry x-pass-secret = PASS_SECRET (else 403), and only then are the visitor's address
+// (x-forwarded-for, first entry), the public host name (x-forwarded-host) and https (x-forwarded-proto) believed.
 //
 // One writer at a time: every change (POST / PUT / PATCH / DELETE, through h()) runs inside one writeTx —
 // the global write lock, one transaction, one data_version bump — and the stock movements it made are
 // stamped with the login's id inside that same transaction. A failure rolls the whole change back and
 // only then is it answered.
 import express from 'express';
+import crypto from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -19,14 +22,18 @@ import { savePhoto, deletePhoto, readPhoto } from './photos.js';
 import { fetchWebImage } from './webImage.js';
 import * as layout from './layout.js';
 import { goLive } from './golive.js';
-import { parseOrderPdf } from './parseOrder.js';
 import { parseConditions, testRule } from './rules.js';
 import * as inv from './inventory.js';
-import { exportWorkbook } from './exportXlsx.js';
 import { TRADES, assignMissingTrades, isTrade } from './trades.js';
 import { tidyReport, markReportChecked } from './tidyReport.js';
 import { linkLine, linkPreview, makeOneOff, addTextParts } from './relink.js';
 import * as auth from './auth.js';
+
+// The PDF reader (pdfjs) and the Excel writer (exceljs) are big: loaded the first time they're needed, so a
+// cold start of the Edge Function (whose CPU time counts) doesn't pay for them, and a library that won't load
+// there breaks only its own route.
+const pdfReader = () => import('./parseOrder.js');
+const exportWorkbook = async () => (await import('./exportXlsx.js')).exportWorkbook();
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 // Local date and time for the log ("2026-10-12 14:05:09"), so "it failed yesterday afternoon" can be found.
@@ -73,6 +80,9 @@ function h(fn, { write = true } = {}) {
       // (the transaction is already rolled back here)
       // 22P02 "invalid input syntax": text where the database wants a number (an id like "abc") — on SQLite
       // that simply found nothing.
+      // A backstop (ids from the address are checked first, by id()): logged, so a route that should check
+      // its input can be found — the method, address and database message, never the request's body.
+      if (e0?.code === '22P02') console.warn(now(), 'Taken as "Not found" (text where a number belongs):', req.method, req.originalUrl, '—', e0.message);
       const e = e0?.code === '22P02' ? inv.httpError(404, 'Not found') : e0;
       // Our own messages (with a status) are written for staff; anything else is an internal error.
       if (!e.status) console.error(now(), req.method, req.originalUrl, e);
@@ -101,7 +111,12 @@ const json = async (key, fallback) => {
 };
 const importHistory = async () => { const h0 = await json('plan_import_history', []); return Array.isArray(h0) ? h0 : []; };
 
-export function createApp({ cloud = false } = {}) {
+// The first value of a header that may hold a list ("client, proxy1, proxy2"): what Pages itself put there.
+const firstOf = v => String(v ?? '').split(',')[0].trim().slice(0, 100);
+const digest = s => crypto.createHash('sha256').update(String(s)).digest();
+
+// passSecret (cloud only): what x-pass-secret must be (PASS_SECRET, shared with the Pages pass-through).
+export function createApp({ cloud = false, passSecret = process.env.PASS_SECRET } = {}) {
   const app = express();
   // ── Logins (src/auth.js) ──
   // Behind a tunnel / proxy on this PC (Cloudflare Tunnel, Tailscale serve) set TRUST_PROXY=1, so the
@@ -116,8 +131,33 @@ export function createApp({ cloud = false } = {}) {
     res.setHeader('X-Frame-Options', 'SAMEORIGIN');
     next();
   });
+  // ── Online: only the Pages pass-through may call (see the top) ──
+  // The secret is compared in constant time (as sha256 digests, so a wrong length tells nothing either).
+  // Without it: 403 before anything else — no session look-up, no database at all. Not set on the function:
+  // everything is refused.
+  if (cloud) {
+    const want = String(passSecret ?? '');
+    if (!want) console.error(now(), 'PASS_SECRET is not set: every request is refused (403) until it is');
+    const wantDigest = digest(want);
+    app.use((req, res, next) => {
+      const got = req.headers['x-pass-secret'];
+      if (!want || typeof got !== 'string' || !crypto.timingSafeEqual(digest(got), wantDigest)) {
+        return res.status(403).json({ error: 'Please use the Factory Stock app' });
+      }
+      req.viaPages = {
+        ip: firstOf(req.headers['x-forwarded-for']),
+        host: firstOf(req.headers['x-forwarded-host']),
+        https: firstOf(req.headers['x-forwarded-proto']).toLowerCase() === 'https',
+      };
+      next();
+    });
+  }
   const throttle = auth.createThrottle();
-  const clientIp = req => String(req.ip || req.socket?.remoteAddress || '');
+  // The visitor's address (login throttling, the session's record), the host name they used (the change
+  // checks below) and whether it was https (Secure cookies): online, what Pages said; locally, this request's.
+  const clientIp = req => (cloud ? req.viaPages?.ip || 'unknown' : String(req.ip || req.socket?.remoteAddress || ''));
+  const hostOf = req => (cloud ? req.viaPages?.host || '' : req.get('host'));
+  const secure = req => (cloud ? !!req.viaPages?.https : req.secure);
   // Who is logged in on this browser: req.user = { id, username, name, role, trade, mustChange }.
   // (A session look-up / touch is one statement of its own: no write lock — Ruling R11.)
   app.use(async (req, res, next) => {
@@ -128,12 +168,12 @@ export function createApp({ cloud = false } = {}) {
         if (s) {
           req.user = s.user;
           req.sessionHash = s.tokenHash;
-          if (s.refreshed) res.append('Set-Cookie', auth.sessionCookie(token, { secure: req.secure })); // 30 more days
+          if (s.refreshed) res.append('Set-Cookie', auth.sessionCookie(token, { secure: secure(req) })); // 30 more days
         } else {
           // The browser still had a session that has ended (turned off, new role, password reset, logged out on
           // another device, 30 days unused): the log in page says so once, and the old cookie goes.
           req.sessionEnded = true;
-          res.append('Set-Cookie', auth.clearCookie({ secure: req.secure }));
+          res.append('Set-Cookie', auth.clearCookie({ secure: secure(req) }));
         }
       }
       next();
@@ -148,10 +188,10 @@ export function createApp({ cloud = false } = {}) {
     if (req.method === 'GET' || req.method === 'HEAD') return next();
     const origin = req.get('Origin');
     let sameHost = true;
-    if (origin) { try { sameHost = new URL(origin).host === req.get('host'); } catch { sameHost = false; } }
+    if (origin) { try { sameHost = new URL(origin).host === hostOf(req); } catch { sameHost = false; } }
     if (req.get('Sec-Fetch-Site') === 'cross-site' || !sameHost) return res.status(403).json({ error: 'Please use the Factory Stock app' });
-    if (!auth.hostAllowed(req.get('host'))) {
-      const hh = String(req.get('host') || '').slice(0, 100);
+    if (!auth.hostAllowed(hostOf(req))) {
+      const hh = String(hostOf(req) || '').slice(0, 100);
       if (!rejectedHosts.has(hh) && rejectedHosts.size < 50) { rejectedHosts.add(hh); console.log(now(), `Refused a change sent to the address "${hh}" — if that is a real name for this PC, add it to ALLOWED_HOSTS`); }
       return res.status(403).json({ error: "Open the app with the office PC's address to make changes" });
     }
@@ -217,7 +257,7 @@ export function createApp({ cloud = false } = {}) {
   });
 
   // ── Logging in, my login, the Logins page (src/auth.js) ──
-  const setSession = (req, res, token) => res.append('Set-Cookie', auth.sessionCookie(token, { secure: req.secure }));
+  const setSession = (req, res, token) => res.append('Set-Cookie', auth.sessionCookie(token, { secure: secure(req) }));
   const meOut = u => ({ user: { ...auth.publicUser(u), mustChange: !!u.mustChange }, can: auth.capabilities(u.role),
     roles: Object.fromEntries(Object.entries(auth.ROLES).map(([k, r]) => [k, r.label])), trades: TRADES, cloud: !!cloud });
   // (auth.login does its own writes without a new data_version: Ruling R12)
@@ -231,7 +271,7 @@ export function createApp({ cloud = false } = {}) {
   }, OWN_TX));
   app.post('/api/logout', h(async (req, res) => {
     if (req.sessionHash) await auth.endSession(req.sessionHash);
-    res.append('Set-Cookie', auth.clearCookie({ secure: req.secure }));
+    res.append('Set-Cookie', auth.clearCookie({ secure: secure(req) }));
   }, OWN_TX));
   app.get('/api/me', h(req => meOut(req.user)));
   app.post('/api/me/password', h(async req => {
@@ -284,8 +324,9 @@ export function createApp({ cloud = false } = {}) {
   }));
   // (OWN_TX: as for a new login, the hashing stays outside the lock)
   app.post('/api/users/:id/password', h(async req => {
-    const u = await auth.resetPassword(id(req), req.body.password, { mustChange: req.body.must_change !== false });
-    await throttle.unlockUser(u.username); // a new password also lifts a lock from wrong tries
+    // A new password also lifts a lock from wrong tries — in the reset's own transaction, so it is both or neither.
+    const u = await auth.resetPassword(id(req), req.body.password, { mustChange: req.body.must_change !== false,
+      also: row => throttle.unlockUser(row.username) });
     console.log(now(), `Password reset: ${u.username} by ${req.user.username}`);
     return u;
   }, OWN_TX));
@@ -302,6 +343,7 @@ export function createApp({ cloud = false } = {}) {
   // (OWN_TX: reading the PDF takes a moment and changes nothing — not under the write lock)
   app.post('/api/orders/parse', express.raw({ type: 'application/pdf', limit: '25mb' }), h(async req => {
     if (!req.body?.length) throw inv.httpError(400, 'No PDF received');
+    const { parseOrderPdf } = await pdfReader(); // (a library that won't load: an internal error, logged)
     let parsed;
     try { parsed = await parseOrderPdf(req.body); } catch { throw inv.httpError(400, "Couldn't read that PDF"); }
     if (!parsed.fields.length) throw inv.httpError(400, "That PDF doesn't look like a dealer order form");
