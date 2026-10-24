@@ -13,7 +13,7 @@ online version carries over.
 ### What changes for staff (plain words)
 
 - **One address for everyone: https://stallion-stock.pages.dev.** It works from the factory, from home or on the road.
-  No more `http://192.168...` addresses, and the office PC no longer has to stay switched on for the phones to work.
+  No more number-style addresses that only work inside the factory, and the office PC no longer has to stay switched on for the phones to work.
 - **Install it like an app.** Android: the Stallion app (installed from a file). iPhone: Safari, Share, *Add to Home Screen*.
   Windows: Edge, the three dots, Apps, *Install this site as an app*. Steps are in `HANDOVER-CLOUD.md`.
 - **You log in as before.** The same job roles and screens. Logins are not copied across (the old data had
