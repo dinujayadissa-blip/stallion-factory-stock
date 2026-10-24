@@ -20,7 +20,7 @@ import crypto from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { all, get, run, insert, writeTx, getSetting, setSetting, logAlloc, syncSuppliers } from './db.js';
+import { all, get, run, insert, writeTx, getSetting, setSetting, logAlloc, syncSuppliers, asBusy } from './db.js';
 import { savePhoto, deletePhoto, readPhoto } from './photos.js';
 import { fetchWebImage } from './webImage.js';
 import * as layout from './layout.js';
@@ -86,7 +86,8 @@ function h(fn, { write = true } = {}) {
       // A backstop (ids from the address are checked first, by id()): logged, so a route that should check
       // its input can be found — the method, address and database message, never the request's body.
       if (e0?.code === '22P02') console.warn(now(), 'Taken as "Not found" (text where a number belongs):', req.method, req.originalUrl, '—', e0.message);
-      const e = e0?.code === '22P02' ? inv.httpError(404, 'Not found') : e0;
+      // 55P03 / 57014 (a time limit of the transaction, src/db.js): "Busy — try again in a moment", 503.
+      const e = e0?.code === '22P02' ? inv.httpError(404, 'Not found') : asBusy(e0);
       // Our own messages (with a status) are written for staff; anything else is an internal error.
       if (!e.status) console.error(now(), req.method, req.originalUrl, e);
       // confirm: the action needs a yes first (e.g. taking another van's part); problems: every reason a save was refused.
@@ -814,9 +815,10 @@ export function createApp({ cloud = false, passSecret = process.env.PASS_SECRET 
   app.use((err, req, res, next) => {
     if (res.headersSent) return next(err);
     if (err.type === 'entity.too.large') return res.status(413).json({ error: 'That file is too big' });
-    const status = err.status || err.statusCode;
-    // The database is asleep / can't be reached (src/db.js): say so, it is worth trying again.
-    if (status === 503) return res.status(503).json({ error: err.message });
+    const e = asBusy(err);
+    const status = e.status || e.statusCode;
+    // The database is asleep / can't be reached, or busy (src/db.js): say so, it is worth trying again.
+    if (status === 503) return res.status(503).json({ error: e.message });
     if (err.type === 'entity.parse.failed' || (status >= 400 && status < 500)) {
       return res.status(status || 400).json({ error: "The app couldn't read that request — refresh the page and try again" });
     }

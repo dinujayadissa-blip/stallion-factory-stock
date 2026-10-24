@@ -189,3 +189,34 @@ test('with Supabase\'s roles present, anon / authenticated lose every right (000
     assert.equal((await get(`SELECT has_table_privilege(?, 'public.later_one', 'SELECT') AS ok`, role)).ok, false);
   }
 });
+
+// I3: a transaction never waits for ever: for the write lock (lock_timeout), on a slow statement
+// (statement_timeout) or idle in the middle (idle_in_transaction_session_timeout). Those errors are "Busy".
+test('tx / writeTx set their time limits, for that transaction only', async () => {
+  const limits = () => all(`SELECT name, setting, unit FROM pg_settings
+    WHERE name IN ('lock_timeout', 'statement_timeout', 'idle_in_transaction_session_timeout') ORDER BY name`);
+  const want = [
+    { name: 'idle_in_transaction_session_timeout', setting: '30000', unit: 'ms' },
+    { name: 'lock_timeout', setting: '15000', unit: 'ms' },
+    { name: 'statement_timeout', setting: '30000', unit: 'ms' },
+  ];
+  assert.deepEqual(await tx(limits), want);
+  assert.deepEqual(await writeTx(limits), want);
+  assert.deepEqual(await writeTx(limits, { bump: false }), want);
+  // outside a transaction: the server's own (none here)
+  assert.deepEqual((await limits()).map(r => r.setting), ['0', '0', '0']);
+});
+
+test('a lock wait or a statement cut short (55P03 / 57014) is "Busy — try again in a moment" (503), and nothing is kept', async () => {
+  const { BUSY } = await import('../src/db.js');
+  assert.equal(BUSY, 'Busy — try again in a moment');
+  for (const code of ['lock_not_available', 'query_canceled']) {
+    const raise = `DO $$ BEGIN RAISE EXCEPTION 'canceling statement due to a time limit' USING ERRCODE = '${code}'; END $$`;
+    await assert.rejects(writeTx(async () => { await newItem(`BUSY-${code}`); await run(raise); }),
+      e => e.status === 503 && e.message === BUSY && ['55P03', '57014'].includes(e.cause?.code), code);
+    assert.equal(await count('items'), 0, 'rolled back');
+    await assert.rejects(run(raise), e => e.status === 503 && e.message === BUSY, `${code} outside a transaction`);
+  }
+  // other database errors are left as they are
+  await assert.rejects(run(`DO $$ BEGIN RAISE EXCEPTION 'x' USING ERRCODE = 'unique_violation'; END $$`), e => e.code === '23505' && !e.status);
+});

@@ -83,9 +83,17 @@ export function isUnreachable(e, depth = 0) {
   if (!SQLSTATE.test(code) && NETWORK_TEXT.test(msg)) return true;
   return isUnreachable(e.cause, depth + 1);
 }
+// Waited too long for the write lock (55P03, lock_timeout) or a statement ran past statement_timeout (57014,
+// query_canceled): another change is holding things up. Nothing was kept (the transaction is rolled back);
+// trying again in a moment works. Also used by app.js's h() for any such error that comes its way.
+export const BUSY = 'Busy — try again in a moment';
+const BUSY_CODES = new Set(['55P03', '57014']);
+export const asBusy = e => (e && !e.status && BUSY_CODES.has(String(e.code ?? ''))
+  ? Object.assign(new Error(BUSY), { status: 503, cause: e })
+  : e);
 const translate = e => (isUnreachable(e)
   ? Object.assign(new Error('The database is asleep or unreachable — try again in a minute'), { status: 503, cause: e })
-  : e);
+  : asBusy(e));
 
 // The connection of the transaction we're inside (set by tx()), so every query in it — however deep in
 // the call chain — runs on that one connection. Outside a transaction: the driver itself.
@@ -116,11 +124,19 @@ RETURNING id`, p)).rows[0];
 // ── Transactions ──
 // All or nothing. Re-entrant: called inside another tx() it just joins that transaction, so several
 // steps can be combined into one all-or-nothing change.
+// Time limits, for this transaction only (SET LOCAL), before anything else in it (so before writeTx's lock):
+// at most 15 s waiting for a lock (the write lock behind another change), 30 s for one statement, and
+// 30 s idle in the middle (a request that stalled mid-change must not hold the write lock for everyone).
+// Running past one is "Busy — try again in a moment" (asBusy above), and nothing is kept.
+const LIMITS = `SET LOCAL lock_timeout = '15s'; SET LOCAL statement_timeout = '30s'; SET LOCAL idle_in_transaction_session_timeout = '30s'`;
 export async function tx(fn) {
   if (als.getStore()) return fn();
   const d = await driver().catch(e => { throw translate(e); });
   try {
-    return await d.begin(conn => als.run({ conn, write: false }, fn));
+    return await d.begin(async conn => {
+      await conn.query(LIMITS, []);
+      return als.run({ conn, write: false }, fn);
+    });
   } catch (e) { throw translate(e); }
 }
 
