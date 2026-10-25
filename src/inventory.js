@@ -1996,14 +1996,15 @@ export async function qtyChecks({ nearOnly = true } = {}) {
 
 // Dashboard. counts: the "Needs action this month" pieces (vans in production or due within the
 // "coming up" weeks for the per-van lists; POs, deliveries and dates for everything).
-export async function summary() {
+// `checks`: a checkOrdered() answer already at hand (the Dashboard route shares one with the go-live checklist).
+export async function summary({ checks: checksGiven } = {}) {
   const items = (await listItems()).filter(i => !i.placeholder); // "as per plan" catch-alls aren't counted as parts
   const vans = await listVans({ status: 'active' });
   const sh = await shortagesCached(); // listVans just worked it out for the "waiting on PO" split (owner-r3-2)
   const now = sh.rows.filter(r => r.group === 'now' && r.suggest > 1e-9 && !r.check);
   const near = await nearVanSql('v');
   const nearIds = new Set(vans.filter(v => v.near).map(v => v.id));
-  const checks = await checkOrdered();
+  const checks = checksGiven ?? await checkOrdered();
   const checksNear = checks.filter(g => g.near);
   const decisions = await decisionLines();
   const received = (await get(`SELECT COUNT(*) AS c FROM van_lines l JOIN vans v ON v.id = l.van_id

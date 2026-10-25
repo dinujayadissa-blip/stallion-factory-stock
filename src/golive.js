@@ -15,7 +15,8 @@ import { datesToCheck, unassignedPerVan, checkOrdered, checkOrderedCount, reorde
 
 const COUNTABLE = `i.active = 1 AND i.kind = 'stock' AND i.placeholder = 0 AND i.sku NOT ILIKE 'PLAN-%'`;
 
-export async function goLive() {
+// `checks`: a checkOrdered() answer already at hand (the Dashboard's summary has one), else it is worked out.
+export async function goLive({ checks } = {}) {
   const steps = [];
   // a
   steps.push({ key: 'a', title: 'Clean-up done and the Clean-up report checked', href: '#/cleanup',
@@ -36,7 +37,7 @@ export async function goLive() {
     count: `${baysDone} of ${bays.length} van(s) in a bay checked · ${orphans.length} bought-for-van part(s) with no van`,
     vans: bays.map(b => ({ id: b.id, chassis: b.chassis, bay: b.bay, checked: !!b.checked })), orphans: orphans.length });
   // d
-  const groups = (await checkOrdered()).length;
+  const groups = (checks ?? await checkOrdered()).length;
   const lines = await checkOrderedCount();
   steps.push({ key: 'd', title: '"Check: already ordered?" answered', href: '#/purchasing', done: lines === 0,
     count: lines ? `${groups} order number(s), ${lines} part(s) still to answer` : 'all answered' });

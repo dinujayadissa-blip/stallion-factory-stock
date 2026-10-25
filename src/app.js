@@ -348,7 +348,11 @@ export function createApp({ cloud = false, passSecret = process.env.PASS_SECRET 
   // office app asks for it after every page (the menu badge). data_version is read from the database on every
   // request, so a server instance never answers with figures that another instance has changed since.
   let summaryMemo = null;
-  const dashboard = async () => ({ ...await inv.summary(), golive: await goLive(), demo: (await getSetting('demo')) === '1' });
+  // ("Check: already ordered?" is worked out once, for both the summary and the go-live checklist)
+  const dashboard = async () => {
+    const checks = await inv.checkOrdered();
+    return { ...await inv.summary({ checks }), golive: await goLive({ checks }), demo: (await getSetting('demo')) === '1' };
+  };
   app.get('/api/summary', h(async () => {
     if (inTx()) return dashboard();
     const key = `${await dataVersion()}|${inv.today()}`;
