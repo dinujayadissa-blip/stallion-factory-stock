@@ -535,6 +535,7 @@ export function createApp({ cloud = false, passSecret = process.env.PASS_SECRET 
     const rid = String(req.body.rid || '').slice(0, 80);
     const at = Date.now();
     if (rid) {
+      // (?::text::jsonb: a jsonb-typed parameter would be JSON-encoded twice by the postgres client)
       const seen = await get('SELECT out FROM request_receipts WHERE rid = ? AND at > ?', rid, at - RECEIPT_MS);
       if (seen) return seen.out;
     }
@@ -547,9 +548,10 @@ export function createApp({ cloud = false, passSecret = process.env.PASS_SECRET 
     // to / shelf (follow-up round 1, worker-r3-4): where THIS delivery went — "1 → ST0380", or on the shelf.
     const out = { vans, movement_id: r.movement_id, to: r.to || [], shelf: r.shelf || 0 };
     if (rid) {
+      // (?::text::jsonb: a jsonb-typed parameter would be JSON-encoded twice by the postgres client)
       // (old receipts go here as well as in the nightly clean-up, so a local run without it stays small)
       await run('DELETE FROM request_receipts WHERE at <= ?', at - RECEIPT_MS);
-      await run(`INSERT INTO request_receipts(rid, out, at) VALUES(?, ?::jsonb, ?)
+      await run(`INSERT INTO request_receipts(rid, out, at) VALUES(?, ?::text::jsonb, ?)
                  ON CONFLICT (rid) DO UPDATE SET out = excluded.out, at = excluded.at`, rid, JSON.stringify(out), at);
     }
     return out;

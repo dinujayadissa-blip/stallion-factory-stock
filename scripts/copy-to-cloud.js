@@ -339,7 +339,9 @@ export async function copyAll({ from, to, photosDir, photosTo, wipe = false, pre
             .filter(r => !(t === 'settings' && r.key === 'data_version'))
             .map(r => Object.fromEntries(cols.map(k => [k, plain(r[k], t)])));
           const list = cols.map(q).join(', ');
-          const sql = `INSERT INTO public.${q(t)} (${list}) SELECT ${list} FROM jsonb_populate_recordset(NULL::public.${q(t)}, $1::jsonb)`
+          // $1::text::jsonb, not $1::jsonb: with a jsonb parameter the postgres client JSON-encodes the (already
+          // JSON) string a second time, and Postgres sees one string instead of a list of rows. PGlite does not.
+          const sql = `INSERT INTO public.${q(t)} (${list}) SELECT ${list} FROM jsonb_populate_recordset(NULL::public.${q(t)}, $1::text::jsonb)`
             + (t === 'settings' ? ' ON CONFLICT (key) DO UPDATE SET value = excluded.value' : '');
           try {
             for (let i = 0; i < rows.length; i += BATCH) await c.query(sql, [JSON.stringify(rows.slice(i, i + BATCH))]);
