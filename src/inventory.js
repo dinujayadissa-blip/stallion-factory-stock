@@ -1172,9 +1172,11 @@ export function coverText(x) {
 let shortMemo = null;
 export async function shortagesCached() {
   if (inTx()) return shortages();
-  await syncSuppliers();
   const key = `${await dataVersion()}|${today()}`;
   if (shortMemo?.key !== key) {
+    // (shortages() adds supplier rows for new names first. They are only added when it is worked out again,
+    // not on every read as before — two INSERTs each time, about three times per page. Every change bumps
+    // data_version, so the first read after any change still adds them.)
     const memo = { key, value: shortages() };
     shortMemo = memo;
     memo.value.catch(() => { if (shortMemo === memo) shortMemo = null; }); // a failed working-out isn't kept
