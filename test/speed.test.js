@@ -203,3 +203,44 @@ test('F4 reorder suggestions: the same levels as with one or two queries per ite
   assert.deepEqual([...some.keys()].sort((a, b) => a - b), [glue, fresh].sort((a, b) => a - b));
   assert.deepEqual(some.get(glue), got.get(glue));
 });
+
+// F7: the worker van screen's "set aside for other vans" — one query for every line instead of one per line.
+test('F7 floor van: "held by" the same vans, in the same build order, as with one query per line', async () => {
+  const late = await van('SP-F7-B', 'planned', '2099-03-01');       // made first, but later in the build order
+  const soon = await van('SP-F7-A', 'in_production', '2026-02-01');
+  const gone = await van('SP-F7-DONE', 'done', '');
+  const me = await van('SP-F7-ME', 'planned', '2099-09-01');
+  const p = await item({ name: 'F7 panel', on_hand: 3 });   // all set aside: for both other vans
+  const r = await item({ name: 'F7 rivet', on_hand: 1 });   // set aside for one van
+  const s = await item({ name: 'F7 sealant', on_hand: 5 }); // some free: no "held by"
+  const t = await item({ name: 'F7 trim', on_hand: 0 });    // nothing on the shelf: no "held by"
+  await line(late, p, { qty: 1, reserved: 1 });
+  await line(soon, p, { qty: 1, reserved: 1 });
+  await line(soon, p, { qty: 1, reserved: 1 });  // a second line of the same van: named once
+  await line(gone, p, { qty: 2, reserved: 2 });  // a finished van: not named
+  await line(late, r, { qty: 1, reserved: 1 });
+  await line(soon, s, { qty: 1, reserved: 1 });
+  const lp = await line(me, p, { qty: 1 });
+  const lp2 = await line(me, p, { qty: 2 });
+  const lr = await line(me, r, { qty: 1 });
+  const ls = await line(me, s, { qty: 1 });
+  const lt = await line(me, t, { qty: 1 });
+
+  const f = await inv.floorVan(me);
+  // The code before (inventory.js, cloud @ 4585471): one query per line.
+  const { PRIORITY } = inv;
+  for (const l of f.lines) {
+    const want = (l.issued >= l.qty || l.reserved > 0 || !(l.on_hand > 0) || l.free > 0) ? undefined
+      : [...new Set((await all(`SELECT v.chassis FROM van_lines x JOIN vans v ON v.id = x.van_id
+           WHERE x.item_id = ? AND x.van_id <> ? AND x.reserved > 0 AND v.status IN ('planned','in_production') ORDER BY ${PRIORITY}`, l.item_id, me)).map(x => x.chassis))];
+    assert.deepEqual(l.held_by, want, l.name);
+  }
+  // and what that means
+  const by = id => f.lines.find(l => l.id === id);
+  assert.deepEqual(by(lp).held_by, ['SP-F7-A', 'SP-F7-B']);
+  assert.deepEqual(by(lp2).held_by, ['SP-F7-A', 'SP-F7-B']);
+  assert.notEqual(by(lp).held_by, by(lp2).held_by, 'each line its own list');
+  assert.deepEqual(by(lr).held_by, ['SP-F7-B']);
+  assert.equal(by(ls).held_by, undefined);
+  assert.equal(by(lt).held_by, undefined);
+});

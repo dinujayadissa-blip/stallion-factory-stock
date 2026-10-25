@@ -2641,10 +2641,16 @@ export async function floorVan(vanId) {
     ORDER BY i.category, i.name`, vanId);
   // On the shelf but all set aside for other vans (phone round 1, C9): which vans, so the worker is told
   // "set aside for ST0367, ST0380 — ask before taking" instead of "none on the shelf".
-  for (const l of lines) {
-    if (l.issued >= l.qty || l.reserved > 0 || !(l.on_hand > 0) || l.free > 0) continue;
-    l.held_by = [...new Set((await all(`SELECT v.chassis FROM van_lines x JOIN vans v ON v.id = x.van_id
-                                 WHERE x.item_id = ? AND x.van_id <> ? AND x.reserved > 0 AND ${ACTIVE_VAN} ORDER BY ${PRIORITY}`, l.item_id, vanId)).map(r => r.chassis))];
+  // One query for every such line (it was one per line: up to 22 on a big van, and the screen reloads after
+  // each take); per item, the vans in build order, each named once.
+  const heldLines = lines.filter(l => !(l.issued >= l.qty || l.reserved > 0 || !(l.on_hand > 0) || l.free > 0));
+  if (heldLines.length) {
+    const ids = [...new Set(heldLines.map(l => l.item_id))];
+    const heldBy = new Map(ids.map(i => [i, new Set()]));
+    for (const r of await all(`SELECT x.item_id, v.chassis FROM van_lines x JOIN vans v ON v.id = x.van_id
+                                 WHERE x.item_id IN (${ids.map(() => '?').join(',')}) AND x.van_id <> ? AND x.reserved > 0 AND ${ACTIVE_VAN}
+                                 ORDER BY x.item_id, ${PRIORITY}`, ...ids, vanId)) heldBy.get(r.item_id).add(r.chassis);
+    for (const l of heldLines) l.held_by = [...heldBy.get(l.item_id)];
   }
   await floorOrderInfo(vanId, lines);
   const reminders = await all(`SELECT id, text, due, trade, worker FROM reminders WHERE van_id = ? AND done = 0
