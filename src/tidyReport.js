@@ -2,7 +2,7 @@
 // the allocation log and the settings it left. The clean-up itself (src/tidy.js) is SQLite-only and ran on
 // the original version before the move (the `sqlite-final` checkout); this only shows its results and
 // records "Checked". STEPS mirrors the keys and labels of tidy.js's STEPS — keep them the same.
-import { all, getSetting, setSetting } from './db.js';
+import { all, setSetting } from './db.js';
 
 export const STEPS = [
   { key: 'lock', label: 'Parts received for a van are locked to it' },
@@ -33,16 +33,19 @@ export async function tidyReport() {
   const rows = await all(`SELECT a.*, v.chassis, i.sku, i.name AS item_name FROM allocation_log a
                     LEFT JOIN vans v ON v.id = a.van_id LEFT JOIN items i ON i.id = a.item_id
                     WHERE a.reason ILIKE 'tidy:%' ORDER BY a.id`);
-  const raw = await getSetting('tidy_report_checked', '');
+  // Every tidy_… setting in one query (the 20 step flags, the backup, "Checked") instead of one query each.
+  const settings = new Map((await all(`SELECT key, value FROM settings WHERE key LIKE 'tidy%'`)).map(r => [r.key, r.value]));
+  const setting = (key, fallback = '') => settings.get(key) ?? fallback; // (as getSetting)
+  const raw = setting('tidy_report_checked');
   let checked = null;
   try { checked = JSON.parse(raw || 'null'); } catch { checked = null; }
   const steps = [];
   for (const s of STEPS) {
     const mine = rows.filter(r => r.reason === `tidy:${s.key}`);
-    steps.push({ key: s.key, label: s.label, doneAt: await getSetting(flagKey(s.key), ''),
+    steps.push({ key: s.key, label: s.label, doneAt: setting(flagKey(s.key)),
       changes: mine.filter(r => r.field !== 'flag'), flagged: mine.filter(r => r.field === 'flag') });
   }
-  return { backup: await getSetting('tidy_backup', ''), checked, steps };
+  return { backup: setting('tidy_backup'), checked, steps };
 }
 
 export async function markReportChecked(by = '') {

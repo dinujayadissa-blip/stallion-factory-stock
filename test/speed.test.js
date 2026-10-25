@@ -5,7 +5,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { freshDb } from './helpers.js';
-import { run, get, all, insert, writeTx, closeDb } from '../src/db.js';
+import { run, get, all, insert, writeTx, closeDb, getSetting, setSetting } from '../src/db.js';
 import * as inv from '../src/inventory.js';
 import * as auth from '../src/auth.js';
 import { createApp } from '../src/app.js';
@@ -264,4 +264,20 @@ test('F9 session look-up: the login, its expiry and a turned-off login, as befor
   assert.equal(await auth.sessionFromToken(old, t0 + 31 * 24 * 3600 * 1000), null);
   assert.equal((await get('SELECT COUNT(*) AS c FROM sessions WHERE token_hash = ?', auth.tokenHash(old))).c, 0);
   assert.equal(await auth.sessionFromToken('x'.repeat(43)), null); // no such session
+});
+
+// F5(a): the Clean-up report reads its settings in one query.
+test('F5 clean-up report: the same step dates, backup and "Checked" as reading each setting', async () => {
+  const { tidyReport, markReportChecked, STEPS } = await import('../src/tidyReport.js');
+  await setSetting('tidy_lock_v1', '2026-10-01 10:00:00');
+  await setSetting('tidy_sku_fix_v1', '2026-10-02 11:00:00');
+  await setSetting('tidy_backup', 'backup-before-tidy.db');
+  await setSetting('tidyish', 'not one of them');
+  await markReportChecked('Tester');
+  const r = await tidyReport();
+  assert.deepEqual(r.steps.map(s => s.doneAt), await Promise.all(STEPS.map(s => getSetting(`tidy_${s.key}_v1`, ''))));
+  assert.equal(r.steps.find(s => s.key === 'lock').doneAt, '2026-10-01 10:00:00');
+  assert.equal(r.steps.find(s => s.key === 'plan_qty').doneAt, '');
+  assert.equal(r.backup, 'backup-before-tidy.db');
+  assert.equal(r.checked.by, 'Tester');
 });
