@@ -244,3 +244,24 @@ test('F7 floor van: "held by" the same vans, in the same build order, as with on
   assert.equal(by(ls).held_by, undefined);
   assert.equal(by(lt).held_by, undefined);
 });
+
+// F9: the session look-up (every request) reads the session and its login in one query: the same checks.
+test('F9 session look-up: the login, its expiry and a turned-off login, as before', async () => {
+  const u = await auth.createUser({ username: 'sess9', name: 'Session Nine', role: 'stores', password: 'sess9-pass-1', mustChange: true });
+  const t0 = Date.now();
+  const token = await auth.createSession(u.id, {}, t0);
+  const s = await auth.sessionFromToken(token, t0 + 1000);
+  assert.deepEqual(s.user, { id: u.id, username: 'sess9', name: 'Session Nine', role: 'stores', trade: '', mustChange: true });
+  assert.equal(s.refreshed, false);
+  assert.equal((await auth.sessionFromToken(token, t0 + 10 * 60 * 1000)).refreshed, true);
+  // turned off without its sessions being ended: refused at the next request, and the session goes
+  await run('UPDATE users SET active = 0 WHERE id = ?', u.id);
+  assert.equal(await auth.sessionFromToken(token, t0 + 11 * 60 * 1000), null);
+  assert.equal((await get('SELECT COUNT(*) AS c FROM sessions WHERE token_hash = ?', auth.tokenHash(token))).c, 0);
+  // expired: refused, and the session goes
+  await run('UPDATE users SET active = 1 WHERE id = ?', u.id);
+  const old = await auth.createSession(u.id, {}, t0);
+  assert.equal(await auth.sessionFromToken(old, t0 + 31 * 24 * 3600 * 1000), null);
+  assert.equal((await get('SELECT COUNT(*) AS c FROM sessions WHERE token_hash = ?', auth.tokenHash(old))).c, 0);
+  assert.equal(await auth.sessionFromToken('x'.repeat(43)), null); // no such session
+});

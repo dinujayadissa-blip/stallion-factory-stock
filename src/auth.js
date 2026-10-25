@@ -456,10 +456,12 @@ export async function createSession(userId, { ip = '', ua = '' } = {}, now = Dat
 export async function sessionFromToken(token, now = Date.now()) {
   if (typeof token !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(token)) return null;
   const h = tokenHash(token);
-  const s = await get('SELECT * FROM sessions WHERE token_hash = ?', h);
+  // The session and its login in one query (this runs on every request); u_id is null when the login is gone.
+  const s = await get(`SELECT s.expires_at, s.last_seen, u.id AS u_id, u.username, u.name, u.role, u.trade, u.active, u.must_change
+                       FROM sessions s LEFT JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?`, h);
   if (!s) return null;
   if (s.expires_at <= now) { await run('DELETE FROM sessions WHERE token_hash = ?', h); return null; }
-  const u = await get('SELECT * FROM users WHERE id = ?', s.user_id);
+  const u = s.u_id == null ? null : { id: s.u_id, username: s.username, name: s.name, role: s.role, trade: s.trade, active: s.active, must_change: s.must_change };
   if (!u || !u.active) { await run('DELETE FROM sessions WHERE token_hash = ?', h); return null; }
   let refreshed = false;
   if (now - s.last_seen >= TOUCH_MS) {
