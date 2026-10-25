@@ -1274,7 +1274,19 @@ export async function checkOrdered() {
     if (neededBy && (!g.needed_by || neededBy < g.needed_by)) g.needed_by = neededBy;
   }
   const t = today();
-  for (const g of groups.values()) {
+  // The open POs with each group's number, for every group in one query (one look-up per group was two round
+  // trips each — about 270 on the real data, the most of any screen). The matching stays in SQL, the same
+  // lower(trim()) comparisons as before, so no PO can match differently. Rows come by group, then by PO id.
+  const list = [...groups.values()];
+  const posOf = new Map(list.map((g, i) => [i + 1, []]));
+  if (list.length) {
+    for (const p of await all(`SELECT g.n, p.id, p.po_no, p.supplier, p.ordered_at, p.expected,
+          (g.x->>'sup' <> '' AND lower(trim(p.supplier)) = lower(g.x->>'sup')) AS same_supplier
+        FROM json_array_elements(?::text::json) WITH ORDINALITY AS g(x, n)
+          JOIN purchase_orders p ON p.status = 'open' AND lower(trim(p.po_no)) = lower(g.x->>'ref')
+        ORDER BY g.n, p.id`, JSON.stringify(list.map(g => ({ ref: g.po_ref, sup: g.supplier }))))) posOf.get(p.n).push(p);
+  }
+  for (const [gi, g] of list.entries()) {
     g.lines.sort((a, b) => (ranks.get(a.van_id) ?? 1e9) - (ranks.get(b.van_id) ?? 1e9) || a.name.localeCompare(b.name));
     // Round 4 (user-r3-1): each line says its van's place in the build order and how late it is; the group
     // says its FIRST van ("#1 ST0367 – 26 days late") and the groups are sorted by that van.
@@ -1287,12 +1299,12 @@ export async function checkOrdered() {
       late_days: f.late_days, needed_now: f.needed_now, when: f.when,
       label: `${f.build_pos ? `#${f.build_pos} ` : ''}${f.chassis} – ${f.when}` };
     g.suppliers = [g.supplier]; // older screens read this
-    // Which PO a "Yes" adds to.
-    const po = g.supplier ? await get(`SELECT id, po_no, supplier, ordered_at, expected FROM purchase_orders WHERE status = 'open' AND lower(trim(po_no)) = lower(?)
-                                 AND lower(trim(supplier)) = lower(?) ORDER BY id LIMIT 1`, g.po_ref, g.supplier) : null;
+    // Which PO a "Yes" adds to: the first open one with this number for this supplier (none without a supplier).
+    const pos = posOf.get(gi + 1);
+    const po = g.supplier ? pos.find(p => p.same_supplier) : null;
     g.target = po ? { po_id: po.id, po_no: po.po_no, supplier: po.supplier, exists: 1, ordered_at: po.ordered_at || '', expected: po.expected || '' } : { po_id: null, po_no: g.po_ref, supplier: g.supplier, exists: 0 };
     // Other open POs with this number (another supplier, or none): shown so nobody is surprised.
-    g.open_pos = await all(`SELECT id, po_no, supplier FROM purchase_orders WHERE status = 'open' AND lower(trim(po_no)) = lower(?) ORDER BY id`, g.po_ref);
+    g.open_pos = pos.map(p => ({ id: p.id, po_no: p.po_no, supplier: p.supplier }));
   }
   // Vans due soon first, then by the first van's place in the build order (#1 first), then the most parts.
   return [...groups.values()].sort((a, b) => b.near - a.near || (a.first.build_pos ?? 1e9) - (b.first.build_pos ?? 1e9)
