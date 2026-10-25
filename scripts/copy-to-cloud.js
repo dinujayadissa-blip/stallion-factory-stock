@@ -444,7 +444,12 @@ function parseArgs(argv) {
       o[{ '--from': 'from', '--to': 'to', '--photos': 'photosDir', '--photos-to': 'photosTo' }[a]] = argv[++i];
     } else throw new Error(`Unknown or incomplete option: ${a}`);
   }
-  if (!o.from || !o.to) throw new Error('Usage: node scripts/copy-to-cloud.js --from <factory.db> --to <postgres://… | PGlite folder> [--photos <folder>] [--photos-to <folder>] [--wipe] [--no-prepare]');
+  // `--to env`: the address is in DATABASE_URL, so the password never sits on a command line.
+  if (o.to === 'env') {
+    o.to = process.env.DATABASE_URL || '';
+    if (!o.to) throw new Error('--to env: DATABASE_URL is not set in this window');
+  }
+  if (!o.from || !o.to) throw new Error('Usage: node scripts/copy-to-cloud.js --from <factory.db> --to <postgres://… | env | PGlite folder> [--photos <folder>] [--photos-to <folder>] [--wipe] [--no-prepare]');
   return o;
 }
 

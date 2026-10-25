@@ -6,8 +6,8 @@
 // come from ./deno.json. Deploy with scripts/deploy-api.ps1, which puts a copy of src/ next to this file
 // (Supabase only bundles what is inside the function's folder) and points the import below at it.
 //
-// Secrets (npx supabase secrets set …): DATABASE_URL, PASS_SECRET, ALLOWED_HOSTS, CLOUD=1 (PUBLIC_URL
-// optional). SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are provided by Supabase itself.
+// Secrets (npx supabase secrets set …): PASS_SECRET, ALLOWED_HOSTS, CLOUD=1 (PUBLIC_URL optional).
+// SUPABASE_DB_URL, SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are provided by Supabase itself.
 import process from 'node:process';
 import { Buffer } from 'node:buffer';
 
@@ -21,4 +21,6 @@ try { process.env.CLOUD = '1'; } catch { /* env not writable: the CLOUD=1 secret
 
 const { startEdge } = await import('../../../src/edge.js');
 // Opens the database once for this isolate, before the first request, and listens on 8000.
-startEdge({ databaseUrl: Deno.env.get('DATABASE_URL') });
+// SUPABASE_DB_URL is the address Supabase gives every function itself (kept right when the database password
+// is reset), so nobody has to type one; DATABASE_URL is only a fallback for running this somewhere else.
+startEdge({ databaseUrl: Deno.env.get('SUPABASE_DB_URL') || Deno.env.get('DATABASE_URL') });
