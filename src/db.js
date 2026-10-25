@@ -101,11 +101,25 @@ const als = new AsyncLocalStorage();
 // Are we inside tx() / writeTx() right now? (replaces the old `db.isTransaction`)
 export const inTx = () => !!als.getStore();
 
+// How many statements a request sent and how long it waited for them, for the Server-Timing header (app.js):
+// the browser's Network tab shows it, online too. Only these two numbers are kept — never SQL, values or rows.
+// countQueries(stats, fn) runs fn with every query under it (however deep) added to `stats`. Queries running at
+// the same time each add their own wait, so ms can be more than the request's own time.
+const counting = new AsyncLocalStorage();
+export const newQueryStats = () => ({ queries: 0, ms: 0 });
+export const countQueries = (stats, fn) => (stats ? counting.run(stats, fn) : fn());
+async function timed(n, work) {
+  const stats = counting.getStore();
+  if (!stats) return work();
+  const t0 = performance.now();
+  try { return await work(); } finally { stats.queries += n; stats.ms += performance.now() - t0; }
+}
+
 async function query(sql, p) {
   try {
     const conn = als.getStore()?.conn ?? await driver();
     // No params: the SQL goes as it is (it may be several statements, e.g. a migration file).
-    return await conn.query(p.length ? placeholders(sql) : sql, p);
+    return await timed(1, () => conn.query(p.length ? placeholders(sql) : sql, p));
   } catch (e) { throw translate(e); }
 }
 
@@ -132,12 +146,17 @@ const LIMITS = `SET LOCAL lock_timeout = '15s'; SET LOCAL statement_timeout = '3
 export async function tx(fn) {
   if (als.getStore()) return fn();
   const d = await driver().catch(e => { throw translate(e); });
+  // For Server-Timing: BEGIN (until fn may start) and COMMIT / ROLLBACK (after fn) count as a statement each.
+  const stats = counting.getStore();
+  let t = performance.now();
+  const tally = () => { if (stats) { stats.queries += 1; stats.ms += performance.now() - t; } };
   try {
     return await d.begin(async conn => {
-      await conn.query(LIMITS, []);
-      return als.run({ conn, write: false }, fn);
+      tally();
+      await timed(1, () => conn.query(LIMITS, []));
+      try { return await als.run({ conn, write: false }, fn); } finally { t = performance.now(); }
     });
-  } catch (e) { throw translate(e); }
+  } catch (e) { throw translate(e); } finally { tally(); }
 }
 
 // A transaction that changes data: one writer at a time across every server instance (advisory lock 42,

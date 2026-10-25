@@ -281,3 +281,40 @@ test('F5 clean-up report: the same step dates, backup and "Checked" as reading e
   assert.equal(r.backup, 'backup-before-tidy.db');
   assert.equal(r.checked.by, 'Tester');
 });
+
+// Server-Timing: how many statements and how long, on every answer — numbers only.
+test('Server-Timing: the database statements and time of each request, and nothing else', async () => {
+  const server = await new Promise(r => { const s = createApp({ cloud: false }).listen(0, '127.0.0.1', () => r(s)); });
+  try {
+    auth.setCookiePort(server.address().port);
+    const u = await auth.createUser({ username: 'timer', name: 'Timer Test', role: 'owner', password: 'timer-pass-1', mustChange: false });
+    const token = await auth.createSession(u.id);
+    const call = async (method, p, body, { as = token } = {}) => {
+      const res = await fetch(`http://127.0.0.1:${server.address().port}${p}`, { method,
+        headers: { ...(as ? { Cookie: `${auth.COOKIE}=${as}` } : {}), ...(body ? { 'Content-Type': 'application/json' } : {}) }, body: body && JSON.stringify(body) });
+      await res.arrayBuffer();
+      return { status: res.status, timing: res.headers.get('server-timing') };
+    };
+    const SHAPE = /^db;dur=\d+(\.\d)?;desc="(\d+) quer(y|ies)"$/;
+    const count = t => Number(SHAPE.exec(t)?.[2]);
+    let r = await call('GET', '/api/me');
+    assert.equal(r.status, 200);
+    assert.match(r.timing, SHAPE);
+    assert.ok(count(r.timing) >= 1, r.timing); // at least the session look-up
+    // a change: its transaction (BEGIN, time limits, write lock, data_version, COMMIT) is counted too
+    r = await call('PUT', '/api/settings', {});
+    assert.equal(r.status, 200);
+    assert.ok(count(r.timing) >= 5, r.timing);
+    // an answer with a body sent some other way, and a page with no database work at all
+    r = await call('GET', '/api/export/plan.xlsx');
+    assert.equal(r.status, 200);
+    assert.match(r.timing, SHAPE);
+    r = await call('GET', '/login', undefined, { as: null });
+    assert.equal(r.timing, 'db;dur=0.0;desc="0 queries"');
+    r = await call('GET', '/api/no-such-thing');
+    assert.equal(r.status, 404);
+    assert.match(r.timing, SHAPE);
+  } finally {
+    await new Promise(r => server.close(r));
+  }
+});

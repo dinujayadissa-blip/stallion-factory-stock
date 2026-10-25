@@ -20,7 +20,7 @@ import crypto from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { all, get, run, insert, writeTx, inTx, dataVersion, getSetting, setSetting, logAlloc, syncSuppliers, asBusy } from './db.js';
+import { all, get, run, insert, writeTx, inTx, dataVersion, getSetting, setSetting, logAlloc, syncSuppliers, asBusy, newQueryStats, countQueries } from './db.js';
 import { savePhoto, deletePhoto, readPhoto } from './photos.js';
 import { fetchWebImage } from './webImage.js';
 import * as layout from './layout.js';
@@ -75,9 +75,9 @@ const READS = new Set(['GET', 'HEAD']);
 function h(fn, { write = true } = {}) {
   return async (req, res) => {
     try {
-      const out = write && !READS.has(req.method)
-        ? await writeTx(() => stamped(req, () => fn(req, res)))
-        : await fn(req, res);
+      const out = await countQueries(req.dbStats, () => (write && !READS.has(req.method)
+        ? writeTx(() => stamped(req, () => fn(req, res)))
+        : fn(req, res)));
       if (!res.headersSent) res.json(out ?? { ok: true });
     } catch (e0) {
       // (the transaction is already rolled back here)
@@ -129,6 +129,20 @@ export function createApp({ cloud = false, passSecret = process.env.PASS_SECRET 
   // those headers are never believed.
   app.set('trust proxy', process.env.TRUST_PROXY === '1' ? 'loopback' : false);
   app.disable('x-powered-by');
+  // Server-Timing: "db;dur=12.3;desc=\"5 queries\"" — the database statements this request sent and the time spent
+  // waiting for them (src/db.js countQueries; the session look-up and the route's own work, through h()). It shows
+  // in the browser's Network tab, so the real cost of each screen can be seen on the live site. Numbers only:
+  // never SQL, values or data. Set just before the headers go out (whatever sends them: json, a file, a
+  // stream), and never once they are sent.
+  app.use((req, res, next) => {
+    const stats = req.dbStats = newQueryStats();
+    const writeHead = res.writeHead;
+    res.writeHead = function (...args) {
+      if (!res.headersSent) res.setHeader('Server-Timing', `db;dur=${stats.ms.toFixed(1)};desc="${stats.queries} ${stats.queries === 1 ? 'query' : 'queries'}"`);
+      return writeHead.apply(this, args);
+    };
+    next();
+  });
   app.use((req, res, next) => {
     res.setHeader('x-fs-app', '1'); // (see the top)
     res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -169,7 +183,7 @@ export function createApp({ cloud = false, passSecret = process.env.PASS_SECRET 
     try {
       const token = auth.readCookie(req.headers.cookie);
       if (token) {
-        const s = await auth.sessionFromToken(token);
+        const s = await countQueries(req.dbStats, () => auth.sessionFromToken(token));
         if (s) {
           req.user = s.user;
           req.sessionHash = s.tokenHash;
@@ -820,7 +834,7 @@ export function createApp({ cloud = false, passSecret = process.env.PASS_SECRET 
   }));
   app.get('/api/export/plan.xlsx', async (req, res) => {
     try {
-      const buf = await exportWorkbook();
+      const buf = await countQueries(req.dbStats, exportWorkbook); // (counted for Server-Timing, as in h())
       // Melbourne's date, whatever the server's own time zone (UTC in the cloud: yesterday until ~10am here).
       const stamp = inv.today();
       res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
