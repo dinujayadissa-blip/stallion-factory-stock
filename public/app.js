@@ -356,6 +356,7 @@ async function route({ keep = false } = {}) {
       if (deadModalStep()) quietBack();
       app.innerHTML = '<div class="empty">Loading…</div>'; window.scrollTo(0, 0);
     }
+    pageSummary = null;
     try { await fn(...m.slice(1)); }
     catch (e) { app.innerHTML = `<div class="panel empty">Couldn't load this page: ${esc(e.message)}</div>`; }
     if (was) {
@@ -370,7 +371,8 @@ async function route({ keep = false } = {}) {
     // A Dashboard link can ask for one part of the page ("POs to check", "Waiting on a decision"…).
     const to = sessionStorage.getItem('scrollTo');
     if (to) { sessionStorage.removeItem('scrollTo'); const el = document.getElementById(to); if (el) { if (el.tagName === 'DETAILS') el.open = true; el.scrollIntoView({ block: 'start' }); } }
-    refreshNavCount();
+    refreshNavCount(pageSummary);
+    pageSummary = null;
     return;
   }
   location.hash = '#/';
@@ -401,9 +403,11 @@ window.matchMedia('(min-width: 901px)').addEventListener?.('change', m => { if (
 document.addEventListener('click', e => { const a = e.target.closest?.('[data-purtab]'); if (a) sessionStorage.setItem('purTab', a.dataset.purtab); }, true);
 const reload = () => route({ keep: true });
 
-async function refreshNavCount() {
+// The summary the page just loaded (the Dashboard): the menu badge uses it instead of asking for it again.
+let pageSummary = null;
+async function refreshNavCount(loaded = null) {
   try {
-    const s = await api('GET', '/api/summary');
+    const s = loaded || await api('GET', '/api/summary');
     const el = $('#nav-order-count');
     // The same number as the Dashboard "Order now" row and the Purchasing "Order now" header.
     el.textContent = s.counts.itemsToOrder;
@@ -475,6 +479,7 @@ const VAN_FOCUS = {
 
 async function renderHome() {
   const [s, reminders] = await Promise.all([api('GET', '/api/summary'), api('GET', '/api/reminders')]);
+  pageSummary = s; // (for the menu badge, see refreshNavCount)
   const today = localToday();
   const c = s.counts;
   const active = s.vans.filter(v => ['planned', 'in_production'].includes(v.status));

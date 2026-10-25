@@ -7,6 +7,8 @@ import assert from 'node:assert/strict';
 import { freshDb } from './helpers.js';
 import { run, get, all, insert, writeTx, closeDb } from '../src/db.js';
 import * as inv from '../src/inventory.js';
+import * as auth from '../src/auth.js';
+import { createApp } from '../src/app.js';
 
 before(freshDb);
 after(closeDb);
@@ -112,4 +114,36 @@ test('F2 re-prioritise: the same set-asides as calling allocate for every stock 
   assert.equal(await held(later, d), 2);
   assert.equal(await held(first, d), 3);
   assert.equal(await held(first, e), 1);
+});
+
+// F3: the Dashboard answer is remembered until the data changes (data_version) or the day does.
+test('F3 /api/summary: the same answer until a change; any change (a new data_version) is seen at once', async () => {
+  const server = await new Promise(r => { const s = createApp({ cloud: false }).listen(0, '127.0.0.1', () => r(s)); });
+  try {
+    auth.setCookiePort(server.address().port);
+    const u = await auth.createUser({ username: 'speedy', name: 'Speed Test', role: 'owner', password: 'speedy-pass-1', mustChange: false });
+    const token = await auth.createSession(u.id);
+    const summary = async () => {
+      const res = await fetch(`http://127.0.0.1:${server.address().port}/api/summary`, { headers: { Cookie: `${auth.COOKIE}=${token}` } });
+      assert.equal(res.status, 200);
+      return res.json();
+    };
+    const first = await summary();
+    assert.deepEqual(await summary(), first, 'nothing changed: the same answer');
+    // A write outside writeTx (no new data_version) is not seen: the remembered answer is used…
+    await run(`INSERT INTO purchase_orders(po_no, supplier) VALUES('F3-1', 'MemoCo')`);
+    assert.equal((await summary()).counts.openPOs, first.counts.openPOs);
+    // …until any change made through the app (here one that changes nothing: still a new data_version)
+    const res = await fetch(`http://127.0.0.1:${server.address().port}/api/settings`, { method: 'PUT',
+      headers: { Cookie: `${auth.COOKIE}=${token}`, 'Content-Type': 'application/json' }, body: '{}' });
+    assert.equal(res.status, 200, await res.text());
+    const after1 = await summary();
+    assert.equal(after1.counts.openPOs, first.counts.openPOs + 1);
+    assert.deepEqual(await summary(), after1);
+    // or any other writeTx
+    await writeTx(() => run(`INSERT INTO purchase_orders(po_no, supplier) VALUES('F3-2', 'MemoCo')`));
+    assert.equal((await summary()).counts.openPOs, first.counts.openPOs + 2);
+  } finally {
+    await new Promise(r => server.close(r));
+  }
 });

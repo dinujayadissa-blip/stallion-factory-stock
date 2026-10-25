@@ -20,7 +20,7 @@ import crypto from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { all, get, run, insert, writeTx, getSetting, setSetting, logAlloc, syncSuppliers, asBusy } from './db.js';
+import { all, get, run, insert, writeTx, inTx, dataVersion, getSetting, setSetting, logAlloc, syncSuppliers, asBusy } from './db.js';
 import { savePhoto, deletePhoto, readPhoto } from './photos.js';
 import { fetchWebImage } from './webImage.js';
 import * as layout from './layout.js';
@@ -342,7 +342,23 @@ export function createApp({ cloud = false, passSecret = process.env.PASS_SECRET 
   }));
 
   // ── Dashboard ──
-  app.get('/api/summary', h(async () => ({ ...await inv.summary(), golive: await goLive(), demo: (await getSetting('demo')) === '1' })));
+  // The whole answer is remembered until the data changes or the day does: the same key and rules as
+  // shortagesCached() in inventory.js (data_version, bumped by every change on any server instance, and Melbourne's
+  // date; never inside a transaction; a failed working-out isn't kept). Working it out is about 90 queries, and the
+  // office app asks for it after every page (the menu badge). data_version is read from the database on every
+  // request, so a server instance never answers with figures that another instance has changed since.
+  let summaryMemo = null;
+  const dashboard = async () => ({ ...await inv.summary(), golive: await goLive(), demo: (await getSetting('demo')) === '1' });
+  app.get('/api/summary', h(async () => {
+    if (inTx()) return dashboard();
+    const key = `${await dataVersion()}|${inv.today()}`;
+    if (summaryMemo?.key !== key) {
+      const memo = { key, value: dashboard() };
+      summaryMemo = memo;
+      memo.value.catch(() => { if (summaryMemo === memo) summaryMemo = null; }); // (the request itself still gets the error)
+    }
+    return summaryMemo.value;
+  }));
 
   // ── Dealer orders ──
   // (OWN_TX: reading the PDF takes a moment and changes nothing — not under the write lock)
