@@ -5,7 +5,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { freshDb } from './helpers.js';
-import { run, get, all, insert, closeDb } from '../src/db.js';
+import { run, get, all, insert, writeTx, closeDb } from '../src/db.js';
 import * as inv from '../src/inventory.js';
 
 before(freshDb);
@@ -62,4 +62,54 @@ test('F1 checkOrdered: the target PO and the other open POs are the same as with
   assert.equal(by('77').supplier, '');
   assert.equal(by('77').target.exists, 0);
   assert.deepEqual(by('77').open_pos.map(p => p.id), [seven]);
+});
+
+// F2: re-prioritise asks for free stock once for every item, and hands out only the items that have some.
+test('F2 re-prioritise: the same set-asides as calling allocate for every stock item', async () => {
+  const later = await van('SP-F2-LATE', 'planned', '2099-06-01');
+  const first = await van('SP-F2-FIRST', 'in_production', '2026-01-10');
+  const done = await van('SP-F2-DONE', 'done', '');
+  const a = await item({ name: 'F2 bracket', on_hand: 3 });   // held by the later van: moves to the first
+  const b = await item({ name: 'F2 screw', on_hand: 0 });     // nothing on the shelf
+  const c = await item({ name: 'F2 fridge', on_hand: 2, kind: 'per-van' }); // never moved
+  const d = await item({ name: 'F2 seal', on_hand: 5 });      // locked for the later van: stays, the rest is handed out
+  const e = await item({ name: 'F2 rail', on_hand: 4 });      // a finished van's set-aside isn't counted: free
+  await line(later, a, { qty: 2, reserved: 2 });
+  await line(first, a, { qty: 2 });
+  await line(first, b, { qty: 1 });
+  await line(later, c, { qty: 1, reserved: 1 });
+  await line(first, c, { qty: 1 });
+  await line(later, d, { qty: 3, reserved: 3, firm: 2 });
+  await line(first, d, { qty: 4 });
+  await line(done, e, { qty: 4, reserved: 4 });
+  await line(first, e, { qty: 1 });
+
+  // The code before (inventory.js, cloud @ 4585471): allocate for every stock item; then rolled back.
+  const ROLL = Symbol('roll back');
+  const snapshot = () => all('SELECT id, reserved, reserved_firm FROM van_lines ORDER BY id');
+  let expected;
+  await writeTx(async () => {
+    await run(`UPDATE van_lines SET reserved = reserved_firm
+         WHERE reserved > reserved_firm AND van_id IN (SELECT id FROM vans v WHERE v.status IN ('planned','in_production'))
+           AND item_id IN (SELECT id FROM items WHERE kind = 'stock')`);
+    for (const { id } of await all(`SELECT id FROM items WHERE kind = 'stock' ORDER BY id`)) await inv.allocateItem(id, null, { reason: '' });
+    expected = await snapshot();
+    throw ROLL;
+  }).catch(err => { if (err !== ROLL) throw err; });
+
+  const before = await snapshot();
+  assert.notDeepEqual(expected, before, 'the fixture has something to move');
+  const preview = await inv.reprioritisePreview();
+  assert.deepEqual(await snapshot(), before, 'the preview keeps nothing');
+  const done1 = await inv.reprioritiseAll({ by: 'Test' });
+  assert.deepEqual(done1, preview);
+  assert.deepEqual(await snapshot(), expected);
+  // and what that means
+  const held = async (vanId, itemId) => (await get('SELECT reserved FROM van_lines WHERE van_id = ? AND item_id = ?', vanId, itemId)).reserved;
+  assert.equal(await held(first, a), 2);
+  assert.equal(await held(later, a), 1);
+  assert.equal(await held(later, c), 1);
+  assert.equal(await held(later, d), 2);
+  assert.equal(await held(first, d), 3);
+  assert.equal(await held(first, e), 1);
 });

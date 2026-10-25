@@ -251,7 +251,14 @@ async function runReprioritise() {
   await run(`UPDATE van_lines SET reserved = reserved_firm
        WHERE reserved > reserved_firm AND van_id IN (SELECT id FROM vans v WHERE ${ACTIVE_VAN})
          AND item_id IN (SELECT id FROM items WHERE kind = 'stock')`);
-  for (const { id } of await all(`SELECT id FROM items WHERE kind = 'stock' ORDER BY id`)) await allocateItem(id, null, { reason: '' });
+  // Every stock item's free stock in one query, and allocate() only where there is some to hand out (it reads
+  // it again itself). Asking allocate() for every item was two queries each even when nothing was free.
+  // Handing out one item only changes that item's lines, so reading all of them up front gives the same answer.
+  const free = await all(`SELECT i.id, i.on_hand, COALESCE(r.r, 0) AS r FROM items i
+                     LEFT JOIN (SELECT l.item_id, SUM(l.reserved) AS r FROM van_lines l JOIN vans v ON v.id = l.van_id
+                                WHERE ${ACTIVE_VAN} GROUP BY l.item_id) r ON r.item_id = i.id
+                     WHERE i.kind = 'stock' ORDER BY i.id`);
+  for (const { id, on_hand, r } of free) if (on_hand - r > 0) await allocateItem(id, null, { reason: '' });
 }
 
 // Per van: the parts it would gain and lose (net, per item).
