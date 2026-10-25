@@ -3112,6 +3112,22 @@ export async function reorderSuggestions(itemIds = null) {
   const med = await itemMedians(items.filter(i => onLines.has(i.id)).map(i => i.id));
   const lead = new Map((await all('SELECT name, lead_days FROM suppliers')).map(s => [s.name, s.lead_days]));
   const round = (n, unit) => (WHOLE_UNITS.test(unit || '') ? Math.ceil(n - 1e-9) : Math.round(n * 10) / 10);
+  // Floor consumables: the parts taken, for all of them at once — two queries in all, not one or two per item.
+  // First when each was first taken (days since then, worked out in SQL: `at` is Melbourne wall-clock time)…
+  const rest = items.filter(i => !onLines.has(i.id));
+  const firstTaken = new Map(rest.length ? (await all(`SELECT item_id, MIN(at) AS first, ${AGE_SECS('MIN(at)')} AS secs FROM movements
+      WHERE item_id IN (${rest.map(() => '?').join(',')}) AND type = 'issue' GROUP BY item_id`, ...rest.map(i => i.id))).map(r => [r.item_id, r]) : []);
+  const spans = new Map();
+  for (const i of rest) {
+    const h = firstTaken.get(i.id);
+    const days = h?.first ? h.secs / 86400 : 0;
+    if (days >= 28) spans.set(i.id, Math.min(days, 84));
+  }
+  // …then, for those with 4+ weeks of it, how many were taken in the last `span` days (up to 12 weeks).
+  const usedOf = new Map(spans.size ? (await all(`SELECT (g.x->>'id')::int AS id, (SELECT COALESCE(SUM(m.qty),0) FROM movements m
+        WHERE m.item_id = (g.x->>'id')::int AND m.type = 'issue' AND m.at >= to_char(${MELB} + (g.x->>'iv')::interval, 'YYYY-MM-DD HH24:MI:SS')) AS s
+      FROM json_array_elements(?::text::json) AS g(x)`, JSON.stringify([...spans].map(([id, span]) => ({ id, iv: `-${Math.round(span)} days` })))))
+    .map(r => [r.id, -r.s]) : []);
   for (const i of items) {
     if (onLines.has(i.id)) {
       const m = med.get(i.id) || 0;
@@ -3119,12 +3135,9 @@ export async function reorderSuggestions(itemIds = null) {
         : { level: null, why: 'no van use yet' });
       continue;
     }
-    // (days since the first one, worked out in SQL: `at` is Melbourne wall-clock time)
-    const h = await get(`SELECT MIN(at) AS first, ${AGE_SECS('MIN(at)')} AS secs FROM movements WHERE item_id = ? AND type = 'issue'`, i.id);
-    const days = h?.first ? h.secs / 86400 : 0;
-    if (days < 28) { out.set(i.id, { level: null, why: 'not enough history yet (needs 4 weeks of parts taken)' }); continue; }
-    const span = Math.min(days, 84);
-    const used = -(await get(`SELECT COALESCE(SUM(qty),0) AS s FROM movements WHERE item_id = ? AND type = 'issue' AND at >= to_char(${MELB} + ?::interval, 'YYYY-MM-DD HH24:MI:SS')`, i.id, `-${Math.round(span)} days`)).s;
+    if (!spans.has(i.id)) { out.set(i.id, { level: null, why: 'not enough history yet (needs 4 weeks of parts taken)' }); continue; }
+    const span = spans.get(i.id);
+    const used = usedOf.get(i.id);
     const perWeek = used / (span / 7);
     const ld = lead.get(String(i.supplier || '').trim()) ?? 14;
     const level = perWeek > 0 ? round(perWeek * (ld / 7 + 1), i.unit) : null;

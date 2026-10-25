@@ -147,3 +147,59 @@ test('F3 /api/summary: the same answer until a change; any change (a new data_ve
     await new Promise(r => server.close(r));
   }
 });
+
+// F4: reorder suggestions for floor consumables read the parts taken for every item at once.
+test('F4 reorder suggestions: the same levels as with one or two queries per item', async () => {
+  const MELB = `(now() AT TIME ZONE 'Australia/Melbourne')`;
+  // (an item's first take is never a whole number of days ago: the window starts a whole number of days back, and a
+  // take right on that second would be in or out depending on when the clock ticks over)
+  const take = (itemId, qty, ago) => run(`INSERT INTO movements(item_id, qty, type, at)
+    VALUES(?, ?, 'issue', to_char(${MELB} - ?::interval, 'YYYY-MM-DD HH24:MI:SS'))`, itemId, -qty, ago);
+  await run(`INSERT INTO suppliers(name, lead_days) VALUES('GlueCo', 21) ON CONFLICT (name) DO UPDATE SET lead_days = 21`);
+  const glue = await item({ name: 'F4 glue', supplier: 'GlueCo' });
+  const tape = await item({ name: 'F4 tape' });
+  const screws = await item({ name: 'F4 screws' });
+  const fresh = await item({ name: 'F4 new part' });
+  await item({ name: 'F4 never taken' });
+  const quiet = await item({ name: 'F4 not lately' });
+  await take(glue, 3, '40 days 18 hours'); await take(glue, 2, '10 days'); await take(glue, 1, '1 day');
+  await take(tape, 4, '100 days'); await take(tape, 5, '90 days'); await take(tape, 6, '30 days'); // 12 weeks at most: the first two don't count
+  await take(screws, 1.5, '29 days 18 hours');
+  await take(fresh, 9, '5 days');
+  await take(quiet, 0, '50 days 6 hours');
+  await run(`UPDATE items SET unit = 'ea' WHERE id = ?`, screws);
+
+  // The code before (inventory.js, cloud @ 4585471), for parts not on van lines.
+  const AGE = col => `EXTRACT(EPOCH FROM now() - ((${col})::timestamp AT TIME ZONE 'Australia/Melbourne'))`;
+  const lead = new Map((await all('SELECT name, lead_days FROM suppliers')).map(s => [s.name, s.lead_days]));
+  const round = (n, unit) => (/^(ea|set|kit|pair|sheet|length|box|roll|pack|pkt|bag)$/i.test(unit || '') ? Math.ceil(n - 1e-9) : Math.round(n * 10) / 10);
+  const oneByOne = async i => {
+    const h = await get(`SELECT MIN(at) AS first, ${AGE('MIN(at)')} AS secs FROM movements WHERE item_id = ? AND type = 'issue'`, i.id);
+    const days = h?.first ? h.secs / 86400 : 0;
+    if (days < 28) return { level: null, why: 'not enough history yet (needs 4 weeks of parts taken)' };
+    const span = Math.min(days, 84);
+    const used = -(await get(`SELECT COALESCE(SUM(qty),0) AS s FROM movements WHERE item_id = ? AND type = 'issue' AND at >= to_char(${MELB} + ?::interval, 'YYYY-MM-DD HH24:MI:SS')`, i.id, `-${Math.round(span)} days`)).s;
+    const perWeek = used / (span / 7);
+    const ld = lead.get(String(i.supplier || '').trim()) ?? 14;
+    const level = perWeek > 0 ? round(perWeek * (ld / 7 + 1), i.unit) : null;
+    // (the "why" text uses q(), the app's own number format: compared by its level and the start of the text)
+    return { level, why: level ? 'a week' : 'not used in the last weeks' };
+  };
+  const got = await inv.reorderSuggestions();
+  const mine = await all(`SELECT id, unit, supplier FROM items WHERE name LIKE 'F4 %' ORDER BY id`);
+  for (const i of mine) {
+    const want = await oneByOne(i), have = got.get(i.id);
+    assert.equal(have.level, want.level, i.id);
+    if (want.why === 'a week') assert.match(have.why, / a week × /); else assert.equal(have.why, want.why);
+  }
+  // and what that means
+  assert.ok(got.get(glue).level > 0);
+  assert.ok(got.get(tape).level > 0);
+  assert.equal(got.get(screws).level, 2); // 1.09 a whole unit: rounded up
+  assert.equal(got.get(fresh).level, null);
+  assert.equal(got.get(quiet).why, 'not used in the last weeks');
+  // asking for some items only
+  const some = await inv.reorderSuggestions([glue, fresh]);
+  assert.deepEqual([...some.keys()].sort((a, b) => a - b), [glue, fresh].sort((a, b) => a - b));
+  assert.deepEqual(some.get(glue), got.get(glue));
+});
