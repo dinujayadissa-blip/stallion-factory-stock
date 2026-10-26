@@ -159,3 +159,23 @@ test('a stock figure already Infinity / NaN in the database is put right by a co
   assert.equal(await onHand(it), 6);
   assert.equal((await get('SELECT reserved FROM van_lines WHERE id = ?', l)).reserved, 3);
 });
+
+// ── 3. Cache-Control ──
+
+test('every /api answer says no-store; the plan export says private, no-store; photos keep their own', async () => {
+  let r = await call('GET', '/api/export/plan.xlsx', { as: S.olive });
+  assert.equal(r.status, 200, r.text);
+  assert.match(r.headers['content-type'], /spreadsheetml/);
+  assert.equal(r.headers['cache-control'], 'private, no-store');
+  r = await call('GET', '/api/me', { as: S.olive });
+  assert.equal(r.status, 200);
+  assert.equal(r.headers['cache-control'], 'no-store');
+  for (const [m, p, as] of [['GET', '/api/vans', S.olive], ['GET', '/api/me', null], ['GET', '/api/export/plan.xlsx', S.sam], ['GET', '/api/nothing-here', S.olive], ['POST', '/api/logout', null]]) {
+    r = await call(m, p, { as });
+    assert.equal(r.headers['cache-control'], 'no-store', `${m} ${p} (${r.status})`);
+  }
+  // (not under /api: the photo route sets its own, a 404 here has none from us)
+  r = await call('GET', '/photos/none.jpg', { as: S.olive });
+  assert.equal(r.status, 404);
+  assert.notEqual(r.headers['cache-control'], 'no-store');
+});

@@ -150,6 +150,9 @@ export function createApp({ cloud = false, passSecret = process.env.PASS_SECRET 
     res.setHeader('X-Frame-Options', 'SAMEORIGIN');
     next();
   });
+  // Every /api answer is one person's data (or a refusal): never kept by the browser or anything between it and
+  // here, unless a route says otherwise (it sets its own Cache-Control, which replaces this one).
+  app.use('/api', (req, res, next) => { res.setHeader('Cache-Control', 'no-store'); next(); });
   // ── Online: only the Pages pass-through may call (see the top) ──
   // The secret is compared in constant time (as sha256 digests, so a wrong length tells nothing either).
   // Without it: 403 before anything else — no session look-up, no database at all. Not set on the function:
@@ -841,6 +844,9 @@ export function createApp({ cloud = false, passSecret = process.env.PASS_SECRET 
       const stamp = inv.today();
       res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
       res.setHeader('Content-Disposition', `attachment; filename="Production Plan ${stamp}.xlsx"`);
+      // The whole plan (customers' names): this browser only, and not even kept there. The address ends in .xlsx,
+      // which a cache in front of the cloud function could otherwise keep by its address alone.
+      res.setHeader('Cache-Control', 'private, no-store');
       res.send(buf);
     } catch (e) {
       console.error(now(), req.method, req.originalUrl, e);
