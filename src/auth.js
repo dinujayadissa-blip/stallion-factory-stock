@@ -566,12 +566,19 @@ export async function login({ username, password, ip = '', ua = '' }, throttle, 
   }
   // One transaction: the wrong tries are cleared, last login and the new session saved. No new data_version
   // (nothing any screen shows changed), so logging in doesn't refresh everyone else's screens.
+  // The password was checked above, outside the write lock: a password reset / change or a turned-off login
+  // may have been saved since (it ended the sessions there were). So the session is only made if the login
+  // still has the very password that was checked and is still on — read again here, under the lock, just
+  // before the session is saved; otherwise the same "wrong" answer and nothing is saved (the tx rolls back).
+  let user = row;
   const token = await writeTx(async () => {
     await throttle.success(ip, uname);
     await run(`UPDATE users SET last_login = ${MELBOURNE_NOW} WHERE id = ?`, row.id);
+    user = await get('SELECT * FROM users WHERE id = ?', row.id);
+    if (!user || user.pass_hash !== row.pass_hash || !user.active) throw httpError(401, WRONG);
     return createSession(row.id, { ip, ua }, now);
   }, NO_BUMP);
-  return { token, user: { ...publicUser(row), mustChange: !!row.must_change } };
+  return { token, user: { ...publicUser(user), mustChange: !!user.must_change } };
 }
 
 // ───────────────────────── first login (setup) ─────────────────────────

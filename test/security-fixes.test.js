@@ -248,3 +248,35 @@ test('"gone out the gate", moving a van and assigning stock to it: only for a va
   assert.equal(r.status, 200, r.text);
   assert.equal((await get('SELECT status FROM vans WHERE id = ?', v)).status, 'completed');
 });
+
+// ── 5. a log in racing a password reset ──
+
+test('a log in whose password was reset (or login turned off) after the check gets "wrong" and no session', async () => {
+  const u = await auth.createUser({ username: 'vic', name: 'Vic Tim', role: 'worker', trade: 'plumber', password: 'old-pass-123', mustChange: false }, 'test');
+  const real = auth.createThrottle();
+  // The reset lands between the password check and the session being saved: done here from the throttle's
+  // success(), which runs inside the log in's own transaction, just before the session is made.
+  const racing = change => ({ ...real, lockedUntil: real.lockedUntil.bind(real), fail: real.fail, async success(...a) { await change(); return real.success(...a); } });
+  const sessions = async () => (await get('SELECT COUNT(*) AS n FROM sessions WHERE user_id = ?', u.id)).n;
+  const before = await sessions();
+
+  await assert.rejects(auth.login({ username: 'vic', password: 'old-pass-123', ip: '10.9.9.9' },
+    racing(() => auth.resetPassword(u.id, 'new-pass-456', { mustChange: false }))), { status: 401, message: auth.WRONG });
+  assert.equal(await sessions(), before);
+  // (the reset itself is kept: it was saved first; here it ran inside the log in's transaction, so do it again)
+  await auth.resetPassword(u.id, 'new-pass-456', { mustChange: false });
+  await assert.rejects(auth.login({ username: 'vic', password: 'old-pass-123', ip: '10.9.9.9' }, real), { status: 401 });
+
+  // the same for the person's own change of password, and for a login turned off meanwhile
+  await assert.rejects(auth.login({ username: 'vic', password: 'new-pass-456', ip: '10.9.9.9' },
+    racing(() => run(`UPDATE users SET pass_hash = 'scrypt$16384$8$1$AAAA$AAAA' WHERE id = ?`, u.id))), { status: 401, message: auth.WRONG });
+  await assert.rejects(auth.login({ username: 'vic', password: 'new-pass-456', ip: '10.9.9.9' },
+    racing(() => run('UPDATE users SET active = 0 WHERE id = ?', u.id))), { status: 401, message: auth.WRONG });
+  assert.equal(await sessions(), before);
+
+  // nothing racing: logs in as before, with the login as it is now
+  const ok = await auth.login({ username: 'vic', password: 'new-pass-456', ip: '10.9.9.9' }, real);
+  assert.ok(ok.token);
+  assert.equal(ok.user.mustChange, false);
+  assert.equal(await sessions(), before + 1);
+});
