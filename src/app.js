@@ -420,7 +420,7 @@ export function createApp({ cloud = false, passSecret = process.env.PASS_SECRET 
   app.delete('/api/van-lines/:id', h(req => inv.deleteLine(id(req))));
   app.post('/api/van-lines/:id/return', h(req => {
     const qty = num(req.body.qty);
-    if (!(qty > 0)) throw inv.httpError(400, 'Type how many to return, e.g. 2'); // never "return everything" by mistake
+    inv.checkQty(qty, 'Type how many to return, e.g. 2'); // never "return everything" by mistake
     return inv.returnLine(id(req), qty);
   }));
   app.post('/api/van-lines/:id/status', h(req => inv.setLineStatus(id(req), req.body.status, { po_no: req.body.po_no })));
@@ -675,10 +675,12 @@ export function createApp({ cloud = false, passSecret = process.env.PASS_SECRET 
   app.post('/api/items', h(async req => {
     const v = itemValues(req.body);
     if (!v.sku || !v.name) throw inv.httpError(400, 'SKU and name are required');
+    const opening = Number(req.body.on_hand);
+    if (opening > 0) inv.checkQty(opening); // (blank / 0: no opening stock, as before; Infinity is refused)
     if (await get('SELECT 1 FROM items WHERE sku = ?', v.sku)) throw inv.httpError(409, `SKU ${v.sku} already exists`);
     const keys = ITEM_FIELDS.filter(k => v[k] != null);
     const newId = await insert(`INSERT INTO items(${keys.join(',')}) VALUES(${keys.map(() => '?').join(',')})`, ...keys.map(k => v[k]));
-    if (Number(req.body.on_hand) > 0) await inv.receive(newId, Number(req.body.on_hand), { note: 'Opening stock' });
+    if (opening > 0) await inv.receive(newId, opening, { note: 'Opening stock' });
     await assignMissingTrades(); // no trade picked → best guess from the name
     return { id: newId };
   }));

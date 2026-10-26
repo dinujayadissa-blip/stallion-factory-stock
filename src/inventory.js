@@ -196,7 +196,7 @@ async function allocate(itemId, preferVan = null, { firm = 0, reason = 'allocate
   const reserved = (await get(`SELECT COALESCE(SUM(l.reserved),0) AS r FROM van_lines l JOIN vans v ON v.id = l.van_id
                         WHERE l.item_id = ? AND ${ACTIVE_VAN}`, itemId)).r;
   let free = item.on_hand - reserved;
-  if (free <= 0) return;
+  if (!(free > 0) || !Number.isFinite(free)) return; // (a stock figure that is not a number hands out nothing)
   const lines = await all(`SELECT l.* FROM van_lines l JOIN vans v ON v.id = l.van_id
                      WHERE l.item_id = ? AND ${ACTIVE_VAN} AND l.qty > l.reserved + l.issued AND ${ALLOCATABLE('l')}
                        AND (? = 'stock' OR v.id = ?)
@@ -673,7 +673,7 @@ export async function deleteVan(id) {
 }
 
 export async function addLine(vanId, { item_id, qty, spec = '', note = '' }) {
-  if (!(qty > 0)) throw httpError(400, 'Quantity must be more than 0');
+  checkQty(qty);
   return writeTx(async () => {
     if (!await get('SELECT 1 FROM vans WHERE id = ?', vanId)) throw httpError(404, 'That van no longer exists — refresh');
     const id = await insert(`INSERT INTO van_lines(van_id, item_id, qty, spec, note, source) VALUES(?,?,?,?,?, 'manual')`, vanId, item_id, qty, spec, note);
@@ -687,6 +687,8 @@ export async function updateLine(lineId, { qty, spec, note }) {
     const l = await get('SELECT * FROM van_lines WHERE id = ?', lineId);
     if (!l) throw httpError(404, 'Line not found');
     const newQty = qty ?? l.qty;
+    // 0 is fine here (nothing needed any more), but never Infinity / NaN / an absurd amount.
+    if (!(Number.isFinite(newQty) && newQty >= 0 && newQty <= MAX_QTY)) throw httpError(400, `Type a quantity from 0 to ${MAX_QTY}`);
     if (newQty < l.issued) throw httpError(400, `${l.issued} already issued — can't go below that`);
     // Editing a rule line by hand turns it into a manual line so a rebuild won't overwrite it.
     await run(`UPDATE van_lines SET qty = ?, reserved = LEAST(reserved, ?::double precision - issued), spec = ?, note = ?, source = 'manual' WHERE id = ?`,
@@ -744,7 +746,7 @@ export async function returnLine(lineId, qty) {
 // locked to that van, so re-prioritising never moves it.
 // `poRef`: the order number it came on (the van's line naming that order is filled first — see allocateItem).
 export async function receive(itemId, qty, { ref = '', note = '', vanId = null, by = '', poRef = '' } = {}) {
-  if (!(qty > 0)) throw httpError(400, 'Quantity must be more than 0');
+  checkQty(qty);
   return writeTx(async () => {
     const mv = await insert(`INSERT INTO movements(item_id, qty, type, ref, note, van_id, worker) VALUES(?, ?, 'receive', ?, ?, ?, ?)`, itemId, qty, ref, note, vanId, by);
     await stockIn(itemId, qty, vanId, by, poRef);
@@ -781,7 +783,7 @@ async function closePoIfDone(poId) {
 // lines for finished vans last), the PO / line number only as the tie-break. Follow-up round 1
 // (chk-r3-1): in line-number order a delivery of 2 went to vans #2 and #4 while #1 and #3 waited.
 export async function receiveDelivery(itemId, qty, { ref = '', note = '', vanId = null, by = '' } = {}) {
-  if (!(qty > 0)) throw httpError(400, 'Quantity must be more than 0');
+  checkQty(qty);
   return writeTx(async () => {
     const item = await get('SELECT kind FROM items WHERE id = ?', itemId);
     if (!item) throw httpError(404, 'Item not found');
@@ -868,8 +870,23 @@ export async function adjust(itemId, { mode = 'set', qty, note = '', type, by = 
   await writeTx(async () => {
     const item = await get('SELECT * FROM items WHERE id = ?', itemId);
     if (!item) throw httpError(404, 'Item not found');
-    if (!Number.isFinite(Number(qty))) throw httpError(400, 'Type a quantity');
+    qty = Number(qty);
+    if (!Number.isFinite(qty)) throw httpError(400, 'Type a quantity');
+    if (Math.abs(qty) > MAX_QTY) throw httpError(400, `That's too many — at most ${MAX_QTY} at a time`);
     const kind = type || (mode === 'set' ? 'count' : 'adjust');
+    // A stock figure that is not a number (Infinity / NaN, saved before quantities were checked): nothing can be
+    // added to it, but a count (or "set to zero") puts the real figure back. The movement says so; its qty is
+    // 0 because the change from "not a number" has no size.
+    if (!Number.isFinite(item.on_hand)) {
+      if (mode !== 'set') throw httpError(400, "This part's stock figure is broken — count it (set the number on the shelf) to fix it");
+      await run('UPDATE items SET on_hand = ? WHERE id = ?', qty, itemId);
+      await run(`INSERT INTO movements(item_id, qty, type, note, worker) VALUES(?, 0, ?, ?, ?)`, itemId, kind,
+          [note || (kind === 'count' ? 'Stocktake' : 'Adjustment'), `stock figure was not a number (${item.on_hand}) — set to ${q(qty)}`].join(' · '), by);
+      if (kind === 'count') await run(`UPDATE items SET last_counted = ${NOW_SQL} WHERE id = ?`, itemId);
+      await trimReservations(itemId, { reason: kind, worker: by });
+      await allocateItem(itemId, null, { reason: kind, worker: by });
+      return;
+    }
     const delta = mode === 'set' ? qty - item.on_hand : qty;
     if (!Number.isFinite(delta) || (delta === 0 && kind !== 'count')) return;
     await run('UPDATE items SET on_hand = on_hand + ? WHERE id = ?', delta, itemId);
@@ -1873,8 +1890,9 @@ export async function overdueLines() {
 // supplier, needs a yes first (`confirm`): the reply is 409 with `confirm.warnings`.
 export async function createPO({ po_no, supplier = '', notes = '', lines = [], ordered_at = '', expected = '', confirm = false }) {
   if (!String(po_no || '').trim()) throw httpError(400, 'PO number is required');
-  const valid = lines.filter(l => l.item_id && l.qty > 0);
+  const valid = lines.filter(l => l.item_id && Number(l.qty) > 0);
   if (!valid.length) throw httpError(400, 'Add at least one line');
+  for (const l of valid) checkQty(Number(l.qty)); // (a blank / 0 line is left out, as before; Infinity is refused)
   if (expected && !validDate(expected)) throw httpError(400, 'Pick the expected date');
   return writeTx(async () => {
     // Stops a double-click on "Create PO" making the same order twice (and doubling "on order").
@@ -1897,6 +1915,7 @@ export async function createPO({ po_no, supplier = '', notes = '', lines = [], o
       if (merged.has(k)) merged.get(k).qty += Number(l.qty);
       else merged.set(k, { item_id: Number(l.item_id), van_id: Number(l.van_id) || null, qty: Number(l.qty), spec });
     }
+    for (const l of merged.values()) checkQty(l.qty); // (lines for the same part add up)
     for (const l of merged.values()) await run('INSERT INTO po_lines(po_id, item_id, qty, van_id, spec) VALUES(?,?,?,?,?)', id, l.item_id, l.qty, l.van_id, l.spec);
     if (!sup) await run('UPDATE purchase_orders SET needs_check = 1 WHERE id = ?', id);
     await syncSuppliers();
@@ -1928,6 +1947,7 @@ export async function receivePO(poId, receipts = [], { backorder = {}, closeBala
       const pl = await lineRow(r.id);
       const got = Number(r.qty);
       if (!pl || !(got > 0)) continue;
+      checkQty(got);
       booked++;
       const due = Math.max(0, pl.qty - pl.received - pl.closed);
       const take = Math.min(got, due), extra = got - take;
@@ -2245,7 +2265,7 @@ export async function takeForVan(lineId, qty, by = '', { extraLine = false, seen
     if (!['planned', 'in_production'].includes(l.van_status)) throw httpError(400, `${l.chassis} is finished — parts can't be taken for it`);
     if (seenIssued != null && Number(seenIssued) !== l.issued) throw httpError(409, 'Someone already took some of this. Check the list.');
     const take = qty == null ? l.qty - l.issued : Number(qty);
-    if (!(take > 0)) throw httpError(400, 'How many did you take?');
+    checkQty(take, 'How many did you take?');
     // What this take changes, so Undo can put every bit of it back.
     const rec = { line: lineId, own: Math.min(l.reserved, take), ownFirm: l.reserved_firm, corr: 0, corrMv: null, borrowed: [], po: [], reopen: [], extraLine: !!extraLine };
     // Took more than the list said: the list grows to match.
@@ -2397,7 +2417,7 @@ export async function floorExtra(vanId, itemId, qty, by = '', { seenTaken, accep
     if (!van) throw httpError(404, 'That van no longer exists — refresh');
     if (!['planned', 'in_production'].includes(van.status)) throw httpError(400, `${van.chassis} is finished — parts can't be taken for it`);
     if (!await get('SELECT 1 FROM items WHERE id = ?', itemId)) throw httpError(404, 'Part not found');
-    if (!(qty > 0)) throw httpError(400, 'How many did you take?');
+    checkQty(qty, 'How many did you take?');
     if (seenTaken != null) {
       const taken = (await get('SELECT COALESCE(SUM(issued),0) AS n FROM van_lines WHERE van_id = ? AND item_id = ?', vanId, itemId)).n;
       if (Number(seenTaken) !== taken) throw httpError(409, 'Someone already took some of this. Check the list.');
@@ -2865,16 +2885,20 @@ export async function checkCount(id, counts = [], { timing = {} } = {}) {
   const s = await countSession(id);
   const seen = new Set();
   const out = [];
-  for (const c of counts.filter(c => c.qty !== '' && c.qty != null && Number.isFinite(Number(c.qty)) && s.expected[c.item_id] != null)
+  // (a part in this count: its key is there even when the figure is null — JSON writes Infinity / NaN as null)
+  for (const c of counts.filter(c => c.qty !== '' && c.qty != null && Number.isFinite(Number(c.qty)) && Object.hasOwn(s.expected, String(Number(c.item_id))))
     .filter(c => !seen.has(Number(c.item_id)) && seen.add(Number(c.item_id)))) {
       const itemId = Number(c.item_id), counted = Number(c.qty), expected = s.expected[itemId];
       const it = await get('SELECT sku, name, unit, on_hand FROM items WHERE id = ?', itemId);
       const now = it ? it.on_hand : expected;
-      const moved = now - expected;
+      // A stock figure that is not a number (then or now): the count is the only figure there is, so it is
+      // taken as it stands ("after"), and nothing is worked out from the old figure.
+      const broken = !Number.isFinite(now) || !Number.isFinite(expected);
+      const moved = broken ? 0 : now - expected;
       const locked = await lockedFor(itemId);
       const moves = await all(`SELECT m.at, m.type, m.qty, m.worker, m.note, v.chassis FROM movements m LEFT JOIN vans v ON v.id = m.van_id
                          WHERE m.item_id = ? AND m.id > ? ORDER BY m.id`, itemId, s.last_move_id);
-      const changed = moves.length > 0 || Math.abs(moved) > 1e-9;
+      const changed = !broken && (moves.length > 0 || Math.abs(moved) > 1e-9);
       const said = ['before', 'after'].includes(timing[itemId]) ? timing[itemId] : '';
       const when = changed ? said || 'after' : 'after';
       const bookFor = w => w === 'before' ? counted + moved : counted;
@@ -2884,7 +2908,7 @@ export async function checkCount(id, counts = [], { timing = {} } = {}) {
       out.push({ item_id: itemId, sku: it?.sku, name: it?.name, unit: it?.unit, expected, now, moved, counted, moves,
         changed, timing: changed ? said : 'after', // '' = moved while counting and not answered yet
         book, diff: book - now, diff_before: counted - expected, diff_after: counted - now,
-        big: when === 'before' ? bigDiff(expected, counted) : bigDiff(now, counted), big_before: bigDiff(expected, counted), big_after: bigDiff(now, counted),
+        big: broken ? false : when === 'before' ? bigDiff(expected, counted) : bigDiff(now, counted), big_before: bigDiff(expected, counted), big_after: bigDiff(now, counted),
         locked: locked.total, lockedVans: locked.vans,
         shortfall, shortfall_before: shortFor('before'), shortfall_after: shortFor('after'), belowLocked: shortfall > 1e-9 });
   }
@@ -2913,6 +2937,7 @@ export async function saveCount(id, { counts = [], elsewhere = {}, elsewhereQty 
       const c = byId.get(r.item_id);
       const vans = r.lockedVans.map(v => v.chassis).join(', ');
       if (r.counted < 0) { problems.push(`${r.name}: a count can't be below 0`); continue; }
+      if (r.counted > MAX_QTY) { problems.push(`${r.name}: that's too many — at most ${MAX_QTY}`); continue; }
       if (r.changed && !r.timing) { problems.push(`${r.name}: stock moved while counting — was the shelf counted before or after those movements?`); continue; }
       if (r.book < -1e-9) problems.push(`${r.name}: counted before the movements would leave the books below 0 — check the count or pick "after"`);
       if (r.big && !String(c.reason || '').trim() && !c.recounted) problems.push(`${r.name}: recount or give a reason`);
@@ -2937,7 +2962,10 @@ export async function saveCount(id, { counts = [], elsewhere = {}, elsewhereQty 
       const missing = r.belowLocked ? Math.max(0, r.shortfall - away) : 0;
       const target = r.book + away;                   // on the books = shelf (+ what moved after it was counted) + kept elsewhere
       const nowOnHand = (await get('SELECT on_hand FROM items WHERE id = ?', r.item_id)).on_hand;
-      const delta = target - nowOnHand;               // against the books right now, so nothing is counted twice
+      // A stock figure that is not a number (Infinity / NaN, from before quantities were checked) is replaced
+      // by the count: adding to it would stay Infinity / NaN. The movement's qty is 0 (that change has no size).
+      const broken = !Number.isFinite(nowOnHand);
+      const delta = broken ? 0 : target - nowOnHand;  // against the books right now, so nothing is counted twice
       const vans = r.lockedVans.map(v => v.chassis).join(', ');
       const note = [`Counted ${q(r.counted)} ${r.unit || ''}`.trim()
           + (r.changed ? ` (${r.timing === 'before'
@@ -2945,13 +2973,15 @@ export async function saveCount(id, { counts = [], elsewhere = {}, elsewhereQty 
             : 'after the stock that moved while counting'})` : '')
           + (away ? ` + ${q(away)} kept elsewhere for ${vans}` : ''),
         missing > 1e-9 ? `${q(missing)} kept for ${vans} missing — back to short` : '',
+        broken ? `stock figure was not a number (${nowOnHand}) — set to ${q(target)}` : '',
         String(c.reason || '').trim(), c.recounted ? 'recounted' : '', `(${s.label})`].filter(Boolean).join(' · ');
-      await run(`UPDATE items SET on_hand = on_hand + ?, last_counted = ${NOW_SQL} WHERE id = ?`, delta, r.item_id);
+      if (broken) await run(`UPDATE items SET on_hand = ?, last_counted = ${NOW_SQL} WHERE id = ?`, target, r.item_id);
+      else await run(`UPDATE items SET on_hand = on_hand + ?, last_counted = ${NOW_SQL} WHERE id = ?`, delta, r.item_id);
       await run(`INSERT INTO movements(item_id, qty, type, ref, note, worker) VALUES(?, ?, 'count', ?, ?, ?)`, r.item_id, delta, `Count #${id}`, note, by);
       saved++;
       // More found than the books said: the extra shelf stock goes to vans waiting for it. Stock added
       // by a "kept elsewhere" answer is never handed out — it only covers what is already kept for vans.
-      if (delta > 1e-9 && !away) await allocateItem(r.item_id, null, { reason: 'count', worker: by });
+      if ((delta > 1e-9 || broken) && !away) await allocateItem(r.item_id, null, { reason: 'count', worker: by });
       // Less: shelf stock merely held for the vans built last goes back first (logged)…
       await trimReservations(r.item_id, { reason: 'count', worker: by });
       // …then parts received for vans that aren't on the shelf or anywhere else go back to short.
@@ -3074,6 +3104,7 @@ export async function assignToVan(itemId, vanId, qty, by = '') {
     const it = await get('SELECT * FROM items WHERE id = ?', itemId);
     if (!it) throw httpError(404, 'Part not found');
     const free = it.on_hand - (await get(`SELECT COALESCE(SUM(l.reserved),0) AS r FROM van_lines l JOIN vans v ON v.id = l.van_id WHERE l.item_id = ? AND ${ACTIVE_VAN}`, itemId)).r;
+    if (!(qty == null || qty === '')) checkQty(Number(qty));
     const want = qty == null || qty === '' ? free : Math.min(Number(qty), free);
     if (!(want > 1e-9)) throw httpError(409, 'Nothing left to assign — refresh');
     const van = await get('SELECT chassis FROM vans WHERE id = ?', vanId);
@@ -3336,4 +3367,16 @@ export async function ackCheck(kind, id, ack = true) {
 
 export function httpError(status, message) {
   return Object.assign(new Error(message), { status });
+}
+
+// The most of a part that one change may book (a take, a delivery, a PO line, a count).
+export const MAX_QTY = 100000;
+// A quantity that may go on the books: a real number, more than 0, not absurd. JSON reads 1e400 as Infinity
+// (and Number('Infinity') is Infinity too); once on_hand is Infinity it never adds up again, so it is refused.
+export const goodQty = n => Number.isFinite(n) && n > 0 && n <= MAX_QTY;
+// The same as a 400 in plain words: `msg` for nothing / 0 / not a number, "too many" for the rest.
+export function checkQty(n, msg = 'Quantity must be more than 0') {
+  if (goodQty(n)) return n;
+  if (!(n > 0)) throw httpError(400, msg);
+  throw httpError(400, `That's too many — at most ${MAX_QTY} at a time`);
 }
