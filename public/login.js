@@ -157,8 +157,11 @@ function setupForm(here) {
   });
 }
 
+// Only the office PC can end the session (the cookie can't be removed from here): until it says so the
+// person stays on this form and is told.
 async function logout() {
-  try { await call('POST', '/api/logout'); } catch { /* logged out anyway */ }
+  try { await call('POST', '/api/logout'); }
+  catch (e) { return showError(e.status === 0 ? "Couldn't log out — no signal. Try again when you have signal." : `Couldn't log out — ${e.message}`); }
   location.replace('/login?out=1');
 }
 

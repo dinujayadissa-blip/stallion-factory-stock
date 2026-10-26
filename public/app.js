@@ -2219,9 +2219,15 @@ function changePasswordDialog() {
   $('#cp-save', m.el).onclick = save;
 }
 
+// Only the office PC can end the session (the cookie can't be removed from here): until it says so (a 2xx)
+// the person stays on this screen and is told, so nobody carries on as them once the connection is back.
 async function logout() {
-  try { await fetch('/api/logout', { method: 'POST' }); } catch { /* logged out on this browser anyway */ }
+  let res = null;
+  try { res = await fetch('/api/logout', { method: 'POST' }); } catch { /* no connection */ }
+  if (!res?.ok) return toast(res ? "Couldn't log out — something went wrong, try again" : "Couldn't log out — no connection. Try again when you're back online.", true);
   try { sessionStorage.clear(); localStorage.removeItem('officeName'); } catch { /* private mode */ }
+  // What the worker app kept on this browser for a person (takes / bookings to undo, the last van) goes too.
+  for (const k of ['takes', 'lastTake', 'lastBooking', 'lastVan']) { try { localStorage.removeItem(`floor.${k}`); } catch { /* private mode */ } }
   location.replace('/login?out=1');
 }
 

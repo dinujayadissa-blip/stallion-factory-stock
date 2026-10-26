@@ -68,13 +68,15 @@ async function api(method, url, body) {
     throw new Error(method === 'GET' ? 'No signal — check the Wi-Fi and try again' : 'No signal. Not sure it saved. Check the list before trying again.');
   } finally { clearTimeout(timer); }
   // Not logged in (any more), or a new password to choose first: the log in page, then back here.
-  if (res.status === 401 || (res.status === 403 && data.mustChange)) toLogin(!!data.ended);
+  if (res.status === 401 || (res.status === 403 && data.mustChange)) toLogin(!!data.ended, res.status === 401);
   if (!res.ok) throw Object.assign(new Error(data.error || 'Something went wrong — try again'), { status: res.status, confirm: data.confirm });
   return data;
 }
-function toLogin(ended = false) {
+// signedOut: the session has ended (401), so what this phone kept for that person goes too.
+function toLogin(ended = false, signedOut = false) {
   if (toLogin.going) return;
   toLogin.going = true;
+  if (signedOut) forgetPerson();
   location.href = `/login?next=${encodeURIComponent(`/floor${location.hash}`)}${ended ? '&ended=1' : ''}`;
 }
 // A one-off id for a request, so a retry isn't booked twice (crypto.randomUUID needs https).
@@ -242,7 +244,7 @@ function whoSheet() {
     <button type="button" class="cancel" data-close>Close</button>`);
   $$('[data-t]', s.el).forEach(b => { b.onclick = () => { setTrade(b.dataset.t); s.close(); itemsCache = null; route(); }; });
   $('#w-pw', s.el).onclick = () => passwordSheet();
-  $('#w-out', s.el).onclick = e => { e.currentTarget.disabled = true; logout(); };
+  $('#w-out', s.el).onclick = e => { e.currentTarget.disabled = true; logout(e.currentTarget); };
 }
 
 function passwordSheet() {
@@ -266,13 +268,25 @@ function passwordSheet() {
   };
 }
 
-// Log out: the session ends on the office PC, and the screens kept on this phone for no-signal use are
-// cleared, so the next person sees nothing of the last one.
-async function logout() {
-  try { await fetch('/api/logout', { method: 'POST' }); } catch { /* logged out here anyway */ }
-  // What this phone remembered for the person (their takes / bookings to undo, the last van) goes too, so the
-  // next person on a shared phone doesn't see it.
+// What this phone remembered for the person (their takes / bookings to undo, the last van): gone when they log
+// out or their session ends, so the next person on a shared phone doesn't see it.
+function forgetPerson() {
   for (const k of ['takes', 'lastTake', 'lastBooking', 'lastVan']) { try { localStorage.removeItem(`floor.${k}`); } catch { /* private mode */ } }
+}
+// Log out: the session ends on the office PC, and the screens kept on this phone for no-signal use are
+// cleared, so the next person sees nothing of the last one. Only the office PC can end the session (the
+// cookie can't be removed from here), so until it says so (a 2xx) the person stays on this screen and is
+// told: otherwise the next person would carry on as them once the signal is back.
+async function logout(btn) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 15000);
+  let res = null;
+  try { res = await fetch('/api/logout', { method: 'POST', signal: ctl.signal }); } catch { /* no signal */ } finally { clearTimeout(timer); }
+  if (!res?.ok) {
+    if (btn) btn.disabled = false;
+    return flash(res ? "Couldn't log out — try again" : "Couldn't log out — no signal", res ? 'Something went wrong on the office PC.' : 'Try again when you have signal.', { error: true });
+  }
+  forgetPerson();
   try { if (window.caches) for (const k of await caches.keys()) await caches.delete(k); } catch { /* none */ }
   location.replace('/login?out=1');
 }
