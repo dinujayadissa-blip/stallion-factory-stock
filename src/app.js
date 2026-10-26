@@ -409,7 +409,17 @@ export function createApp({ cloud = false, passSecret = process.env.PASS_SECRET 
   app.get('/api/vans/:id', h(req => inv.getVan(id(req))));
   // A van that was deleted meanwhile: a plain 404, not "Something went wrong".
   const vanThere = async req => { if (!await get('SELECT 1 FROM vans WHERE id = ?', id(req))) throw inv.httpError(404, 'That van no longer exists — refresh'); };
-  app.put('/api/vans/:id', h(async req => { await vanThere(req); return inv.updateVan(id(req), req.body); }));
+  app.put('/api/vans/:id', h(async req => {
+    await vanThere(req);
+    // A leading hand may only undo a van move (planned ↔ in production): the table in src/auth.js checks the
+    // status asked for, this checks the van's status now (read under the write lock), so a finished or
+    // cancelled van can't be brought back (its stock set aside again) from the floor.
+    if (req.user.role === 'leadhand' && 'status' in (req.body || {})) {
+      const v = await get('SELECT status FROM vans WHERE id = ?', id(req));
+      if (!['planned', 'in_production'].includes(v.status)) throw inv.httpError(403, 'Only the office can reopen a finished or cancelled van');
+    }
+    return inv.updateVan(id(req), req.body, { by: worker(req) });
+  }));
   app.delete('/api/vans/:id', h(async req => { await vanThere(req); return inv.deleteVan(id(req)); }));
   app.post('/api/vans/:id/rebuild', h(async req => {
     await vanThere(req);

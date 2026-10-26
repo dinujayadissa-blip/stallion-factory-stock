@@ -179,3 +179,72 @@ test('every /api answer says no-store; the plan export says private, no-store; p
   assert.equal(r.status, 404);
   assert.notEqual(r.headers['cache-control'], 'no-store');
 });
+
+// ── 4. van status changes from the floor ──
+
+test('a leading hand can undo a van move (in production → planned) but not reopen a cancelled or finished van', async () => {
+  const it = await item('V-PART', 5);
+  const area = await insert(`INSERT INTO floor_areas(kind, name, x, y, w, h) VALUES('bay', 'Bay V', 0, 0, 3, 9)`);
+  // the undo of a move: a planned van parked in a bay became "in production", the undo puts it back
+  const live = await van('VL1', 'planned');
+  await line(live, it, 2);
+  let r = await call('POST', `/api/vans/${live}/move`, { as: S.lee, body: { area_id: area } });
+  assert.equal(r.status, 200, r.text);
+  assert.equal((await get('SELECT status FROM vans WHERE id = ?', live)).status, 'in_production');
+  r = await call('PUT', `/api/vans/${live}`, { as: S.lee, body: { status: 'planned' } });
+  assert.equal(r.status, 200, r.text);
+  assert.equal((await get('SELECT status FROM vans WHERE id = ?', live)).status, 'planned');
+  // the history says who
+  assert.equal((await get(`SELECT worker FROM allocation_log WHERE van_id = ? AND reason = 'van status' ORDER BY id DESC LIMIT 1`, live)).worker, 'LEE');
+
+  for (const status of ['cancelled', 'completed']) {
+    const dead = await van(`VD-${status}`, status);
+    const l = await line(dead, it, 3);
+    const logs = (await get('SELECT COUNT(*) AS n FROM allocation_log')).n;
+    for (const to of ['planned', 'in_production']) {
+      r = await call('PUT', `/api/vans/${dead}`, { as: S.lee, body: { status: to } });
+      assert.equal(r.status, 403, `${status} → ${to}: ${r.text}`);
+      assert.equal(r.json.error, 'Only the office can reopen a finished or cancelled van');
+    }
+    assert.equal((await get('SELECT status FROM vans WHERE id = ?', dead)).status, status);
+    assert.equal((await get('SELECT reserved FROM van_lines WHERE id = ?', l)).reserved, 0);
+    assert.equal((await get('SELECT COUNT(*) AS n FROM allocation_log')).n, logs);
+  }
+  // the office still can
+  const back = await van('VD-office', 'cancelled');
+  await line(back, it, 1);
+  r = await call('PUT', `/api/vans/${back}`, { as: S.olive, body: { status: 'planned' } });
+  assert.equal(r.status, 200, r.text);
+  assert.equal((await get(`SELECT worker FROM allocation_log WHERE van_id = ? AND reason = 'van status' ORDER BY id DESC LIMIT 1`, back)).worker, 'OLIVE');
+});
+
+test('"gone out the gate", moving a van and assigning stock to it: only for a van still being built (409), for every role', async () => {
+  const it = await item('V-GATE', 5, 'per-van');
+  const area = await insert(`INSERT INTO floor_areas(kind, name, x, y, w, h) VALUES('bay', 'Bay G', 0, 0, 3, 9)`);
+  for (const status of ['cancelled', 'completed']) {
+    const v = await van(`VG-${status}`, status);
+    const l = await line(v, it, 1);
+    await insert(`INSERT INTO reminders(van_id, text) VALUES(?, 'Check the A-frame')`, v);
+    for (const as of [S.lee, S.olive]) {
+      for (const [p, body] of [[`/api/vans/${v}/leave`, {}], [`/api/vans/${v}/move`, { area_id: area }], [`/api/vans/${v}/move`, { area_id: null }]]) {
+        const r = await call('POST', p, { as, body });
+        assert.equal(r.status, 409, `${status} ${p}: ${r.text}`);
+        assert.equal(r.json.error, 'That van is not active');
+      }
+    }
+    const r = await call('POST', `/api/items/${it}/assign`, { as: S.olive, body: { van_id: v, qty: 1 } });
+    assert.equal(r.status, 409, r.text);
+    assert.equal(r.json.error, 'That van is not active');
+    const after = await get('SELECT status, area_id FROM vans WHERE id = ?', v);
+    assert.equal(after.status, status);
+    assert.equal(after.area_id, null);
+    assert.equal((await get('SELECT reserved FROM van_lines WHERE id = ?', l)).reserved, 0);
+    assert.equal((await get('SELECT done FROM reminders WHERE van_id = ?', v)).done, 0);
+  }
+  assert.equal(await onHand(it), 5);
+  // an active van still goes out the gate
+  const v = await van('VG-live', 'in_production');
+  const r = await call('POST', `/api/vans/${v}/leave`, { as: S.lee, body: {} });
+  assert.equal(r.status, 200, r.text);
+  assert.equal((await get('SELECT status FROM vans WHERE id = ?', v)).status, 'completed');
+});

@@ -593,7 +593,8 @@ export function qtyCheckFor(l, usual = 0) {
   return leadInfo(l.spec || '', 1).check || dotsCheck(l.spec);
 }
 
-export async function updateVan(id, patch) {
+// `by`: the login that made the change (written on the status history row).
+export async function updateVan(id, patch, { by = '' } = {}) {
   const allowed = ['customer', 'dealer', 'model', 'length', 'floor_plan', 'colour', 'atm', 'quote_no', 'order_date', 'eta', 'notes', 'reviewed', 'status', 'build_order'];
   const keys = Object.keys(patch).filter(k => allowed.includes(k));
   if (!keys.length) return;
@@ -610,7 +611,7 @@ export async function updateVan(id, patch) {
     // floor take never puts back a status the office chose ('van status' rows are the office's).
     if (before && 'status' in patch && patch.status !== before.status) {
       const word = s => String(s || '').replace(/_/g, ' ');
-      await logAlloc('van status', { van_id: id, field: 'van status', before: word(before.status), after: word(patch.status), note: 'status set by the office' });
+      await logAlloc('van status', { van_id: id, field: 'van status', before: word(before.status), after: word(patch.status), worker: by, note: 'status set by the office' });
     }
     // Finishing a van uses up what it still had set aside (it left inside the van); cancelling frees it.
     if (patch.status === 'completed' && before.status !== 'completed') {
@@ -3107,8 +3108,11 @@ export async function assignToVan(itemId, vanId, qty, by = '') {
     if (!(qty == null || qty === '')) checkQty(Number(qty));
     const want = qty == null || qty === '' ? free : Math.min(Number(qty), free);
     if (!(want > 1e-9)) throw httpError(409, 'Nothing left to assign — refresh');
-    const van = await get('SELECT chassis FROM vans WHERE id = ?', vanId);
+    const van = await get('SELECT chassis, status FROM vans WHERE id = ?', vanId);
     if (!van) throw httpError(404, 'That van no longer exists — refresh');
+    // Stock locked to a finished or cancelled van would never be handed out again (and "gone out the gate"
+    // would count it as used).
+    if (!['planned', 'in_production'].includes(van.status)) throw httpError(409, 'That van is not active');
     let left = want;
     for (const l of await all(`SELECT * FROM van_lines l WHERE van_id = ? AND item_id = ? AND l.qty > l.reserved + l.issued + 1e-9 AND ${ALLOCATABLE('l')} ORDER BY id`, vanId, itemId)) {
       if (left <= 1e-9) break;

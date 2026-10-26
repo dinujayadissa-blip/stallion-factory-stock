@@ -122,6 +122,7 @@ export async function advanceLine({ nextVanId = null, dryRun = false, expect = n
 }
 
 const ACTIVE = `v.status IN ('planned','in_production')`;
+const ACTIVE_STATUS = ['planned', 'in_production']; // (the same, for a van already read)
 // A line that counts as one of the van's parts: the Dashboard / Vans list bar (line_count in inventory.js
 // listVans) — customer supplies / to be decided lines are reminders, not parts, unless already issued.
 const COUNTED_PART = l => `${l}.state NOT IN ('customer','tbd') OR ${l}.issued >= ${l}.qty`;
@@ -191,6 +192,9 @@ export function moveVan(vanId, areaId) {
   return writeTx(async () => {
     const van = await get('SELECT id, chassis, area_id, status FROM vans WHERE id = ?', vanId);
     if (!van) throw httpError(404, 'Van not found');
+    // Only a van still being built goes on the map (as for "Move the line along"): a finished or cancelled one
+    // would hold a bay nobody can see.
+    if (!ACTIVE_STATUS.includes(van.status)) throw httpError(409, 'That van is not active');
     if (areaId == null) { await run('UPDATE vans SET area_id = NULL WHERE id = ?', vanId); return { swapped: null }; }
     const area = await get('SELECT * FROM floor_areas WHERE id = ?', areaId);
     if (!area) throw httpError(404, 'That spot no longer exists');
@@ -208,7 +212,10 @@ export function leaveFactory(vanId) {
   return writeTx(async () => {
     const van = await get('SELECT id, status FROM vans WHERE id = ?', vanId);
     if (!van) throw httpError(404, 'Van not found');
-    if (van.status !== 'completed') await useUpVan(vanId);
+    // Only a van still being built can go out the gate: a cancelled one must not become "finished" (and use up
+    // stock set aside for it), and a finished one already went.
+    if (!ACTIVE_STATUS.includes(van.status)) throw httpError(409, 'That van is not active');
+    await useUpVan(vanId);
     await run(`UPDATE vans SET status = 'completed', area_id = NULL WHERE id = ?`, vanId);
     await run(`UPDATE reminders SET done = 1, done_at = ${MEL_NOW} WHERE van_id = ? AND done = 0`, vanId);
   });
