@@ -213,7 +213,9 @@ export function leaveFactory(vanId) {
     const van = await get('SELECT id, status FROM vans WHERE id = ?', vanId);
     if (!van) throw httpError(404, 'Van not found');
     // Only a van still being built can go out the gate: a cancelled one must not become "finished" (and use up
-    // stock set aside for it), and a finished one already went.
+    // stock set aside for it). A finished one already went: nothing to do (a phone that lost the first reply
+    // and taps again gets "done", not an error).
+    if (van.status === 'completed') return;
     if (!ACTIVE_STATUS.includes(van.status)) throw httpError(409, 'That van is not active');
     await useUpVan(vanId);
     await run(`UPDATE vans SET status = 'completed', area_id = NULL WHERE id = ?`, vanId);

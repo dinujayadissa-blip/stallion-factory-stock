@@ -228,6 +228,7 @@ test('"gone out the gate", moving a van and assigning stock to it: only for a va
     for (const as of [S.lee, S.olive]) {
       for (const [p, body] of [[`/api/vans/${v}/leave`, {}], [`/api/vans/${v}/move`, { area_id: area }], [`/api/vans/${v}/move`, { area_id: null }]]) {
         const r = await call('POST', p, { as, body });
+        if (status === 'completed' && p.endsWith('/leave')) { assert.equal(r.status, 200, r.text); continue; } // (already went: a repeat tap is fine, changes nothing)
         assert.equal(r.status, 409, `${status} ${p}: ${r.text}`);
         assert.equal(r.json.error, 'That van is not active');
       }
