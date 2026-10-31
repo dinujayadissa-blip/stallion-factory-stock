@@ -16,17 +16,21 @@ const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'fs-fresh-'));
 after(() => fs.rmSync(tmp, { recursive: true, force: true }));
 const n = async t => (await get(`SELECT COUNT(*) AS n FROM ${t}`)).n;
 
-let part, other, rack, rule, user;
+let part, other, rack, rule, user, plan, planRule, flagged;
 test('set-up: parts with stock, vans with lines, a PO, movements, notes, reminders, a count', async () => {
   rack = await insert(`INSERT INTO floor_areas(kind, name, x, y, w, h) VALUES('storage', 'Rack A', 0, 0, 2, 1)`);
   part = await insert(`INSERT INTO items(sku, name, supplier, area_id, photo) VALUES('FS-1', 'Tap', 'Taps Co', ?, '1-1.jpg')`, rack);
   other = await insert(`INSERT INTO items(sku, name, kind) VALUES('FS-2', 'Fridge', 'per-van')`);
   rule = await insert(`INSERT INTO rules(name, conditions, item_id) VALUES('Tap on every van', '*', ?)`, part);
+  plan = await insert(`INSERT INTO items(sku, name, kind, placeholder) VALUES('PLAN-FRIDGE', 'Fridge (as per plan)', 'per-van', 1)`);
+  flagged = await insert(`INSERT INTO items(sku, name, placeholder) VALUES('ODD-1', 'Marked as per plan', 1)`);
+  planRule = await insert(`INSERT INTO rules(name, conditions, item_id) VALUES('Fridge as per plan', '*', ?)`, plan);
   user = await insert(`INSERT INTO users(username, name, role, pass_hash) VALUES('boss', 'Boss', 'owner', 'x')`);
   await inv.receive(part, 10, { note: 'opening' });
   const v = await insert(`INSERT INTO vans(chassis, customer, area_id) VALUES('FS-CH-1', 'A Customer', ?)`, rack);
   await insert(`INSERT INTO order_fields(van_id, label, value) VALUES(?, 'FRIDGE', 'yes')`, v);
   await inv.addLine(v, { item_id: other, qty: 1 });
+  await inv.addLine(v, { item_id: plan, qty: 1, spec: 'Thetford 175' });
   await inv.createPO({ po_no: 'FS-PO', supplier: 'Taps Co', lines: [{ item_id: other, qty: 1, van_id: v }] });
   await insert(`INSERT INTO van_notes(van_id, text) VALUES(?, 'note')`, v);
   await insert(`INSERT INTO reminders(van_id, text) VALUES(?, 'ring the customer')`, v);
@@ -42,6 +46,8 @@ test('without --yes: says what would go and changes nothing', async () => {
   assert.equal(r.done, false);
   assert.equal(r.before.vans, 1);
   assert.equal(r.before.items_with_stock, 1);
+  assert.equal(r.before.plan_items, 2);
+  assert.equal(r.before.plan_item_rules, 1);
   assert.equal(await n('vans'), 1);
   assert.equal(await dataVersion(), v0);
   assert.deepEqual(fs.readdirSync(tmp), []);
@@ -64,7 +70,10 @@ test('with --yes: the copy first, then no vans, every figure 0, the parts list a
   assert.equal(r.after.items_with_stock, 0);
   assert.deepEqual(await get('SELECT sku, name, supplier, area_id, photo, on_hand, last_counted FROM items WHERE id = ?', part),
     { sku: 'FS-1', name: 'Tap', supplier: 'Taps Co', area_id: rack, photo: '1-1.jpg', on_hand: 0, last_counted: '' });
-  assert.equal(await n('items'), 2);
+  assert.equal(await n('items'), 2, 'the two real parts stay; PLAN- and placeholder parts go');
+  assert.equal(await get('SELECT 1 FROM items WHERE id IN (?, ?)', plan, flagged), undefined);
+  assert.equal(await get('SELECT 1 FROM rules WHERE id = ?', planRule), undefined, 'its rule goes with it');
+  assert.equal(r.after.plan_items, 0);
   assert.ok(await get('SELECT 1 FROM rules WHERE id = ?', rule), 'rules kept');
   assert.ok(await get('SELECT 1 FROM floor_areas WHERE id = ?', rack), 'layout kept');
   assert.ok(await get('SELECT 1 FROM users WHERE id = ?', user), 'logins kept');
@@ -75,7 +84,9 @@ test('with --yes: the copy first, then no vans, every figure 0, the parts list a
   // the copy holds every row that went
   const copy = JSON.parse(fs.readFileSync(r.file, 'utf8'));
   assert.equal(copy.tables.vans[0].chassis, 'FS-CH-1');
-  assert.equal(copy.tables.van_lines.length, 1);
+  assert.equal(copy.tables.van_lines.length, 2);
+  assert.deepEqual(copy.tables.plan_items.map(i => i.sku).sort(), ['ODD-1', 'PLAN-FRIDGE']);
+  assert.equal(copy.tables.plan_item_rules[0].name, 'Fridge as per plan');
   assert.ok(copy.tables.movements.length >= 1);
   assert.equal(copy.tables.items_stock.find(i => i.id === part).on_hand, 10);
   // and the app carries on: a new van, new stock, new movement ids above the old ones

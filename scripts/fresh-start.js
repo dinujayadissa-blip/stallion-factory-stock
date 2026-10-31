@@ -1,6 +1,7 @@
 // A fresh start for a new owner of the data: every van and everything about them goes, every stock figure
-// goes to 0 — the parts list stays (names, codes, suppliers, racks, photos), and so do the parts rules, the
-// floor layout, the suppliers' lead times, the settings and the logins. The vans are then loaded again from
+// goes to 0, and the "as per plan" catch-all parts (PLAN-…, made by the production plan import) go too, with
+// any parts rule that adds one. The rest of the parts list stays (names, codes, suppliers, racks, photos), and
+// so do the other parts rules, the floor layout, the suppliers' lead times, the settings and the logins. The vans are then loaded again from
 // the dealer orders.
 //
 //   node scripts/fresh-start.js --backup "<folder>"          shows what would go (changes nothing)
@@ -22,13 +23,17 @@ export const WIPED = ['po_lines', 'purchase_orders', 'movements', 'allocation_lo
   'van_lines', 'vans', 'count_sessions', 'request_receipts'];
 // Settings about the old data (the plan import that made the vans, the demo flag).
 const OLD_SETTINGS = ['plan_imported_at', 'plan_import_history'];
+// The "as per plan" catch-all parts.
+const PLAN_ITEM = `(placeholder = 1 OR sku ILIKE 'PLAN-%')`;
 
 const count = async t => (await get(`SELECT COUNT(*) AS n FROM ${t}`)).n;
 async function figures() {
   const out = {};
   for (const t of WIPED) out[t] = await count(t);
   const s = await get(`SELECT COUNT(*) AS items, COALESCE(SUM(CASE WHEN on_hand <> 0 THEN 1 ELSE 0 END), 0) AS with_stock FROM items`);
-  return { ...out, items: s.items, items_with_stock: s.with_stock };
+  const plan = await get(`SELECT COUNT(*) AS n FROM items WHERE ${PLAN_ITEM}`);
+  const planRules = await get(`SELECT COUNT(*) AS n FROM rules WHERE item_id IN (SELECT id FROM items WHERE ${PLAN_ITEM})`);
+  return { ...out, items: s.items, items_with_stock: s.with_stock, plan_items: plan.n, plan_item_rules: planRules.n };
 }
 
 // { yes: false } → what would go; { yes: true, backupDir } → the copy's file and what went.
@@ -41,6 +46,8 @@ export async function freshStart({ yes = false, backupDir } = {}) {
     const copy = { made: new Date().toISOString(), note: 'Factory Stock fresh start: what was removed', tables: {} };
     for (const t of WIPED) copy.tables[t] = await all(`SELECT * FROM ${t} ORDER BY 1`);
     copy.tables.items_stock = await all('SELECT id, sku, on_hand, last_counted FROM items ORDER BY id');
+    copy.tables.plan_items = await all(`SELECT * FROM items WHERE ${PLAN_ITEM} ORDER BY id`);
+    copy.tables.plan_item_rules = await all(`SELECT * FROM rules WHERE item_id IN (SELECT id FROM items WHERE ${PLAN_ITEM}) ORDER BY id`);
     copy.tables.settings = await all(`SELECT * FROM settings WHERE key IN (${OLD_SETTINGS.map(() => '?').join(',')}) OR key = 'demo'`, ...OLD_SETTINGS);
     fs.mkdirSync(backupDir, { recursive: true });
     const stamp = new Date().toISOString().slice(0, 16).replace(/[-:]/g, '').replace('T', '_');
@@ -48,6 +55,7 @@ export async function freshStart({ yes = false, backupDir } = {}) {
     fs.writeFileSync(file, JSON.stringify(copy), { flag: 'wx' }); // (never over an older copy)
     for (const t of WIPED) await run(`DELETE FROM ${t}`);
     await run(`UPDATE items SET on_hand = 0, last_counted = ''`);
+    await run(`DELETE FROM items WHERE ${PLAN_ITEM}`); // (their rules go with them: ON DELETE CASCADE)
     await run(`DELETE FROM settings WHERE key IN (${OLD_SETTINGS.map(() => '?').join(',')})`, ...OLD_SETTINGS);
     await run(`UPDATE settings SET value = '0' WHERE key = 'demo'`);
     return { done: true, file, before, after: await figures() };
@@ -74,7 +82,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     await openDb();
     const r = await freshStart({ yes, backupDir: path.resolve(backupDir) });
     print(r);
-    if (r.done) console.log(`\nDone. The parts list is kept, every stock figure is 0, no vans. Copy of what was removed: ${r.file}`);
+    if (r.done) console.log(`\nDone. No vans, no PLAN- parts, every stock figure 0; the rest of the parts list is kept. Copy of what was removed: ${r.file}`);
     else console.log('\nNothing was changed. To do it, run the same command with --yes at the end.');
   } catch (e) {
     console.error(`Stopped, nothing was changed: ${e.message}`);
