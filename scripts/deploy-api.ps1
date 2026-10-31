@@ -39,12 +39,8 @@ $entry = Get-Content -Raw -Encoding UTF8 (Join-Path $root 'supabase\functions\ap
 if ($entry -notmatch [regex]::Escape("'../../../src/edge.js'")) { throw "index.ts no longer imports '../../../src/edge.js' - update this script" }
 $entry = $entry.Replace("'../../../src/edge.js'", "'./src/edge.js'")
 [System.IO.File]::WriteAllText((Join-Path $fn 'index.ts'), $entry, (New-Object System.Text.UTF8Encoding($false)))
-# src/, without the parts only the original (SQLite) version used - nothing online imports them.
-$localOnly = @('importPlan.js', 'tidy.js', 'seed.js')
-Get-ChildItem (Join-Path $root 'src') -Filter '*.js' | Where-Object { $localOnly -notcontains $_.Name } |
-  ForEach-Object { Copy-Item $_.FullName (Join-Path $fn "src\$($_.Name)") }
-$bad = Select-String -Path (Join-Path $fn 'src\*.js') -Pattern "from '\./(importPlan|tidy|seed)\.js'" -List
-if ($bad) { throw "A file the function needs imports a local-only file: $($bad.Path -join ', ')" }
+# src/, sub-folders and all.
+Copy-Item (Join-Path $root 'src\*') (Join-Path $fn 'src') -Recurse -Force
 Write-Host "Deploy folder ready: $fn"
 if ($StageOnly) { exit 0 }
 
