@@ -164,11 +164,29 @@ function upgradedCopy(from, { prepare = true } = {}) {
     } catch (e) {
       throw new Error(`Bringing the copy up to date failed: ${redact(e.stderr || e.message)}`);
     }
-    return { dir, file, prepared };
+    return { dir, file, prepared, unlinked: clearDanglingIds(file) };
   } catch (e) {
     fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
     throw e;
   }
+}
+
+// Ids that point at a row that no longer exists (a deleted rule, rack or login) become none (NULL) on the
+// temporary copy — they already showed as none — so the target's foreign keys (0003_links_and_checks.sql)
+// take them. Returns how many per column (counts only).
+const LINKS = [['van_lines', 'rule_id', 'rules'], ['items', 'area_id', 'floor_areas'], ['vans', 'area_id', 'floor_areas'], ['movements', 'user_id', 'users']];
+function clearDanglingIds(file) {
+  const db = new DatabaseSync(file);
+  try {
+    const has = (t, col) => !!db.prepare('SELECT 1 FROM pragma_table_info(?) WHERE name = ?').get(t, col);
+    const out = [];
+    for (const [t, col, ref] of LINKS) {
+      if (!has(t, col) || !has(ref, 'id')) continue;
+      const rows = Number(db.prepare(`UPDATE ${q(t)} SET ${q(col)} = NULL WHERE ${q(col)} IS NOT NULL AND ${q(col)} NOT IN (SELECT id FROM ${q(ref)})`).run().changes);
+      if (rows) out.push({ column: `${t}.${col}`, rows });
+    }
+    return out;
+  } finally { db.close(); }
 }
 
 function readSource(file) {
@@ -420,7 +438,8 @@ export async function copyAll({ from, to, photosDir, photosTo, wipe = false, pre
           }
         }
         const report = { tables, checks, ok: checks.every(x => x.ok), ...(tidyBackupNote ? { tidyBackupNote } : {}),
-          ...(tmp.prepared ? { prepare: tmp.prepared } : {}), ...(photos?.skipped.length ? { photosSkipped: photos.skipped } : {}) };
+          ...(tmp.prepared ? { prepare: tmp.prepared } : {}), ...(photos?.skipped.length ? { photosSkipped: photos.skipped } : {}),
+          ...(tmp.unlinked.length ? { unlinked: tmp.unlinked } : {}) };
         if (!report.ok) throw new ChecksFailed(report); // roll everything back
         return report;
       });
@@ -487,6 +506,7 @@ export function formatReport(r) {
     }
     if (r.tidyBackupNote) out.push('Clean-up backup: the original data on the home PC (the temporary copy is not kept)', '');
   }
+  if (r.unlinked) out.push(`Ids pointing at a row that no longer exists, set to none on the copy: ${r.unlinked.map(u => `${u.column} ${u.rows}`).join(', ')}`, '');
   if (r.photosSkipped) out.push(`Photos folder: ${r.photosSkipped.length} file(s) skipped (not .jpg): ${r.photosSkipped.join(', ')}`, '');
   out.push(line('Table', 'From', 'To'), ...r.tables.map(t => line(t.name, fmt(t.from), fmt(t.to), t.from === t.to ? 'ok' : 'DIFFERENT')), '');
   out.push(line('Check', 'From', 'To'));

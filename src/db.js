@@ -197,16 +197,23 @@ export async function writeTx(fn, { bump = true } = {}) {
   return cur ? body() : tx(body);
 }
 
-// A brand-new database (a new local DATA_DIR/pg folder) has no tables: build them from
-// supabase/migrations/*.sql, in name order — the same files the cloud database is made from. A database
-// that already has them is left alone. (Only the local runner calls this; the cloud is migrated by hand.)
+// A local database (a DATA_DIR/pg folder) brought up to supabase/migrations/*.sql, in name order — the same
+// files the cloud database is made from. A brand-new one gets every file; one made earlier gets the files
+// added since (settings.migrations lists those applied; with no list, everything after 0001_schema.sql runs
+// again — those files are safe to re-run). A database whose migrations the Supabase CLI keeps (the cloud,
+// `npx supabase db push`) is left alone. Returns true when the tables were just made.
 export async function migrate() {
-  if ((await get(`SELECT to_regclass('public.settings') IS NOT NULL AS ok`)).ok) return false;
+  if ((await get(`SELECT to_regclass('supabase_migrations.schema_migrations') IS NOT NULL AS cli`)).cli) return false;
+  const fresh = !(await get(`SELECT to_regclass('public.settings') IS NOT NULL AS ok`)).ok;
   const dir = path.join(root, 'supabase', 'migrations');
+  const files = fs.readdirSync(dir).filter(f => f.endsWith('.sql')).sort();
   await tx(async () => {
-    for (const f of fs.readdirSync(dir).filter(f => f.endsWith('.sql')).sort()) await run(fs.readFileSync(path.join(dir, f), 'utf8'));
+    const done = fresh ? [] : JSON.parse(await getSetting('migrations', '["0001_schema.sql"]'));
+    const todo = files.filter(f => !done.includes(f));
+    for (const f of todo) await run(fs.readFileSync(path.join(dir, f), 'utf8'));
+    if (todo.length) await setSetting('migrations', JSON.stringify([...done, ...todo]));
   });
-  return true;
+  return fresh;
 }
 
 export async function dataVersion() {

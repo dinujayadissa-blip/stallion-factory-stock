@@ -149,7 +149,7 @@ test('a stock figure already Infinity / NaN in the database is put right by a co
   assert.equal((await get('SELECT reserved FROM van_lines WHERE id = ?', l)).reserved, 0);
 
   // a count of the rack: opened while the figure was Infinity (written down as null), saved as counted
-  const rack = await insert(`INSERT INTO floor_areas(kind, name, x, y, w, h) VALUES('rack', 'Rack Q', 0, 0, 2, 1)`);
+  const rack = await insert(`INSERT INTO floor_areas(kind, name, x, y, w, h) VALUES('storage', 'Rack Q', 0, 0, 2, 1)`);
   await run('UPDATE items SET area_id = ? WHERE id = ?', rack, it);
   await run(`UPDATE items SET on_hand = 'Infinity'::double precision WHERE id = ?`, it);
   const c = await call('POST', '/api/counts', { as: S.stu, body: { scope: `area:${rack}` } });

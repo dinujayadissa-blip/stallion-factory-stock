@@ -194,6 +194,32 @@ test('a database behind the code is brought up to date on a temporary copy first
   });
 });
 
+test('ids pointing at a deleted rule, rack or login become none on the copy, so the links in the target take them', async () => {
+  const from = sqliteFinalDb(tmp('dangling'));
+  const d = new DatabaseSync(from);
+  d.exec(`INSERT INTO floor_areas(id, kind, name, x, y, w, h) VALUES (1, 'storage', 'Rack A', 0, 0, 2, 1);
+          INSERT INTO items(id, sku, name, area_id) VALUES (1, 'D-1', 'Part', 1), (2, 'D-2', 'Part on a removed rack', 55);
+          INSERT INTO rules(id, name, conditions, item_id) VALUES (3, 'Rule', '*', 1);
+          INSERT INTO vans(id, chassis, area_id) VALUES (1, 'D-CH', 66);
+          INSERT INTO van_lines(id, van_id, item_id, qty, rule_id) VALUES (1, 1, 1, 1, 3), (2, 1, 1, 1, 99), (3, 1, 2, 1, 98);
+          INSERT INTO movements(id, item_id, qty, type, user_id) VALUES (1, 1, 1, 'receive', 7);`);
+  d.close();
+  const before = sha(from);
+  const to = path.join(tmp('to'), 'pg');
+  const report = await copyAll({ from, prepare: false, to });
+  assert.equal(report.ok, true, JSON.stringify(report.checks.filter(c => !c.ok)));
+  assert.deepEqual(report.unlinked, [{ column: 'van_lines.rule_id', rows: 2 }, { column: 'items.area_id', rows: 1 },
+    { column: 'vans.area_id', rows: 1 }, { column: 'movements.user_id', rows: 1 }]);
+  assert.ok(formatReport(report).includes('set to none on the copy: van_lines.rule_id 2, items.area_id 1, vans.area_id 1, movements.user_id 1'));
+  assert.equal(sha(from), before, 'the source file is never changed');
+  await withTarget(to, async t => {
+    assert.deepEqual(await rows(t, 'SELECT id, rule_id FROM van_lines ORDER BY id'), [{ id: 1, rule_id: 3 }, { id: 2, rule_id: null }, { id: 3, rule_id: null }]);
+    assert.deepEqual(await rows(t, 'SELECT id, area_id FROM items ORDER BY id'), [{ id: 1, area_id: 1 }, { id: 2, area_id: null }]);
+  });
+  // nothing to clear: nothing said
+  assert.equal((await copyAll({ from: SRC, prepare: false, to: path.join(tmp('to'), 'pg') })).unlinked, undefined);
+});
+
 test('a failed load leaves the target unchanged', async () => {
   const dir = tmp('bad');
   const from = sqliteFinalDb(dir);

@@ -307,6 +307,8 @@ test('issue #2: floor stats count by login id; only old movements (no id) by nam
   const inv = await import('../src/inventory.js');
   const item = await insert(`INSERT INTO items(sku, name) VALUES('ST-1', 'Stats part')`);
   const mv = (worker, userId) => run(`INSERT INTO movements(item_id, qty, type, worker, user_id) VALUES(?, -1, 'issue', ?, ?)`, item, worker, userId);
+  // (the logins the movements name: a movement's login id is a real login)
+  for (const id of [101, 102]) await run(`INSERT INTO users(id, username, name, role, pass_hash) VALUES(?, ?, 'Sam Smith', 'worker', 'x')`, id, `stats-${id}`);
   await mv('Sam Smith', 101); await mv('Sam Smith', 102); await mv('Sam Smith', 102); await mv('Sam Smith', null);
   assert.equal((await inv.floorStats({ userId: 101, name: 'Sam Smith' })).mine_took, 2); // own (1) + the old one by name (1)
   assert.equal((await inv.floorStats({ userId: 102, name: 'Sam Smith' })).mine_took, 3);

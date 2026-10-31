@@ -70,7 +70,7 @@ test('F1 checkOrdered: the target PO and the other open POs are the same as with
 test('F2 re-prioritise: the same set-asides as calling allocate for every stock item', async () => {
   const later = await van('SP-F2-LATE', 'planned', '2099-06-01');
   const first = await van('SP-F2-FIRST', 'in_production', '2026-01-10');
-  const done = await van('SP-F2-DONE', 'done', '');
+  const done = await van('SP-F2-DONE', 'completed', '');
   const a = await item({ name: 'F2 bracket', on_hand: 3 });   // held by the later van: moves to the first
   const b = await item({ name: 'F2 screw', on_hand: 0 });     // nothing on the shelf
   const c = await item({ name: 'F2 fridge', on_hand: 2, kind: 'per-van' }); // never moved
@@ -208,7 +208,7 @@ test('F4 reorder suggestions: the same levels as with one or two queries per ite
 test('F7 floor van: "held by" the same vans, in the same build order, as with one query per line', async () => {
   const late = await van('SP-F7-B', 'planned', '2099-03-01');       // made first, but later in the build order
   const soon = await van('SP-F7-A', 'in_production', '2026-02-01');
-  const gone = await van('SP-F7-DONE', 'done', '');
+  const gone = await van('SP-F7-DONE', 'completed', '');
   const me = await van('SP-F7-ME', 'planned', '2099-09-01');
   const p = await item({ name: 'F7 panel', on_hand: 3 });   // all set aside: for both other vans
   const r = await item({ name: 'F7 rivet', on_hand: 1 });   // set aside for one van
