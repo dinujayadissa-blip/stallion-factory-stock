@@ -66,17 +66,6 @@ export const NEW_ITEMS = [
   { sku: 'BASIN-ROUND-RAZOR', name: 'Vanity basin white round (Razor)', category: 'Bathroom & Kitchen', from: 'PLAN-BATHROOM-ENSUITE-BASIN', supplier: 'Razor' },
 ];
 
-// Spelling fixes for placeholder display names (the plan column header keeps its original text,
-// so the Excel export still matches the spreadsheet).
-export const NAME_FIXES = [
-  [/Servise/g, 'Service'],
-  [/Seperating Bunk Aeria/gi, 'Separating bunk area'],
-  [/Seperate/g, 'Separate'],
-  [/Barthroom/g, 'Bathroom'],
-  [/tpilet/gi, 'toilet'],
-  [/Roof Baw/g, 'Roof Bow'], // follow-up round 1 (planner-r3-4)
-];
-
 // Part codes renamed to fix a typo (follow-up round 1, planner-r3-4; the start-up clean-up step 'sku_fix'
 // renames the part). The old code still finds the part everywhere a code is looked up: a production plan
 // re-import (its column is still headed "Roof Baw", which makes "PLAN-ROOF-BAW"), a stock count sheet,
@@ -140,7 +129,6 @@ const gotStock = x => !!x && ((Number(x.reserved_firm) || 0) > 1e-9
 // Both lines already had a delivery for this van: two parts arrived, so they are most likely different
 // parts. Never offered as "same thing?" and never merged without the office saying so.
 export const bothReceived = (a, b) => gotStock(a) && gotStock(b);
-export const DIFFERENT_TEXT = 'Two deliveries were received for this van – probably different parts';
 export const diffFlag = (toName, existing) =>
   `two deliveries were received for this van – probably not the same part as this van's "${toName}" line${existing.plan_column ? ` (for: ${existing.plan_column})` : ''}`;
 // Small fixes & phone round 1 (check-r4-1): a "merge all" that would move nothing.

@@ -6,7 +6,7 @@ import { all, get, run, insert, writeTx, inTx, dataVersion, getSetting, setSetti
 import { buildPartsList } from './rules.js';
 import { capFor, leadInfo } from './planMap.js';
 import { detectState, dotsCheck, STATES, REMINDER_STATES, STATE_LABEL, PO_OPEN, PO_IS_OPEN, OPEN_PO_BY_VAN, UNANSWERED, UNANSWERED_CORR,
-  COUNTS_SHORT, COUNTS_SHORT_CORR, ALLOCATABLE, STILL_MISSING, SPECIAL_ITEM, today, addDays, validDate, specForPo, givenTo, customerSays } from './lineState.js';
+  COUNTS_SHORT, COUNTS_SHORT_CORR, ALLOCATABLE, STILL_MISSING, SPECIAL_ITEM, today, addDays, validDate, specForPo, customerSays } from './lineState.js';
 import { suggestionsFor, sameTextKey, linkableItems, learnedLinks, mergedCols, textParts, partsFor, vanParts, dealerNames, notAPart, skuNow } from './relink.js';
 
 // Melbourne's date 'YYYY-MM-DD', whatever time zone the server runs in (lineState.js).
@@ -1234,12 +1234,6 @@ export function orderNowText(c) {
   return `${c.parts} part${c.parts === 1 ? '' : 's'} (${vanLines} van line${vanLines === 1 ? '' : 's'}${c.topups ? ` + ${c.topups} shelf top-up${c.topups === 1 ? '' : 's'}` : ''})`;
 }
 
-// Different parts in "Order now" (kept for older callers; same as orderNowCount().parts).
-export async function orderNowItems(sh) {
-  if (sh === undefined) sh = await shortages();
-  return sh.orderNow ? sh.orderNow.parts : orderNowCount(sh.rows).parts;
-}
-
 // ── "Check: already ordered?" — plan order numbers nobody has confirmed ──
 
 // Which supplier's order a plan order number belongs to, and the group it is answered in.
@@ -1343,11 +1337,6 @@ export async function checkOrdered() {
 // production); needed_now = its parts are needed now (in production, or a planned van due within the build
 // weeks). when: "26 days late" / "in production, due 19/11" / "in production, no due date" /
 // "due 3/11 – parts needed now" / "due 3/12" / "date passed (8/2) – check" / "no due date".
-// (`buildWeeks` left out: the setting.)
-export async function vanTiming(v, t = today(), buildWeeks) {
-  if (buildWeeks === undefined) buildWeeks = (await purchasingSettings()).build_weeks;
-  return timingFor(v, t, buildWeeks);
-}
 function timingFor(v, t, buildWeeks) {
   const days = (a, b) => Math.round((Date.parse(a) - Date.parse(b)) / 864e5);
   if (v.status === 'in_production') {
@@ -1693,7 +1682,6 @@ const LINE_EXPECTED = `COALESCE(NULLIF(pl.expected, ''), p.expected)`;
 // POs made from the production plan (the import's pink cells, or "Yes, on order" on Check: already
 // ordered?). The plan never says when they were ordered: a blank ordered date on these shows as
 // "unknown (from plan)" until someone types it (Small fixes & phone round 1, user-r4-5).
-export const PLAN_PO_SQL = `(notes ILIKE '%Imported from the production plan%' OR notes ILIKE '%Order number from the production plan%')`;
 const PLAN_PO_RE = /Imported from the production plan|Order number from the production plan/;
 const withPlanFlag = p => ({ ...p, from_plan: PLAN_PO_RE.test(p.notes || '') ? 1 : 0 });
 
@@ -2176,31 +2164,6 @@ async function receiveInto(line, qty, ref, { reason = 'receive', by = '', note =
   await logAlloc(reason, { van_id: line.van_id, item_id: line.item_id, line_id: line.id, field: 'reserved (locked)', before: '', after: `+${q(qty)}`, note: ref, worker: by,
     change: qty, firm_change: qty });
   await run(`INSERT INTO movements(item_id, qty, type, van_id, ref, note, worker) VALUES(?, ?, 'receive', ?, ?, ?, ?)`, line.item_id, qty, line.van_id, ref, note, by);
-}
-
-// Stock arrived for one van line (a grey cell on an updated production plan, C12): open PO lines for
-// that van and part are ticked off first, the rest is booked straight in. Never more than the line still
-// needs (qty − set aside − fitted). Received for the van = locked to it. (Joins the caller's write
-// transaction, or runs in its own.)
-export async function receiveForLine(lineId, qty, opts = {}) {
-  return writeTx(() => receiveForLineNow(lineId, qty, opts));
-}
-async function receiveForLineNow(lineId, qty, { ref = 'Production plan update', by = '' } = {}) {
-  const l = await get('SELECT * FROM van_lines WHERE id = ?', lineId);
-  if (!l) return 0;
-  let left = Math.min(qty, Math.max(0, l.qty - l.reserved - l.issued));
-  const got = left;
-  for (const pl of await all(`SELECT pl.*, p.po_no FROM po_lines pl JOIN purchase_orders p ON p.id = pl.po_id
-                        WHERE ${PO_IS_OPEN} AND pl.van_id = ? AND pl.item_id = ? ORDER BY pl.id`, l.van_id, l.item_id)) {
-    if (left <= 1e-9) break;
-    const take = Math.min(left, pl.qty - pl.received - pl.closed);
-    await run('UPDATE po_lines SET received = received + ? WHERE id = ?', take, pl.id);
-    await receiveInto(l, take, `PO ${pl.po_no}`, { reason: 'plan update', by, note: ref });
-    await closePoIfDone(pl.po_id);
-    left -= take;
-  }
-  if (left > 1e-9) await receiveInto(l, left, ref, { reason: 'plan update', by, note: ref });
-  return got;
 }
 
 // Move one part line forward from the plan: 'ordered' (needs po_no), 'received', or 'done'
@@ -2769,40 +2732,6 @@ export async function fittedQuickStart(vanId) {
         covered: l.reserved_firm > 0 && l.reserved_firm >= open - 1e-9 && !['customer', 'tbd'].includes(l.state) ? 1 : 0 };
     });
   return { van: { ...van, build: (await buildOrderInfo()).get(van.id) || null }, today: today(), lines };
-}
-
-// A part the plan says was handed to a worker for this van ("Black Jack Gave to Alex 15/07/2026",
-// round 2 user-r1-5): it is no longer on the shelf, so the line is closed as given out (issued = qty).
-// Same stock rule as "Already fitted": what was set aside for the line is booked out of the shelf figure
-// with one 'issue' movement (worker = the person named, the plan text in the note), so on hand still
-// equals the sum of movements. A part never set aside for the line is closed with no movement (it never
-// was in the books for this van) and the result says so, for the clean-up report. Returns null when the
-// line is already closed or isn't a "given to" line.
-export async function closeAsGiven(lineId, { reason = 'given', by = '', text } = {}) {
-  return writeTx(async () => {
-    const l = await get(`SELECT l.*, v.chassis, v.status AS van_status, i.unit FROM van_lines l JOIN vans v ON v.id = l.van_id
-                   JOIN items i ON i.id = l.item_id WHERE l.id = ?`, lineId);
-    if (!l || l.issued >= l.qty - 1e-9) return null;
-    const said = text ?? l.spec;
-    const g = givenTo(said);
-    if (!g) return null;
-    const open = l.qty - l.issued;
-    const fromStock = Math.max(0, Math.min(l.reserved, open));
-    const reserved = Math.max(0, l.reserved - fromStock);
-    await run('UPDATE van_lines SET issued = qty, reserved = ?, reserved_firm = LEAST(reserved_firm, ?::double precision), urgent = 0 WHERE id = ?', reserved, reserved, l.id);
-    const plan = `plan note "${said}"`;
-    if (fromStock > 0) {
-      await run('UPDATE items SET on_hand = on_hand - ? WHERE id = ?', fromStock, l.item_id);
-      await run(`INSERT INTO movements(item_id, qty, type, van_id, ref, note, worker) VALUES(?, ?, 'issue', ?, ?, ?, ?)`,
-          l.item_id, -fromStock, l.van_id, l.chassis, `Given to ${g.name} for ${l.chassis}${g.date ? ` (plan says ${g.date})` : ''} – ${plan}`, g.name);
-    }
-    const notFrom = open - fromStock;
-    await logAlloc(reason, { van_id: l.van_id, item_id: l.item_id, line_id: l.id, field: 'issued', before: q(l.issued), after: q(l.qty), worker: by,
-      change: -fromStock, firm_change: -(l.reserved_firm - Math.min(l.reserved_firm, reserved)),
-      note: `given to ${g.name}${g.date ? ` ${g.date}` : ''} (${plan}): ${fromStock > 0 ? `${q(fromStock)} ${l.unit} set aside for ${l.chassis} booked out of the shelf figure` : 'nothing was set aside'}`
-        + (notFrom > 1e-9 && fromStock > 0 ? `; ${q(notFrom)} not set aside – shelf figure not changed for those` : '') });
-    return { line_id: l.id, chassis: l.chassis, name: g.name, date: g.date, fromStock, notFromStock: notFrom, unit: l.unit };
-  });
 }
 
 // ───────────────────────── counts (blind, rack by rack) ─────────────────────────

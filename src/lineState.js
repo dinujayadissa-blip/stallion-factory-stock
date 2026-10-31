@@ -42,39 +42,11 @@ export function customerSays(text) {
   if (CUSTOMER_RE.test(s)) return 'auto';
   return CUSTOMER_SUGGEST_RE.test(s) ? 'suggest' : '';
 }
-// The rule used before round 2 (any "...." = to be decided). Only the clean-up step that re-checks
-// lines marked by it uses this (tidy.js stepStateDots).
-export function detectStateV1(text) {
-  const s = String(text || '');
-  if (CUSTOMER_RE.test(s)) return 'customer';
-  if (TBD_RE.test(s) || DOTS_RE.test(s)) return 'tbd';
-  return '';
-}
 // "...." next to a count or description: not "to be decided", but worth a look ('' = nothing to say).
 export function dotsCheck(text) {
   const s = String(text || '');
   return DOTS_RE.test(s) && !onlyDots(s) && !TBD_RE.test(s) && !CUSTOMER_RE.test(s) ? 'the plan text has "...." in it – check what is needed' : '';
 }
-
-// "Black Jack Gave to Alex 15/07/2026": the part was handed to a worker for this van, so it is off the
-// shelf and as good as fitted (round 2, user-r1-5). Returns { name, date } or null.
-// Only a past tense + "to" + a person's name counts: "Gave to Alex", "given to Alex", "handed (over) to Sam".
-// Never "to be given to…", "will give to…", "need to give…", "not given", or "given to customer / dealer /
-// supplier" (that is a hand-over to someone outside the factory, not a part for the van).
-const GIVEN_RE = /\b(gave|given|handed)\s+(?:it\s+|over\s+)?to\s+([A-Za-z][A-Za-z'-]{1,20})\b(?:\s+(?:on\s+)?(\d{1,2}\/\d{1,2}(?:\/\d{2,4})?))?/i;
-const NOT_A_NAME = /^(the|a|an|it|him|her|them|me|us|customer|customers|client|dealer|supplier|suppliers|office|back|out|away|up|over|for|from|by|and|on|in|at|van|be)$/i;
-const FUTURE_RE = /\b(to\s+be|will(\s+be)?|need(s|ed)?\s+to|not|never|yet\s+to|tobe)\s+(gave|given|give|handed)\b/i;
-export function givenTo(text) {
-  const s = String(text || '');
-  if (FUTURE_RE.test(s)) return null;
-  const m = GIVEN_RE.exec(s);
-  if (!m || NOT_A_NAME.test(m[2])) return null;
-  const name = m[2][0].toUpperCase() + m[2].slice(1);
-  return { name, date: m[3] || '' };
-}
-// "Jordan picked up", "Picked up from Aussie traveller": collected from the supplier — received, not
-// necessarily in the van. Only flagged for the office to check, never booked out.
-export const pickedUp = text => /\bpick(ed)?\s*up\b/i.test(String(text || ''));
 
 // Open quantity of a PO line: ordered - received - balance the supplier cancelled.
 export const PO_OPEN = '(pl.qty - pl.received - pl.closed)';

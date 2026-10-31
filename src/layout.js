@@ -276,7 +276,6 @@ const REFS = [
   { re: /\be-?mails?\b/i, icon: '✉️', word: 'customer email' },
   { re: /\b(photos?|pics?|pictures?)\b/i, icon: '📷', word: 'photo' },
 ];
-export const REF_RE = /\b(drawings?|e-?mails?|photos?|pics?|pictures?)\b/i;
 const titleCase = s => String(s).toLowerCase().replace(/(^|\s)(\w)/g, (m, a, c) => a + c.toUpperCase());
 
 export function drawingReminders(vanId) {
