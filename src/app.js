@@ -778,13 +778,10 @@ export function createApp({ cloud = false, passSecret = process.env.PASS_SECRET 
   // Try a rule against every active van and say which ones it would fire for. (Changes nothing.)
   app.post('/api/rules/test', h(async req => {
     try { checkRule({ ...req.body, item_id: 1 }); } catch (e) { throw inv.httpError(400, e.message); }
-    const out = [];
-    for (const v of await inv.listVans({ status: 'active' })) {
-      const fields = await all('SELECT * FROM order_fields WHERE van_id = ? ORDER BY sort', v.id);
-      const r = testRule(req.body, fields);
-      out.push({ chassis: v.chassis, fired: r.fired, matched: r.fired ? [...r.pos].map(f => `${f.label}: ${f.value}`) : [] });
-    }
-    return out;
+    return (await inv.activeVanFields()).map(v => {
+      const r = testRule(req.body, v.fields);
+      return { chassis: v.chassis, fired: r.fired, matched: r.fired ? [...r.pos].map(f => `${f.label}: ${f.value}`) : [] };
+    });
   }, OWN_TX));
 
   // ── Purchasing ──

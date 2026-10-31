@@ -8,7 +8,7 @@
 //
 // Database access is async (Postgres). Everything that queries is an async function; the pure helpers
 // (constants, text matching, notes) stay synchronous. Any write starts with writeTx.
-import { all, get, run, insert, writeTx, logAlloc, dataVersion } from './db.js';
+import { all, get, run, insert, writeTx, logAlloc, dataVersion, ID_LIST, ids } from './db.js';
 
 // Reviewed table: a line on `fromSku` whose plan text matches `re` is really `toSku`.
 export const RELINKS = [
@@ -690,15 +690,35 @@ export function textParts(spec) {
 // part it most likely is (a part the same cell already became, or one added from here before), so it is
 // done; suggest = the real part it most likely is (needs a click to add). `onVan`: vanParts() for the van.
 export async function partsFor(line, { items, onVan = null } = {}) {
-  const bits = textParts(line.spec);
-  if (!bits.length) return null;
+  if (!textParts(line.spec).length) return null;
+  return (await partsForMany([line], { items, onVanOf: () => onVan })).get(line.id) ?? null;
+}
+// partsFor for many lines at once (the Special parts list): line id → parts (or null), in two statements
+// whatever the number of lines. `onVanOf(vanId)`: vanParts() for that van.
+export async function partsForMany(lines, { items, onVanOf = () => null } = {}) {
+  const out = new Map();
+  const multi = lines.filter(l => textParts(l.spec).length);
+  for (const l of lines) out.set(l.id, null);
+  if (!multi.length) return out;
   items ??= await linkableItems();
   await loadSuppliers();
-  const empty = new Map();
   // Bits added from here before (their line's note says "Part of the plan text: “…”"): done, whatever part was picked.
-  const added = line.id == null ? [] : await all(`SELECT o.note, o.item_id, i.name, i.sku FROM van_lines o JOIN items i ON i.id = o.item_id
-      WHERE o.van_id = ? AND o.id <> ? AND o.plan_column = ? AND o.spec = ? AND o.note ILIKE '%Part of the plan text:%'`,
-    line.van_id, line.id, line.plan_column || '', line.spec || '');
+  const added = new Map(multi.map(l => [l.id, []]));
+  const saved = multi.filter(l => l.id != null);
+  if (saved.length) {
+    for (const { for_id, ...a } of await all(`SELECT l.id AS for_id, o.note, o.item_id, i.name, i.sku FROM van_lines l
+        JOIN van_lines o ON o.van_id = l.van_id AND o.id <> l.id AND o.plan_column = l.plan_column AND o.spec = l.spec
+          AND o.note ILIKE '%Part of the plan text:%'
+        JOIN items i ON i.id = o.item_id
+        WHERE l.id IN ${ID_LIST} ORDER BY o.id`, ids(saved.map(l => l.id)))) added.get(for_id).push(a);
+  }
+  for (const l of multi) out.set(l.id, partsForNow(l, { items, onVan: onVanOf(l.van_id), added: added.get(l.id) }));
+  return out;
+}
+// The same, once the supplier lists are loaded and `added` (the line's bits already added) is read.
+function partsForNow(line, { items, onVan, added }) {
+  const bits = textParts(line.spec);
+  const empty = new Map();
   const out = [];
   for (const text of bits) {
     const r = suggestForNow({ ...line, id: null, spec: text }, { items, learned: empty, exclude: null, onVan });
@@ -746,8 +766,8 @@ export function addTextParts(lineId, parts, { worker = '' } = {}) {
     const list = (Array.isArray(parts) ? parts : []).map(p => ({ text: String(p.text || '').trim().slice(0, 200), item_id: Number(p.item_id) }))
       .filter(p => p.item_id);
     if (!list.length) throw Object.assign(new Error('Pick a part for at least one of them'), { status: 400 });
-    const ids = list.map(p => p.item_id);
-    if (new Set(ids).size !== ids.length) throw Object.assign(new Error('The same part is picked twice — pick a different part for each'), { status: 400 });
+    const picked = list.map(p => p.item_id);
+    if (new Set(picked).size !== picked.length) throw Object.assign(new Error('The same part is picked twice — pick a different part for each'), { status: 400 });
     const have = (await vanParts([l.van_id])).get(l.van_id) || new Map();
     for (const p of list) {
       const it = await get('SELECT * FROM items WHERE id = ?', p.item_id);

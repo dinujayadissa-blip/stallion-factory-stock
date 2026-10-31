@@ -123,6 +123,11 @@ async function query(sql, p) {
   } catch (e) { throw translate(e); }
 }
 
+// A whole list of ids as one value, so one statement covers every row instead of one statement per row:
+//   all(`SELECT … WHERE l.van_id IN ${ID_LIST}`, ids(vanIds))
+export const ID_LIST = '(SELECT value::int FROM json_array_elements_text(?::text::json))';
+export const ids = list => JSON.stringify([...list].map(Number).filter(Number.isSafeInteger)); // (anything else matches no row)
+
 export const all = async (sql, ...p) => (await query(sql, p)).rows;
 export const get = async (sql, ...p) => (await query(sql, p)).rows[0];
 export const run = async (sql, ...p) => ({ changes: (await query(sql, p)).count });
@@ -226,13 +231,23 @@ export async function syncSuppliers() {
 // `change` / `firm_change`: how much `reserved` / `reserved_firm` moved (worked out from before/after
 // when the field is a set-aside field and both are numbers; pass them to say it exactly).
 const SET_ASIDE_FIELD = /^reserved|^locked$|^set aside/;
-export async function logAlloc(reason, { van_id = null, item_id = null, line_id = null, field = '', before = '', after = '', worker = '', note = '',
+function allocRow(reason, { van_id = null, item_id = null, line_id = null, field = '', before = '', after = '', worker = '', note = '',
   change, firm_change } = {}) {
   const b = Number(before), a = Number(after);
   const numeric = String(before ?? '') !== '' && String(after ?? '') !== '' && Number.isFinite(b) && Number.isFinite(a);
   if (change === undefined && numeric && SET_ASIDE_FIELD.test(field) && !/firm/.test(field) && field !== 'locked') change = a - b;
   if (firm_change === undefined && numeric && (field === 'reserved_firm' || field === 'locked')) firm_change = a - b;
+  return { reason, van_id, item_id, line_id, field, before: String(before ?? ''), after: String(after ?? ''), worker: worker || '', note: note || '',
+    change: change ?? null, firm_change: firm_change ?? null };
+}
+export async function logAlloc(reason, entry = {}) {
+  await logAllocMany([[reason, entry]]);
+}
+// Many lines in the allocation log in one statement, in this order: [[reason, { van_id, … }], …].
+export async function logAllocMany(entries) {
+  if (!entries.length) return;
   await run(`INSERT INTO allocation_log(reason, van_id, item_id, line_id, field, before, after, worker, note, change, firm_change)
-             VALUES(?,?,?,?,?,?,?,?,?,?,?)`, reason, van_id, item_id, line_id, field, String(before ?? ''), String(after ?? ''), worker || '', note || '',
-    change ?? null, firm_change ?? null);
+             SELECT x->>'reason', (x->>'van_id')::integer, (x->>'item_id')::integer, (x->>'line_id')::integer, x->>'field', x->>'before',
+               x->>'after', x->>'worker', x->>'note', (x->>'change')::double precision, (x->>'firm_change')::double precision
+             FROM json_array_elements(?::text::json) WITH ORDINALITY AS g(x, n) ORDER BY n`, JSON.stringify(entries.map(([reason, e]) => allocRow(reason, e))));
 }
