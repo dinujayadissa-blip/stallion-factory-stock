@@ -2,7 +2,7 @@
 // changes stock runs inside writeTx (one writer at a time, all or nothing) so the numbers can't drift apart.
 // Every function that reads or writes the database is async (returns a Promise); the pure helpers
 // (lineStatus, qtyCheckFor, coverText, orderNowCount, orderNowText, orderGroupOf, httpError …) are not.
-import { all, get, run, insert, writeTx, inTx, dataVersion, getSetting, setSetting, logAlloc, syncSuppliers, ID_LIST, ids } from './db.js';
+import { all, get, run, insert, writeTx, inTx, dataVersion, getSetting, setSetting, logAlloc, logAllocMany, syncSuppliers, ID_LIST, ids } from './db.js';
 import { buildPartsList } from './rules.js';
 import { capFor, leadInfo } from './planMap.js';
 import { detectState, dotsCheck, STATES, REMINDER_STATES, STATE_LABEL, PO_OPEN, PO_IS_OPEN, OPEN_PO_BY_VAN, UNANSWERED, UNANSWERED_CORR,
@@ -308,10 +308,12 @@ export async function reprioritiseAll({ by = '' } = {}) {
     const before = await reservedSnapshot();
     await runReprioritise();
     const after = await reservedSnapshot();
+    const log = [];
     for (const [id, b] of before) {
       const a = after.get(id)?.reserved ?? 0;
-      if (Math.abs(a - b.reserved) > 1e-9) await logAlloc('reprioritise', { van_id: b.van_id, item_id: b.item_id, line_id: id, field: 'reserved', before: b.reserved, after: a, worker: by });
+      if (Math.abs(a - b.reserved) > 1e-9) log.push(['reprioritise', { van_id: b.van_id, item_id: b.item_id, line_id: id, field: 'reserved', before: b.reserved, after: a, worker: by }]);
     }
+    await logAllocMany(log);
     return reprioritiseDiff(before, after);
   });
 }
@@ -359,10 +361,12 @@ export async function createVan({ header, fields, dealer = '', customer_items = 
       vanId = await insert(`INSERT INTO vans(chassis, customer, dealer, model, length, floor_plan, colour, atm, quote_no, order_date, eta)
                           VALUES(?,?,?,?,?,?,?,?,?,?,?)`, chassis, ...vals);
     }
-    const ins = 'INSERT INTO order_fields(van_id, section, label, value, note, sort) VALUES(?,?,?,?,?,?)';
-    for (const [i, f] of fields.entries()) await run(ins, vanId, f.section || '', f.label, f.value || '', f.note || '', i);
-    const ids = a => new Set((Array.isArray(a) ? a : []).map(Number).filter(Boolean));
-    await applyRules(vanId, { customer: ids(customer_items), normal: ids(normal_items), by });
+    // every field of the order form in one statement, in form order (sort = 0, 1, 2…)
+    if (fields.length) await run(`INSERT INTO order_fields(van_id, section, label, value, note, sort)
+        SELECT ?, x->>'section', x->>'label', x->>'value', x->>'note', (n - 1)::integer FROM json_array_elements(?::text::json) WITH ORDINALITY AS g(x, n)
+        ORDER BY n`, vanId, JSON.stringify(fields.map(f => ({ section: f.section || '', label: f.label, value: f.value || '', note: f.note || '' }))));
+    const idSet = a => new Set((Array.isArray(a) ? a : []).map(Number).filter(Boolean));
+    await applyRules(vanId, { customer: idSet(customer_items), normal: idSet(normal_items), by });
     return vanId;
   });
 }
@@ -636,14 +640,12 @@ export async function updateVan(id, patch, { by = '' } = {}) {
 }
 
 async function releaseVan(id) {
-  const items = await all('SELECT DISTINCT item_id FROM van_lines WHERE van_id = ? AND reserved > 0', id);
-  for (const l of await all('SELECT * FROM van_lines WHERE van_id = ? AND reserved > 0 ORDER BY id', id)) {
-    await logAlloc('van finished', { van_id: id, item_id: l.item_id, line_id: l.id, field: 'reserved', before: l.reserved, after: 0,
-      firm_change: -l.reserved_firm, note: 'van cancelled – set-aside back to the shelf' });
-  }
+  const held = await all('SELECT * FROM van_lines WHERE van_id = ? AND reserved > 0 ORDER BY id', id);
+  await logAllocMany(held.map(l => ['van finished', { van_id: id, item_id: l.item_id, line_id: l.id, field: 'reserved', before: l.reserved, after: 0,
+    firm_change: -l.reserved_firm, note: 'van cancelled – set-aside back to the shelf' }]));
   await run('UPDATE van_lines SET reserved = 0, reserved_firm = 0 WHERE van_id = ?', id);
   await run('UPDATE vans SET area_id = NULL WHERE id = ?', id); // a finished van frees its bay
-  for (const { item_id } of items) await allocateItem(item_id);
+  for (const itemId of new Set(held.map(l => l.item_id))) await allocateItem(itemId);
 }
 
 // A finished van went out with the parts still set aside for it, so they're counted as used
@@ -656,23 +658,24 @@ export async function useUpVan(vanId) {
 async function useUpVanNow(vanId) {
   const van = await get('SELECT chassis FROM vans WHERE id = ?', vanId);
   if (!van) return;
-  const freed = new Set();
-  for (const l of await all('SELECT * FROM van_lines WHERE van_id = ? AND reserved > 0 ORDER BY id', vanId)) {
-    if (l.qty > l.reserved + l.issued) {
-      await run('UPDATE van_lines SET reserved = 0, reserved_firm = 0 WHERE id = ?', l.id);
-      await logAlloc('van finished', { van_id: vanId, item_id: l.item_id, line_id: l.id, field: 'reserved', before: l.reserved, after: 0,
-        firm_change: -l.reserved_firm, note: `${van.chassis} finished while still short – set-aside back to the shelf` });
-      freed.add(l.item_id);
-      continue;
-    }
-    await run('UPDATE items SET on_hand = on_hand - ? WHERE id = ?', l.reserved, l.item_id);
-    await run('UPDATE van_lines SET issued = issued + reserved, reserved = 0, reserved_firm = 0 WHERE id = ?', l.id);
-    await logAlloc('van finished', { van_id: vanId, item_id: l.item_id, line_id: l.id, field: 'reserved', before: l.reserved, after: 0,
-      firm_change: -l.reserved_firm, note: `${van.chassis} finished – set-aside counted as used` });
-    await run(`INSERT INTO movements(item_id, qty, type, van_id, ref, note) VALUES(?, ?, 'issue', ?, ?, 'Used — van finished')`,
-        l.item_id, -l.reserved, vanId, van.chassis);
+  const held = await all('SELECT * FROM van_lines WHERE van_id = ? AND reserved > 0 ORDER BY id', vanId);
+  const isShort = l => l.qty > l.reserved + l.issued;
+  const short = held.filter(isShort), used = held.filter(l => !isShort(l));
+  // Every line at once (the same changes as line by line): short lines give their set-aside back, the rest
+  // are booked out of the shelf figure with one 'issue' movement each.
+  if (short.length) await run(`UPDATE van_lines SET reserved = 0, reserved_firm = 0 WHERE id IN ${ID_LIST}`, ids(short.map(l => l.id)));
+  if (used.length) {
+    const list = ids(used.map(l => l.id));
+    await run(`UPDATE items i SET on_hand = i.on_hand - u.q
+               FROM (SELECT item_id, SUM(reserved) AS q FROM van_lines WHERE id IN ${ID_LIST} GROUP BY item_id) u WHERE i.id = u.item_id`, list);
+    await run(`INSERT INTO movements(item_id, qty, type, van_id, ref, note)
+               SELECT item_id, -reserved, 'issue', van_id, ?, 'Used — van finished' FROM van_lines WHERE id IN ${ID_LIST} ORDER BY id`, van.chassis, list);
+    await run(`UPDATE van_lines SET issued = issued + reserved, reserved = 0, reserved_firm = 0 WHERE id IN ${ID_LIST}`, list);
   }
-  for (const itemId of freed) await allocateItem(itemId);
+  await logAllocMany(held.map(l => ['van finished', { van_id: vanId, item_id: l.item_id, line_id: l.id, field: 'reserved', before: l.reserved, after: 0,
+    firm_change: -l.reserved_firm, note: isShort(l) ? `${van.chassis} finished while still short – set-aside back to the shelf`
+      : `${van.chassis} finished – set-aside counted as used` }]));
+  for (const itemId of new Set(short.map(l => l.item_id))) await allocateItem(itemId);
 }
 
 export async function deleteVan(id) {
@@ -1396,10 +1399,9 @@ export async function answerOrdered(poRef, answer, { lineIds = null, supplier = 
     if (!lines.length) throw httpError(409, 'Nothing left to answer for that order number — refresh');
     const sup = String(supplier || '').trim();
     if (answer === 'no') {
-      for (const l of lines) {
-        await run(`UPDATE van_lines SET state = 'not_ordered' WHERE id = ?`, l.id);
-        await logAlloc('check ordered', { van_id: l.van_id, item_id: l.item_id, line_id: l.id, field: 'state', before: '', after: 'not_ordered', worker: by, note: `Plan said order ${ref}: still to order` });
-      }
+      await run(`UPDATE van_lines SET state = 'not_ordered' WHERE id IN ${ID_LIST}`, ids(lines.map(l => l.id)));
+      await logAllocMany(lines.map(l => ['check ordered', { van_id: l.van_id, item_id: l.item_id, line_id: l.id, field: 'state', before: '', after: 'not_ordered',
+        worker: by, note: `Plan said order ${ref}: still to order` }]));
       return { lines: lines.length, pos: [] };
     }
     const missing = lines.filter(l => !l.og.supplier);
@@ -1444,13 +1446,18 @@ export async function answerOrdered(poRef, answer, { lineIds = null, supplier = 
       pos.set(s, po.id);
       return po.id;
     };
+    // (one PO per supplier first, then every PO line and log line in one statement each)
+    const add = [], log = [];
     for (const l of lines) {
       const s = l.og.supplier || sup;
-      const poId = await poFor(s);
       const short = Math.max(0, l.qty - l.reserved - l.issued);
-      await run('INSERT INTO po_lines(po_id, item_id, qty, van_id, spec) VALUES(?,?,?,?,?)', poId, l.item_id, short, l.van_id, specForPo(l.spec, l.po_ref));
-      await logAlloc('check ordered', { van_id: l.van_id, item_id: l.item_id, line_id: l.id, field: 'po_lines', before: '', after: `PO ${ref} (${s || 'no supplier'}) +${q(short)}`, worker: by, note: `Plan said order ${ref}: on order` });
+      add.push({ po_id: await poFor(s), item_id: l.item_id, qty: short, van_id: l.van_id, spec: specForPo(l.spec, l.po_ref) });
+      log.push(['check ordered', { van_id: l.van_id, item_id: l.item_id, line_id: l.id, field: 'po_lines', before: '', after: `PO ${ref} (${s || 'no supplier'}) +${q(short)}`, worker: by, note: `Plan said order ${ref}: on order` }]);
     }
+    await run(`INSERT INTO po_lines(po_id, item_id, qty, van_id, spec)
+               SELECT (x->>'po_id')::integer, (x->>'item_id')::integer, (x->>'qty')::double precision, (x->>'van_id')::integer, x->>'spec'
+               FROM json_array_elements(?::text::json) WITH ORDINALITY AS g(x, n) ORDER BY n`, JSON.stringify(add));
+    await logAllocMany(log);
     await syncSuppliers();
     return { lines: lines.length, pos: [...pos.values()],
       po_list: [...pos.entries()].map(([s, id]) => ({ id, po_no: ref, supplier: s, new: made.includes(id) ? 1 : 0, ...(joined.get(id) || {}) })) };
